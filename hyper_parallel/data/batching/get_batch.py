@@ -21,9 +21,9 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.data.batching.attention_runtime import (
-    AttentionRuntimeAdapter,
-    build_dense_attention_masks,
+from hyper_parallel.data.batching.runtime_input import (
+    RuntimeInputAdapter,
+    RuntimeInputContext,
 )
 from hyper_parallel.data.batching.sequence_boundaries import (
     IndexedBoundaryResolver,
@@ -38,6 +38,50 @@ from hyper_parallel.data.parallel import (
 )
 
 logger = get_dataset_logger(__name__)
+
+
+def _build_dense_attention_masks(
+        *,
+        cu_seq_lens: Any,
+        micro_batch_size: int,
+        seq_length: int,
+        device: Any,
+        reset_attention_mask: bool,
+        sliding_window: int | None,
+) -> tuple[Any, Any | None]:
+    """Build global dense attention and optional sliding-window masks."""
+    boundaries = [int(boundary) for boundary in cu_seq_lens.tolist()]
+    expected_total = micro_batch_size * seq_length
+    if len(boundaries) < 2 or boundaries[0] != 0:
+        raise ValueError("cu_seq_lens must contain a leading zero and at least one sequence")
+    if any(end <= start for start, end in zip(boundaries[:-1], boundaries[1:])):
+        raise ValueError("cu_seq_lens must be strictly increasing")
+    if boundaries[-1] != expected_total:
+        raise ValueError(
+            f"cu_seq_lens must cover the physical batch length ({expected_total}), but got {boundaries[-1]}"
+        )
+
+    mask_batch_size = micro_batch_size if reset_attention_mask else 1
+    attention_mask = torch.ones(
+        (mask_batch_size, seq_length, seq_length),
+        dtype=torch.bool,
+        device=device,
+    ).tril()
+    attention_mask = attention_mask.view(mask_batch_size, 1, seq_length, seq_length)
+
+    if reset_attention_mask:
+        for seq_start in boundaries[:-1]:
+            batch_index, row_sequence_start = divmod(seq_start, seq_length)
+            attention_mask[batch_index, 0, row_sequence_start:, :row_sequence_start] = False
+
+    swa_mask = None
+    if sliding_window is not None:
+        positions = torch.arange(seq_length, dtype=torch.int64, device=device)
+        token_distance = positions.unsqueeze(1) - positions.unsqueeze(0)
+        outside_window = token_distance > sliding_window
+        swa_mask = attention_mask & ~outside_window.unsqueeze(0).unsqueeze(0)
+
+    return attention_mask, swa_mask
 
 
 class ParallelBatch:
@@ -64,7 +108,7 @@ class ParallelBatch:
             reset_position_ids: bool = False,
             reset_attention_mask: bool = False,
             eod_mask_loss: bool = False,
-            attention_runtime_adapter: AttentionRuntimeAdapter | None = None,
+            runtime_input_adapter: RuntimeInputAdapter | None = None,
     ) -> None:
         """Initialize the batch runtime and its parallel execution context.
 
@@ -82,9 +126,8 @@ class ParallelBatch:
             reset_position_ids: Whether positions restart at sequence boundaries.
             reset_attention_mask: Whether EOD starts an independent attention sequence.
             eod_mask_loss: Whether EOD tokens are excluded from the loss.
-            attention_runtime_adapter: Compressed Attention/CP metadata adapter.
+            runtime_input_adapter: Model-owned forward-input extension.
         """
-        # pylint: disable=too-many-locals
 
         self.parallel_context: DataLoaderParallelContext = create_dataloader_parallel_context(
             mesh_context,
@@ -126,7 +169,7 @@ class ParallelBatch:
             or source_type == "online"
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
-        self.attention_runtime_adapter = attention_runtime_adapter
+        self.runtime_input_adapter = runtime_input_adapter
 
     def __call__(
             self,
@@ -148,33 +191,6 @@ class ParallelBatch:
             cp_local_batch,
             cu_seq_lens,
         )
-        self._log_batch_flow(canonical_batch, parallel_batch)
-
-        position_ids = self._build_local_position_ids(
-            parallel_batch["input_ids"],
-            parallel_batch["cu_seq_lens"],
-        )
-        parallel_batch["position_ids"] = position_ids
-
-        loss_mask = self._build_loss_mask(parallel_batch)
-        attention_mask, swa_mask, packed_seq_params = self._build_attention_data(
-            parallel_batch,
-        )
-        parallel_batch["loss_mask"] = loss_mask
-        parallel_batch["attention_mask"] = attention_mask
-        parallel_batch["swa_mask"] = swa_mask
-        parallel_batch["packed_seq_params"] = packed_seq_params
-
-        model_inputs, loss_inputs = self._split_model_and_loss_inputs(parallel_batch)
-
-        return model_inputs, loss_inputs
-
-    def _log_batch_flow(
-            self,
-            canonical_batch: Mapping[str, Any] | None,
-            parallel_batch: Mapping[str, Any],
-    ) -> None:
-        """Log the resolved source and parallel batch shapes once."""
         if not self._batch_flow_logged:
             source_shape = None if canonical_batch is None else tuple(canonical_batch["input_ids"].shape)
             local_shape = tuple(parallel_batch["input_ids"].shape)
@@ -194,6 +210,28 @@ class ParallelBatch:
                 enabled=True,
             )
             self._batch_flow_logged = True
+
+        position_ids = self._build_local_position_ids(
+            parallel_batch["input_ids"],
+            parallel_batch["cu_seq_lens"],
+        )
+        parallel_batch["position_ids"] = position_ids
+
+        loss_mask = self._build_loss_mask(parallel_batch)
+        attention_mask, swa_mask = self._build_attention_data(
+            parallel_batch,
+        )
+        parallel_batch["loss_mask"] = loss_mask
+        parallel_batch["attention_mask"] = attention_mask
+        parallel_batch["swa_mask"] = swa_mask
+        runtime_inputs = self._build_runtime_inputs(parallel_batch)
+
+        model_inputs, loss_inputs = self._split_model_and_loss_inputs(
+            parallel_batch,
+            runtime_inputs,
+        )
+
+        return model_inputs, loss_inputs
 
     def _read_source_batch(self, data_iterator: Any) -> Mapping[str, Any] | None:
         """Read one complete batch on TP rank zero of each CP coordinate."""
@@ -240,7 +278,6 @@ class ParallelBatch:
         Packed boundaries define the position semantics. CP only determines
         which global sequence interval is materialized by this rank.
         """
-        # pylint: disable=too-many-locals
         batch_size, local_seq_len = input_ids.shape
         cp_size = self.parallel_context.cp_world_size
         global_seq_len = local_seq_len * cp_size
@@ -289,32 +326,20 @@ class ParallelBatch:
     def _build_attention_data(
             self,
             parallel_batch: Mapping[str, Any],
-    ) -> tuple[Any | None, Any | None, object | None]:
-        """Build dense masks or compressed Attention/CP metadata."""
+    ) -> tuple[Any | None, Any | None]:
+        """Build framework-owned dense masks; compressed inputs stay model-owned."""
         attention_mask = None
         swa_mask = None
-        packed_seq_params = None
         if not self.create_attention_mask:
-            return attention_mask, swa_mask, packed_seq_params
+            return attention_mask, swa_mask
 
         mask_compress = self.attention_mode == "compressed"
 
-        if mask_compress:
-            if self.attention_runtime_adapter is not None:
-                packed_seq_params = self.attention_runtime_adapter.build_packed_seq_params(
-                    cu_seq_lens=parallel_batch["cu_seq_lens"],
-                    local_input_shape=parallel_batch["input_ids"].shape,
-                    cp_rank=self.parallel_context.cp_rank,
-                    cp_size=self.parallel_context.cp_world_size,
-                    cp_algorithm=self.cp_algorithm,
-                    causal=self.causal,
-                    sliding_window=self.sliding_window,
-                )
-        else:
+        if not mask_compress:
             # Dense masks remain global although input IDs are already CP-local.
             micro_batch_size, local_seq_length = parallel_batch["input_ids"].shape
             seq_length = local_seq_length * self.parallel_context.cp_world_size
-            attention_mask, swa_mask = build_dense_attention_masks(
+            attention_mask, swa_mask = _build_dense_attention_masks(
                 cu_seq_lens=parallel_batch["cu_seq_lens"],
                 micro_batch_size=micro_batch_size,
                 seq_length=seq_length,
@@ -323,11 +348,48 @@ class ParallelBatch:
                 sliding_window=self.sliding_window,
             )
 
-        return attention_mask, swa_mask, packed_seq_params
+        return attention_mask, swa_mask
+
+    def _build_runtime_inputs(
+            self,
+            parallel_batch: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Delegate optional model-specific forward inputs to a generic adapter."""
+        if self.runtime_input_adapter is None:
+            return {}
+        context = RuntimeInputContext(
+            source_type=self.source_type,
+            local_input_shape=parallel_batch["input_ids"].shape,
+            parallel_ranks={
+                "tp": self.parallel_context.tp_rank,
+                "cp": self.parallel_context.cp_rank,
+            },
+            parallel_sizes={
+                "tp": self.parallel_context.tp_world_size,
+                "cp": self.parallel_context.cp_world_size,
+            },
+            options={
+                "attention_mode": self.attention_mode,
+                "cp_algorithm": self.cp_algorithm,
+                "causal": self.causal,
+                "sliding_window": self.sliding_window,
+            },
+        )
+        runtime_inputs = self.runtime_input_adapter.build_runtime_inputs(
+            batch=parallel_batch,
+            context=context,
+        )
+        if not isinstance(runtime_inputs, Mapping):
+            raise TypeError(
+                "RuntimeInputAdapter.build_runtime_inputs must return a mapping, "
+                f"got {type(runtime_inputs).__name__}"
+            )
+        return dict(runtime_inputs)
 
     def _split_model_and_loss_inputs(
             self,
             parallel_batch: Mapping[str, Any],
+            runtime_inputs: Mapping[str, Any],
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         """Split forward fields from loss and token-accounting fields."""
         model_inputs = {
@@ -340,8 +402,13 @@ class ParallelBatch:
             model_inputs["shift_labels"] = parallel_batch["labels"]
         if parallel_batch["swa_mask"] is not None:
             model_inputs["swa_mask"] = parallel_batch["swa_mask"]
-        if parallel_batch["packed_seq_params"] is not None:
-            model_inputs["packed_seq_params"] = parallel_batch["packed_seq_params"]
+        collisions = set(model_inputs).intersection(runtime_inputs)
+        if collisions:
+            raise ValueError(
+                "runtime inputs cannot replace framework-owned model inputs: "
+                f"{sorted(collisions)}"
+            )
+        model_inputs.update(runtime_inputs)
 
         loss_inputs = {
             "labels": parallel_batch["labels"],

@@ -30,6 +30,9 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
+from hyper_parallel.models._transformers.model_builder import (
+    validate_model_init_dtype,
+)
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import empty_cache
 from hyper_parallel.trainer.runtime.device import (
@@ -351,7 +354,7 @@ class CheckpointerCallback(Callback):
         self.trainer.model.load_state_dict(
             checkpoint_state["model"], strict=not self._is_peft
         )
-        apply_model_init_dtype(
+        validate_model_init_dtype(
             self.trainer.model,
             self.trainer.config.model_init_dtype,
         )
@@ -370,6 +373,7 @@ class CheckpointerCallback(Callback):
         if self._restore_train_state:
             self._apply_extra_state(checkpoint_state["extra_state"])
         else:
+            self._set_start_position_from_state()
             logger.info(
                 "restore_train_state=False: loaded weights only from %s "
                 "(step, scheduler, dataloader and RNG start fresh).",
@@ -436,3 +440,4 @@ class CheckpointerCallback(Callback):
         python_rng = rng_state.get("python")
         if python_rng is not None:
             random.setstate(python_rng)
+
