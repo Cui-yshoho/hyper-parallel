@@ -69,6 +69,7 @@ def _apply_interleaved_rope(
     sin: torch.Tensor,
     unsqueeze_dim: int,
 ) -> torch.Tensor:
+    """Apply interleaved RoPE and append dimensions that bypass rotation."""
     sequence_first = (
         tensor.permute(2, 0, 1, 3)
         if unsqueeze_dim == 1

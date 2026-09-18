@@ -35,6 +35,7 @@ class TestReplacementCheckpointLoading(unittest.TestCase):
     """Exercise actual tensor conversion and copying without distributed setup."""
 
     def _load(self, *, shared=False, extra=False, missing=False, strict=True, replacement=True):
+        """Create a temporary checkpoint and return its load report."""
         model = nn.Module()
         model.register_parameter("target", nn.Parameter(torch.zeros(2)))
         targets = {"target": model.target}

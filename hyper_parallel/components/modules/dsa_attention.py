@@ -61,7 +61,7 @@ def apply_mome(
     if fused:
         padded_mask = F.pad(mome_mask, (padding, 0), value=False)
         weight = convolution.weight.squeeze(1).transpose(0, 1)
-        mixed_states = aggregate_hidden(
+        mixed_states = aggregate_hidden(  # pylint: disable=not-callable
             padded_states.transpose(0, 1).contiguous(),
             weight,
             padded_mask,
@@ -336,6 +336,7 @@ class DeepseekV32DSAAttention(nn.Module):
         batch_size: int,
         seq_length: int,
     ) -> bool:
+        """Return whether position IDs violate the supported dense layout."""
         if position_ids is None:
             return False
         if position_ids.ndim != 2:
@@ -436,7 +437,7 @@ class DeepseekV32DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(
+        aux_loss = dsa_kl_loss(  # pylint: disable=not-callable
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
@@ -469,7 +470,9 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_kv_len = self._get_actual_seq_len(
             actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
         )
-        indexed = dsa_indexer(*index_states, actual_q_len, actual_kv_len, self.index_topk)
+        indexed = dsa_indexer(  # pylint: disable=not-callable
+            *index_states, actual_q_len, actual_kv_len, self.index_topk
+        )
         return indexed[0], indexed[1:], actual_q_len, actual_kv_len
 
     def _compute_sparse_attention(
@@ -479,7 +482,7 @@ class DeepseekV32DSAAttention(nn.Module):
         topk_indices, index_states, actual_q_len, actual_kv_len = self._run_indexer(
             hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs,
         )
-        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
+        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(  # pylint: disable=not-callable
             *attention_states, topk_indices, self.scaling, actual_q_len, actual_kv_len,
         )
         return self._apply_auxiliary_loss(
@@ -756,12 +759,12 @@ class DSAAttention(nn.Module):
         absorbed_query, kv_nope, q_rot, k_rot = attention_states
         sparse_scale = self.qk_head_dim**-0.5
         if self.param_sink_number <= 0:
-            return dsa_sparse_attention(
+            return dsa_sparse_attention(  # pylint: disable=not-callable
                 absorbed_query, kv_nope, q_rot, k_rot, topk_indices,
                 sparse_scale, actual_q_len, actual_kv_len,
             )
         sink_key, sink_value = self._prepare_param_sink(batch_size)
-        return dsa_sparse_attention_rescale(
+        return dsa_sparse_attention_rescale(  # pylint: disable=not-callable
             absorbed_query, kv_nope, q_rot, k_rot, sink_key, sink_value,
             topk_indices, batch_size, seq_length, self.num_heads, sparse_scale,
             1 - self.attention_dropout.p, actual_q_len, actual_kv_len,
@@ -784,7 +787,7 @@ class DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(
+        aux_loss = dsa_kl_loss(  # pylint: disable=not-callable
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
@@ -817,7 +820,9 @@ class DSAAttention(nn.Module):
         actual_kv_len = self._get_actual_seq_len(
             actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
         )
-        indexed = dsa_indexer(*index_states, actual_q_len, actual_kv_len, self.index_topk)
+        indexed = dsa_indexer(  # pylint: disable=not-callable
+            *index_states, actual_q_len, actual_kv_len, self.index_topk
+        )
         return indexed[0], indexed[1:], actual_q_len, actual_kv_len
 
     def _compute_sparse_attention(

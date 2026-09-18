@@ -198,6 +198,7 @@ class MLAAttention(nn.Module):
         return transforms
 
     def _project_latents(self, hidden_states: torch.Tensor) -> _MLALatents:
+        """Project hidden states into query and compressed KV latent states."""
         batch_size, sequence_length = hidden_states.shape[:-1]
         latent_states = self.linear_qkv(hidden_states)
         query_latent, kv_nope, key_rope = torch.split(
@@ -233,6 +234,7 @@ class MLAAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         past_key_values: Any | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build query, key, and value tensors from compressed latent states."""
         latents = self._project_latents(hidden_states)
         query_rope, key_rope = latents.query_rope, latents.key_rope
         if position_embeddings is not None:

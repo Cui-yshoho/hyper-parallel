@@ -26,6 +26,8 @@ import torch_npu
 
 @dataclass
 class _FusionAttentionContext:
+    """Normalized arguments required by the NPU fusion-attention operator."""
+
     query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
@@ -248,6 +250,7 @@ def _prepare_fusion_attention_context(
     attention_mask: Optional[torch.Tensor],
     kwargs: dict[str, Any],
 ) -> _FusionAttentionContext:
+    """Normalize model inputs into one NPU fusion-attention invocation."""
     query_lengths, key_lengths = resolve_packed_sequence_lengths(
         kwargs,
         query.shape[0] * query.shape[2],

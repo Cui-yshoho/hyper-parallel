@@ -23,6 +23,8 @@ GroupList = Optional[Union[torch.Tensor, list[int], tuple[int, ...]]]
 
 
 class GMMFunction(torch.autograd.Function):
+    """Autograd bridge for NPU grouped matrix multiplication."""
+
     @staticmethod
     def forward(
         ctx: Any,

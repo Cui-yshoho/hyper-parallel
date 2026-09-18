@@ -59,6 +59,7 @@ def _apply_gqa_rope(
     rotary_interleaved: bool,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the configured rotary convention to grouped-query attention."""
     if position_embeddings is None:
         return query, key
     cos, sin = position_embeddings

@@ -221,6 +221,7 @@ def _matching_scoped_converters(
     candidates: list[WeightConverter],
     target_name: str,
 ) -> list[WeightConverter]:
+    """Return scoped converters whose scope contains the target tensor."""
     matched = []
     for converter in candidates:
         scope_prefix = converter.scope_prefix

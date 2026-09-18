@@ -475,6 +475,7 @@ else:
         renamings: list[WeightRenaming],
         converters: list[WeightConverter],
     ) -> dict[str, _WeightTransform]:
+        """Collect reverse transforms and their source tensors."""
         conversion_mapping = {}
         for original_key, tensor in sorted(
             state_dict.items(), key=lambda item: dot_natural_key(item[0])
@@ -508,6 +509,7 @@ else:
         model: Any,
         conversion_mapping: dict[str, _WeightTransform],
     ) -> dict[str, torch.Tensor]:
+        """Apply collected reverse transforms to produce checkpoint tensors."""
         converted_state_dict = {}
         for first_param_name, reverse_conversion in conversion_mapping.items():
             realized = reverse_conversion.convert(

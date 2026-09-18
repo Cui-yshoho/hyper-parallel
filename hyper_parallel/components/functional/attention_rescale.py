@@ -32,6 +32,7 @@ def _rescale_attention_outputs(
     batch_size: int,
     num_heads: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Merge normal and sink attention outputs using their softmax statistics."""
     output = rearrange(output, "(b s) n d -> s b n d", b=batch_size, s=sequence_length)
     sink_output = rearrange(sink_output, "s b (n d) -> s b n d", n=num_heads)
 
@@ -208,8 +209,9 @@ class _AttentionRescale(torch.autograd.Function):
         return rescaled_output, softmax_max
 
     @staticmethod
-    def backward(ctx: Any, grad_rescaled_output: torch.Tensor, _grad_softmax_max: torch.Tensor) -> tuple:
+    def backward(ctx: Any, grad_rescaled_output: torch.Tensor, grad_softmax_max: torch.Tensor) -> tuple:
         """Run the explicit fusion-attention backward operators."""
+        del grad_softmax_max
         grad_query, grad_key, grad_value = _normal_attention_backward(ctx, grad_rescaled_output)
         sink_grad_query, sink_grad_key, sink_grad_value = _sink_attention_backward(ctx, grad_rescaled_output)
         return (
