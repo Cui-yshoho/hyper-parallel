@@ -624,19 +624,26 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
+    if "dataloader_type" in target_node:
+        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
     batch_adapter_node = target_node.pop("batch_adapter", None)
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
-    dataloader_type = normalize_value(
-        target_node.pop("dataloader_type", "single"),
+    sampler_type = normalize_value(
+        target_node.pop("sampler_type", "single"),
         Literal["single", "cyclic"],
-        path=f"{path}.dataloader_type",
+        path=f"{path}.sampler_type",
     )
     data_rearrange_map = target_node.pop("data_rearrange_map", None)
     data_sharding = normalize_value(
         target_node.pop("data_sharding", False),
         bool,
         path=f"{path}.data_sharding",
+    )
+    use_background_prefetcher = normalize_value(
+        target_node.pop("use_background_prefetcher", False),
+        bool,
+        path=f"{path}.use_background_prefetcher",
     )
     target = _resolve_target(target_node, path=path)
     batch_adapter = (
@@ -659,9 +666,10 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         batch_adapter=batch_adapter,
         collate_fn=collate_fn,
         get_batch=get_batch,
-        dataloader_type=dataloader_type,
+        sampler_type=sampler_type,
         data_rearrange_map=data_rearrange_map,
         data_sharding=data_sharding,
+        use_background_prefetcher=use_background_prefetcher,
     )
 
 
@@ -674,11 +682,17 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     model_assets_node = target_node.pop("model_assets", {})
     data_transform_node = target_node.pop("data_transform", None)
     target = _resolve_target(target_node, path=path)
-    model_assets = resolve_component(
-        model_assets_node,
-        annotation=ModelAssetsConfig,
-        path=f"{path}.model_assets",
-    )
+    if isinstance(model_assets_node, Mapping) and "_target_" in model_assets_node:
+        model_assets = _resolve_target(
+            model_assets_node,
+            path=f"{path}.model_assets",
+        )
+    else:
+        model_assets = resolve_component(
+            model_assets_node,
+            annotation=ModelAssetsConfig,
+            path=f"{path}.model_assets",
+        )
     data_transform = (
         None
         if data_transform_node is None
@@ -687,11 +701,12 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
             path=f"{path}.data_transform",
         )
     )
-    return DatasetConfig(
+    dataset_config = DatasetConfig(
         target=target,
         model_assets=model_assets,
         data_transform=data_transform,
     )
+    return dataset_config
 
 
 def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
