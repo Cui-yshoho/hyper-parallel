@@ -425,6 +425,29 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_async_cp_converts_transformers_2d_padding_mask(self):
+        """The native HF wrapper accepts FA2's global 2D padding mask."""
+        query = torch.empty(2, 1, 2, 4)
+        key = torch.empty(2, 1, 4, 4)
+        padding_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+
+        actual = adapter_context_parallel_async._prepare_qwen3_moe_attention_mask(
+            padding_mask,
+            query,
+            key,
+            query_offset=2,
+        )
+
+        expected = torch.tensor(
+            [
+                [[[True, True, True, False], [True, True, True, False]]],
+                [[[True, True, False, False], [True, True, False, False]]],
+            ]
+        )
+        self.assertTrue(torch.equal(actual, expected))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_async_wrappers_return_rewrite_requests_without_mutating_forward(self):
         """M5: the async wrappers return a request and never assign forward.
 
@@ -488,6 +511,28 @@ class TestEpFactoryContract(unittest.TestCase):
                 module=nn.Module(), mesh=None, tp_mesh=None, cp_mesh=None,
                 ep_mesh=None,
             )
+
+
+class TestAsyncCpAttentionCompatibility(unittest.TestCase):
+    """Compatibility contracts shared by Qwen3-MoE and Qwen3-VL-MoE attention."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_missing_sliding_window_defaults_to_none(self):
+        """Qwen3-VL-MoE attention does not expose the optional instance attribute."""
+        module = SimpleNamespace(training=False, scaling=0.125)
+        tensors = [torch.zeros(1) for _ in range(3)]
+
+        with unittest.mock.patch.object(
+            adapter_context_parallel_async,
+            "run_qwen3_moe_flash_attention",
+            return_value=(tensors[0], None),
+        ) as run_attention:
+            adapter_context_parallel_async._run_qwen3_moe_fused_attention(
+                module, *tensors, None, {}
+            )
+
+        self.assertIsNone(run_attention.call_args.kwargs["sliding_window"])
 
 
 class _AttentionNpuStub(types.ModuleType):

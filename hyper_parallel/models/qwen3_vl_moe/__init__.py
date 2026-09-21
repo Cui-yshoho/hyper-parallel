@@ -12,21 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Registry primitives for model-specific context-parallel patches."""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Callable
-
-from torch import nn
-
-MeshGetter = Callable[[], object]
-
-
-@dataclass(frozen=True)
-class ContextParallelModelPatch:
-    """Describe the CP hooks needed by one supported model family."""
-
-    name: str
-    supports: Callable[[nn.Module], bool]
-    prepare: Callable[[nn.Module, object, MeshGetter], None]
+"""Qwen3-VL-MoE model-family registration."""

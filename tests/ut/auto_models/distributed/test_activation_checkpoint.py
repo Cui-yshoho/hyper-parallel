@@ -28,6 +28,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -134,6 +135,20 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         self.assertEqual(
             [[block.child_name for block in container.blocks] for container in containers],
             [["2", "7"], ["2", "7"]],
+        )
+
+    def test_fsdp_discovery_preserves_registered_keys(self):
+        """FSDP source-layout FQNs must use the module's registered child keys."""
+        blocks, _ = FSDP2Manager._find_transformer_block_modules(_DiscoveryModel())
+
+        self.assertEqual(
+            [block.fqn for block in blocks],
+            [
+                "text_tower.decoder.2",
+                "text_tower.decoder.7",
+                "image_tower.decoder.2",
+                "image_tower.decoder.7",
+            ],
         )
 
     def test_unmarked_layers_are_not_selected(self):

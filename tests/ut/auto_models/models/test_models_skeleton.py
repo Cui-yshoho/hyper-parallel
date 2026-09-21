@@ -87,6 +87,24 @@ def test_lazy_family_discovery():
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
          card_mark="onecard", essential_mark="essential")
+def test_qwen3_vl_moe_family_registration():
+    """Qwen3-VL-MoE declares its non-standard vision projection roles."""
+    from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
+
+    spec = get_model_adapter("qwen3_vl_moe")
+    assert isinstance(spec, ModelAdapterSpec), "case: spec_type"
+    assert spec.architecture == "Qwen3VLMoeForConditionalGeneration", "case: architecture"
+    assert spec.sharding_rules() == [
+        ("attn.qkv", ParamRole.FUSED_QKV),
+        ("attn.proj", ParamRole.ROWWISE),
+        ("linear_fc1", ParamRole.COLWISE),
+        (".mlp.linear_fc2", ParamRole.COLWISE),
+        ("linear_fc2", ParamRole.ROWWISE),
+    ], "case: rules"
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+         card_mark="onecard", essential_mark="essential")
 def test_unknown_family_resolves_to_none():
     """No class-name guessing: an unknown model_type finds no adapter."""
     assert get_model_adapter("no_such_family") is None, "case: unknown"

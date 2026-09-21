@@ -19,40 +19,21 @@ Trainer tests live on the LlamaFactory side.
 """
 
 # pylint: disable=wrong-import-position,protected-access
-import sys
-import types
-from types import ModuleType
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-# Stub transformers and accelerate if not installed (needed by utils.py imports)
-try:
-    from transformers import Seq2SeqTrainer  # noqa: F401
-except ImportError:
-    transformers_stub = ModuleType("transformers")
-
-    class Seq2SeqTrainer:  # type: ignore[no-redef]
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
-
-    transformers_stub.Seq2SeqTrainer = Seq2SeqTrainer
-    sys.modules["transformers"] = transformers_stub
-
-if "accelerate.accelerator" not in sys.modules:
-    accelerate_stub = sys.modules.setdefault("accelerate", ModuleType("accelerate"))
-    accelerator_stub = ModuleType("accelerate.accelerator")
-    accelerator_stub.fsdp2_prepare_model = lambda accelerator, model: model
-    accelerate_stub.accelerator = accelerator_stub
-    sys.modules["accelerate.accelerator"] = accelerator_stub
-
 import hyper_parallel.integration.llamafactory.utils as lf_utils
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.integration.llamafactory.utils import (
     HyperParallelArguments,
     export_to_hf_format,
-    _build_fsdp2_kwargs,
-    _resolve_mp_policy,
     wrap_optimizer_with_skip_dtensor_dispatch,
+)
+from hyper_parallel.integration.llamafactory.qwen3_vl_moe import (
+    qwen3_vl_moe_replicated_vision_cp_wrapper,
+    qwen3_vl_moe_text_input_cp_wrapper,
 )
 
 
@@ -65,177 +46,226 @@ class _FakeOptimizer:
         return "stepped"
 
 
-def test_upcast_refreshes_refactored_hsdp_params(monkeypatch):
-    """Upcasting should refresh every HSDP parameter without relying on the removed is_sharded flag."""
+def test_parallelize_model_delegates_to_existing_model_infrastructure(monkeypatch):
+    """The integration entry should compose existing Hyper model-building APIs."""
+    from hyper_parallel.models._transformers import model_builder
+
+    model = torch.nn.Linear(2, 2, device="meta")
+    setup = SimpleNamespace(mesh_context=object())
+    calls = {}
+    monkeypatch.setattr(
+        model_builder,
+        "instantiate_infrastructure",
+        lambda **kwargs: ("planner", "manager"),
+    )
+
+    def _apply(input_model, **kwargs):
+        calls.update(kwargs)
+        return input_model
+
+    monkeypatch.setattr(model_builder, "apply_model_infrastructure", _apply)
+
+    result = lf_utils.parallelize_model(
+        model,
+        setup,
+        pretrained_path="checkpoint",
+        device=torch.device("cpu"),
+        activation_checkpoint="full",
+    )
+
+    assert result is model
+    assert calls["mesh"] is setup.mesh_context
+    assert calls["sharding_planner"] == "planner"
+    assert calls["fsdp2_manager"] == "manager"
+    assert calls["pretrained_path"] == "checkpoint"
+    assert calls["activation_checkpoint"] == "full"
+
+
+def test_hp_args_build_new_distributed_setup_for_cp_ep(monkeypatch):
+    """LlamaFactory arguments should feed Hyper's unified CP/EP/FSDP topology."""
+    build_calls = []
+    monkeypatch.setattr(lf_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(
+        lf_utils.MeshContext,
+        "build_meshs",
+        lambda self, device_type, world_size: build_calls.append((self, device_type, world_size)),
+    )
+    hp_args = HyperParallelArguments(
+        cp_size=2,
+        ep_size=4,
+        fsdp_size=4,
+        efsdp_size=2,
+        device_type="npu",
+        param_dtype="bf16",
+        reduce_dtype="fp32",
+        reshard_after_forward=False,
+        plan_overrides=[
+            {
+                "match": "*.mlp",
+                "when": "ep",
+                "region_dispatch": False,
+                "local_compute_fn": {
+                    "_target_": (
+                        "hyper_parallel.distributed.expert_parallel.recipes."
+                        "routed_only_ep_compute_fn"
+                    )
+                },
+            }
+        ],
+    )
+
+    distributed_setup = hp_args.build_distributed_setup()
+
+    mesh = distributed_setup.mesh_context
+    assert (mesh.dp_size, mesh.cp_size, mesh.ep_size) == (4, 2, 4)
+    assert (mesh.dp_replicate_size, mesh.dp_shard_size, mesh.edp_shard_size) == (2, 4, 2)
+    assert build_calls == [(mesh, "npu", 8)]
+    cp_spec = distributed_setup.plan_overrides["*.self_attn"]
+    assert cp_spec.inner_target == "self"
+    assert cp_spec.inner_wrapper == "sdpa_hf"
+    assert cp_spec.region_dispatch is False
+    ep_spec = distributed_setup.plan_overrides["*.mlp"]
+    assert ep_spec.local_compute_fn is not None
+    assert ep_spec.region_dispatch is False
+    strategy = distributed_setup.strategy_config
+    assert strategy.dp_shard_size == 4
+    assert strategy.edp_shard_size == 2
+    assert strategy.mix_precision.param_dtype == "bfloat16"
+    assert strategy.mix_precision.reduce_dtype == "float32"
+    assert strategy.mix_precision.output_dtype == "bfloat16"
+    assert strategy.reshard_after_forward is False
+
+
+def test_hp_args_do_not_enable_model_specific_replacements_by_default(monkeypatch):
+    """LlamaFactory defaults should not silently enable performance modules."""
+    monkeypatch.setattr(lf_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(lf_utils.MeshContext, "build_meshs", lambda *args, **kwargs: None)
+
+    setup = HyperParallelArguments(cp_size=2, device_type="npu").build_distributed_setup()
+
+    cp_spec = setup.plan_overrides["*.self_attn"]
+    assert cp_spec.inner_wrapper == "sdpa_hf"
+    assert not setup.module_replacements
+
+
+def test_hp_args_load_registered_qwen3_moe_ep_plan(monkeypatch):
+    """Qwen3-MoE should obtain native EP semantics from its model registration."""
+    monkeypatch.setattr(lf_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(lf_utils.MeshContext, "build_meshs", lambda *args, **kwargs: None)
+
+    setup = HyperParallelArguments(ep_size=4, device_type="npu").build_distributed_setup(
+        model_type="qwen3_moe"
+    )
+
+    ep_spec = setup.plan_overrides["*.mlp"]
+    assert ep_spec.local_compute_fn.callable.__name__ == "qwen3moe_ep_compute_fn"
+    assert ep_spec.local_compute_fn.use_grouped_gemm is True
+    assert ep_spec.region_dispatch is False
+    assert not setup.module_replacements
+
+
+def test_hp_args_load_registered_qwen3_moe_cp_plan(monkeypatch):
+    """Qwen3-MoE should use its native-attention async CP wrapper."""
+    monkeypatch.setattr(lf_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(lf_utils.MeshContext, "build_meshs", lambda *args, **kwargs: None)
+
+    setup = HyperParallelArguments(cp_size=2, device_type="npu").build_distributed_setup(
+        model_type="qwen3_moe"
+    )
+
+    cp_spec = setup.plan_overrides["*.self_attn"]
+    assert cp_spec.inner_wrapper.callable.__name__ == "qwen3_moe_async_ulysses_cp_wrapper"
+    assert cp_spec.inner_target == "self"
+    assert cp_spec.region_dispatch is False
+    assert not setup.module_replacements
+
+
+def test_hp_args_load_registered_qwen3_vl_moe_cp_ep_plan(monkeypatch):
+    """Qwen3-VL-MoE should parallelize only its text transformer."""
+    monkeypatch.setattr(lf_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(lf_utils.MeshContext, "build_meshs", lambda *args, **kwargs: None)
+
+    setup = HyperParallelArguments(cp_size=2, ep_size=4, device_type="npu").build_distributed_setup(
+        model_type="qwen3_vl_moe"
+    )
+
+    input_spec = setup.plan_overrides["model.language_model"]
+    assert input_spec.inner_wrapper.callable.__name__ == "qwen3_vl_moe_text_input_cp_wrapper"
+    attention_spec = setup.plan_overrides["model.language_model.layers.*.self_attn"]
+    assert attention_spec.inner_wrapper.callable.__name__ == "qwen3_moe_async_ulysses_cp_wrapper"
+    ep_spec = setup.plan_overrides["model.language_model.layers.*.mlp"]
+    assert ep_spec.local_compute_fn.callable.__name__ == "qwen3moe_ep_compute_fn"
+    assert ep_spec.local_compute_fn.use_grouped_gemm is True
+    assert "model.visual.patch_embed.proj" not in setup.plan_overrides
+    assert "model.visual.pos_embed" not in setup.plan_overrides
+    vision_attention = setup.plan_overrides["model.visual.blocks.*.attn"]
+    assert vision_attention.inner_wrapper.callable.__name__ == "qwen3_vl_moe_replicated_vision_cp_wrapper"
+    for match in ("model.visual.merger", "model.visual.deepstack_merger_list"):
+        vision_merger = setup.plan_overrides[match]
+        assert vision_merger.region_dispatch is False
+        assert vision_merger.inner_wrapper.callable.__name__ == "qwen3_vl_moe_replicated_vision_cp_wrapper"
+    assert not setup.module_replacements
+
+
+def test_qwen3_vl_moe_text_input_cp_wrapper_slices_after_visual_injection():
+    """The VLM wrapper shards text tensors while retaining matching visual features."""
     calls = []
-    hsdp_param = types.SimpleNamespace(reset_sharded_param=lambda: calls.append("reset"))
-    state = types.SimpleNamespace(hsdp_params=[hsdp_param])
-    state._init_mp_dtypes = lambda: calls.append("dtypes")
+    target = torch.nn.Module()
+    target.forward = lambda **kwargs: calls.append(kwargs) or kwargs
+    cp_mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1)
+    request = qwen3_vl_moe_text_input_cp_wrapper(target, None, None, cp_mesh, None)
 
-    class FakeHSDPModule:
-        """Minimal type marker for the isinstance check."""
+    inputs_embeds = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2)
+    position_ids = torch.arange(24).reshape(3, 1, 8)
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    visual_mask = torch.tensor([[False, True, True, False, False, True, False, True]])
+    deepstack = [torch.tensor([[10.0], [11.0], [12.0], [13.0]])]
 
-    module = FakeHSDPModule()
-    module.hsdp_scheduler = types.SimpleNamespace(hsdp_state=state)
-    converted = []
-    model = types.SimpleNamespace(
-        dtype=torch.bfloat16,
-        to=converted.append,
-        modules=lambda: [module],
-    )
-    monkeypatch.setattr(lf_utils, "HSDPModule", FakeHSDPModule)
-    accelerator = types.SimpleNamespace(mixed_precision="bf16", is_main_process=False)
-
-    lf_utils._maybe_upcast_trainable_params(accelerator, model)
-
-    assert converted == [torch.float32]
-    assert calls == ["reset", "dtypes"]
-
-
-def test_hp_args_reshard_after_forward_defaults_to_accelerate_plugin(monkeypatch):
-    """
-    Feature: reshard_after_forward config source
-    Description: When HyperParallel args do not override the setting, use Accelerate's FSDP2 plugin value.
-    Expectation: fully_shard kwargs inherit reshard_after_forward from the plugin by default.
-    """
-    monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils._build_device_mesh",
-        lambda accelerator, hp_args: None,
-    )
-    monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils.get_parameters_from_modules",
-        lambda modules, model, device: set(),
-    )
-    monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils._resolve_shard_size",
-        lambda mesh: 1,
+    request.forward(
+        inputs_embeds=inputs_embeds,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        visual_pos_masks=visual_mask,
+        deepstack_visual_embeds=deepstack,
     )
 
-    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
-    plugin = types.SimpleNamespace(
-        reshard_after_forward=False,
-        cpu_offload=False,
-        mixed_precision_policy=None,
-        ignored_modules=None,
+    forwarded = calls[0]
+    torch.testing.assert_close(forwarded["inputs_embeds"], inputs_embeds[:, 4:8])
+    torch.testing.assert_close(forwarded["position_ids"], position_ids[..., 4:8])
+    assert forwarded["attention_mask"] is attention_mask
+    torch.testing.assert_close(forwarded["visual_pos_masks"], visual_mask[:, 4:8])
+    torch.testing.assert_close(forwarded["deepstack_visual_embeds"][0], torch.tensor([[12.0], [13.0]]))
+    assert target._hp_cp_shards_inputs is True
+
+
+def test_qwen3_vl_moe_vision_cp_wrapper_keeps_replicated_forward():
+    target = torch.nn.Module()
+    target.forward = lambda hidden_states: hidden_states + 1
+    cp_mesh = SimpleNamespace(size=lambda: 2)
+
+    request = qwen3_vl_moe_replicated_vision_cp_wrapper(target, None, None, cp_mesh, None)
+
+    inputs = torch.zeros(2, 4, 8)
+    torch.testing.assert_close(request.forward(inputs), target.forward(inputs))
+
+
+def test_hp_args_do_not_guess_ep_plan_for_unregistered_model(monkeypatch):
+    """Unknown model families should not receive an unrelated EP semantic plan."""
+    monkeypatch.setattr(lf_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(lf_utils.MeshContext, "build_meshs", lambda *args, **kwargs: None)
+
+    setup = HyperParallelArguments(ep_size=4, device_type="npu").build_distributed_setup(
+        model_type="unregistered_moe"
     )
 
-    kwargs = _build_fsdp2_kwargs(
-        accelerator, torch.nn.Linear(2, 2), HyperParallelArguments(), plugin
-    )
-
-    assert kwargs["reshard_after_forward"] is False
-
-
-def test_hp_args_reshard_after_forward_overrides_accelerate_plugin(monkeypatch):
-    """
-    Feature: reshard_after_forward config override
-    Description: Explicit HyperParallel args should override Accelerate's FSDP2 plugin value.
-    Expectation: fully_shard kwargs use the HyperParallel override when provided.
-    """
-    monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils._build_device_mesh",
-        lambda accelerator, hp_args: None,
-    )
-    monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils.get_parameters_from_modules",
-        lambda modules, model, device: set(),
-    )
-    monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils._resolve_shard_size",
-        lambda mesh: 1,
-    )
-
-    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
-    plugin = types.SimpleNamespace(
-        reshard_after_forward=False,
-        cpu_offload=False,
-        mixed_precision_policy=None,
-        ignored_modules=None,
-    )
-
-    hp_args = HyperParallelArguments(reshard_after_forward=True)
-    kwargs = _build_fsdp2_kwargs(accelerator, torch.nn.Linear(2, 2), hp_args, plugin)
-
-    assert kwargs["reshard_after_forward"] is True
-
-
-def test_hp_args_mp_defaults_to_accelerate_policy():
-    """
-    Feature: mixed precision config source
-    Description: When HyperParallel args do not override mp settings, inherit Accelerate's normalized policy.
-    Expectation: HyperParallel mp policy matches the plugin-provided policy values.
-    """
-    plugin = types.SimpleNamespace(
-        mixed_precision_policy=types.SimpleNamespace(
-            param_dtype=torch.float16,
-            reduce_dtype=torch.bfloat16,
-            output_dtype=torch.float16,
-            cast_forward_inputs=False,
-        )
-    )
-
-    policy = _resolve_mp_policy(plugin, HyperParallelArguments())
-
-    assert policy.param_dtype == torch.float16
-    assert policy.reduce_dtype == torch.bfloat16
-    assert policy.output_dtype == torch.float16
-    assert policy.cast_forward_inputs is False
-
-
-def test_hp_args_mp_overrides_accelerate_policy():
-    """
-    Feature: mixed precision override
-    Description: Explicit HyperParallel dtype overrides should replace the inherited Accelerate policy fields.
-    Expectation: Only the configured HyperParallel fields override the plugin policy.
-    """
-    plugin = types.SimpleNamespace(
-        mixed_precision_policy=types.SimpleNamespace(
-            param_dtype=torch.float16,
-            reduce_dtype=torch.float16,
-            output_dtype=torch.float16,
-            cast_forward_inputs=False,
-        )
-    )
-
-    hp_args = HyperParallelArguments(param_dtype="bfloat16", reduce_dtype="float32")
-    policy = _resolve_mp_policy(plugin, hp_args)
-
-    assert policy.param_dtype == torch.bfloat16
-    assert policy.reduce_dtype == torch.float32
-    assert policy.output_dtype == torch.bfloat16
-    assert policy.cast_forward_inputs is False
-
-
-def test_hp_args_mp_without_accelerate_policy_stays_empty_by_default():
-    """
-    Feature: mixed precision default inheritance
-    Description: Without an Accelerate policy and without HyperParallel overrides,
-    do not force a backend default mp policy.
-    Expectation: The resulting HyperParallel mixed precision policy remains empty.
-    """
-    plugin = types.SimpleNamespace(mixed_precision_policy=None)
-
-    policy = _resolve_mp_policy(plugin, HyperParallelArguments())
-
-    assert policy.param_dtype is None
-    assert policy.reduce_dtype is None
-    assert policy.output_dtype is None
-
-
-def test_hp_args_mp_accepts_accelerate_style_dtype_aliases():
-    """
-    Feature: dtype alias compatibility
-    Description: HyperParallel dtype overrides should accept Accelerate-style fpXX / bf16 aliases.
-    Expectation: Aliases are normalized to the matching torch dtypes.
-    """
-    plugin = types.SimpleNamespace(mixed_precision_policy=None)
-
-    hp_args = HyperParallelArguments(param_dtype="bf16", reduce_dtype="fp32")
-    policy = _resolve_mp_policy(plugin, hp_args)
-
-    assert policy.param_dtype == torch.bfloat16
-    assert policy.reduce_dtype == torch.float32
-    assert policy.output_dtype == torch.bfloat16
+    assert "*.mlp" not in setup.plan_overrides
+    assert not setup.module_replacements
 
 
 def test_wrap_optimizer_step_uses_skip_dtensor_dispatch(monkeypatch):
@@ -265,6 +295,67 @@ def test_wrap_optimizer_step_uses_skip_dtensor_dispatch(monkeypatch):
     assert result == "stepped"
     assert optimizer.calls == ["closure"]
     assert enter_exit == ["enter", "exit"]
+
+
+def test_wrap_chained_optimizer_wraps_leaf_steps(monkeypatch):
+    """DCP may call a leaf optimizer directly while initializing its state dict."""
+    enter_exit = []
+
+    class _FakeSkip:
+        def __enter__(self):
+            enter_exit.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            enter_exit.append("exit")
+
+    leaf_optimizer = _FakeOptimizer()
+    chained_optimizer = _FakeOptimizer()
+    chained_optimizer.optimizers_dict = {"leaf": leaf_optimizer}
+    monkeypatch.setattr(lf_utils, "SkipDTensorDispatch", _FakeSkip)
+
+    wrap_optimizer_with_skip_dtensor_dispatch(chained_optimizer)
+    leaf_optimizer.step()
+    chained_optimizer.step()
+
+    assert leaf_optimizer.calls == [None]
+    assert chained_optimizer.calls == [None]
+    assert enter_exit == ["enter", "exit", "enter", "exit"]
+
+
+def test_localize_optimizer_state_preserves_flattened_chained_state_dict():
+    """Flattened FQN keys from ChainedOptimizer must survive checkpoint localization."""
+    optimizer_state = {
+        "state.proj.weight.exp_avg": torch.ones(2),
+        "param_groups.proj.weight.lr": 1.0e-3,
+        "metadata": {"steps": [torch.tensor(3)]},
+    }
+
+    localized = lf_utils._localize_optimizer_state(optimizer_state)
+
+    assert localized.keys() == optimizer_state.keys()
+    assert torch.equal(localized["state.proj.weight.exp_avg"], torch.ones(2))
+    assert localized["param_groups.proj.weight.lr"] == 1.0e-3
+    assert localized["metadata"]["steps"][0].device.type == "cpu"
+
+
+def test_load_hsdp_checkpoint_delegates_chained_optimizer_state(monkeypatch, tmp_path):
+    """Chained optimizer checkpoints should use their FQN-aware load_state_dict implementation."""
+    model = torch.nn.Linear(2, 2)
+    chained_optimizer = ChainedOptimizer(
+        model,
+        {"adamw": torch.optim.AdamW(model.parameters(), lr=1.0e-3)},
+    )
+    saved_state = {"state.weight.exp_avg": torch.ones_like(model.weight)}
+    torch.save(saved_state, tmp_path / "optimizer_rank0.pt")
+    loaded_states = []
+    monkeypatch.setattr(lf_utils.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(chained_optimizer, "load_state_dict", loaded_states.append)
+
+    lf_utils.load_hsdp_optimizer_and_scheduler(chained_optimizer, None, str(tmp_path))
+
+    assert len(loaded_states) == 1
+    assert torch.equal(loaded_states[0]["state.weight.exp_avg"], saved_state["state.weight.exp_avg"])
 
 
 def test_export_to_hf_format_uses_hf_default_shard_size(monkeypatch, tmp_path):
@@ -309,7 +400,7 @@ def test_export_to_hf_format_uses_hf_default_shard_size(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Tests: fsdp_size validation and device mesh construction
+# Tests: fsdp_size validation
 # ---------------------------------------------------------------------------
 
 
@@ -357,122 +448,3 @@ def test_hp_args_fsdp_size_rejects_non_int():
         args = HyperParallelArguments(fsdp_size=bad)
         with pytest.raises(ValueError, match="fsdp_size"):
             args.validate()
-
-
-def _patch_mesh_environment(monkeypatch, world_size):
-    """Install fake mesh initialization and distributed world size."""
-    calls = {}
-
-    def fake_init(device_type, shape, mesh_dim_names=None):
-        calls["device_type"] = device_type
-        calls["shape"] = shape
-        calls["mesh_dim_names"] = mesh_dim_names
-        return f"mesh<{shape}, {mesh_dim_names}>"
-
-    monkeypatch.setattr(lf_utils, "init_device_mesh", fake_init)
-    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: world_size)
-    return calls
-
-
-def test_build_device_mesh_2d_when_fsdp_size_lt_world_size(monkeypatch):
-    """
-    Feature: 2D HSDP mesh construction
-    Description: fsdp_size < world_size and world_size % fsdp_size == 0 builds a 2D (dp, fsdp) mesh.
-    Expectation: init_device_mesh receives shape (dp_size, fsdp_size) with dim names ("dp", "fsdp").
-    """
-    calls = _patch_mesh_environment(monkeypatch, world_size=8)
-    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
-    hp_args = HyperParallelArguments(fsdp_size=4, device_type="cpu")
-
-    mesh = lf_utils._build_device_mesh(accelerator, hp_args)
-
-    assert calls["shape"] == (2, 4), f"Expected shape (2, 4), got {calls['shape']}"
-    assert calls["mesh_dim_names"] == ("dp", "fsdp"), (
-        f"Expected dim names ('dp', 'fsdp'), got {calls['mesh_dim_names']}"
-    )
-    assert mesh == "mesh<(2, 4), ('dp', 'fsdp')>", f"Unexpected mesh: {mesh}"
-
-
-def test_build_device_mesh_1d_when_fsdp_size_ge_world_size(monkeypatch):
-    """
-    Feature: 1D fallback when fsdp_size covers the whole world
-    Description: fsdp_size >= world_size collapses to a 1D ("dp",) mesh.
-    Expectation: init_device_mesh receives shape (world_size,) with dim name ("dp",).
-    """
-    calls = _patch_mesh_environment(monkeypatch, world_size=4)
-    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
-    hp_args = HyperParallelArguments(fsdp_size=4, device_type="cpu")
-
-    lf_utils._build_device_mesh(accelerator, hp_args)
-
-    assert calls["shape"] == (4,), f"Expected shape (4,), got {calls['shape']}"
-    assert calls["mesh_dim_names"] == ("dp",), (
-        f"Expected dim names ('dp',), got {calls['mesh_dim_names']}"
-    )
-
-
-def test_build_device_mesh_raises_when_world_size_not_divisible(monkeypatch):
-    """
-    Feature: Divisibility check
-    Description: world_size not divisible by fsdp_size must raise.
-    Expectation: ValueError naming both world_size and fsdp_size.
-    """
-    _patch_mesh_environment(monkeypatch, world_size=8)
-    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
-    hp_args = HyperParallelArguments(fsdp_size=3, device_type="cpu")
-
-    with pytest.raises(
-        ValueError, match="world_size=8 must be divisible by fsdp_size=3"
-    ):
-        lf_utils._build_device_mesh(accelerator, hp_args)
-
-
-def test_build_device_mesh_ignores_accelerate_mesh_when_fsdp_size_set(monkeypatch):
-    """
-    Feature: fsdp_size bypasses accelerate-cached mesh
-    Description: When fsdp_size is set, accelerator.torch_device_mesh is ignored
-    so we get a fresh 2D HSDP mesh instead of a cached 1D FSDP mesh.
-    Expectation: init_device_mesh is called and the cached mesh is not returned.
-    """
-    calls = _patch_mesh_environment(monkeypatch, world_size=8)
-    # Accelerator carries a cached mesh that *would* be returned by the
-    # default branch — fsdp_size must override it.
-    accelerator = types.SimpleNamespace(
-        device=torch.device("cpu"),
-        torch_device_mesh="CACHED_1D_MESH",
-        parallelism_config=None,
-    )
-    hp_args = HyperParallelArguments(fsdp_size=4, device_type="cpu")
-
-    mesh = lf_utils._build_device_mesh(accelerator, hp_args)
-
-    assert mesh != "CACHED_1D_MESH", (
-        "fsdp_size must override the cached accelerator mesh"
-    )
-    assert calls["shape"] == (2, 4), (
-        f"Expected init_device_mesh called with shape (2, 4), got {calls['shape']}"
-    )
-
-
-def test_build_device_mesh_uses_accelerate_mesh_when_fsdp_size_none(monkeypatch):
-    """
-    Feature: backward compatibility when fsdp_size is None
-    Description: With fsdp_size=None, behavior is unchanged — the accelerate-cached mesh is returned.
-    Expectation: init_device_mesh is NOT called; the cached mesh is returned verbatim.
-    """
-    calls = _patch_mesh_environment(monkeypatch, world_size=8)
-    accelerator = types.SimpleNamespace(
-        device=torch.device("cpu"),
-        torch_device_mesh="CACHED_1D_MESH",
-        parallelism_config=None,
-    )
-    hp_args = HyperParallelArguments()  # fsdp_size=None
-
-    mesh = lf_utils._build_device_mesh(accelerator, hp_args)
-
-    assert mesh == "CACHED_1D_MESH", (
-        f"Expected cached mesh to be returned, got {mesh!r}"
-    )
-    assert "shape" not in calls, (
-        "init_device_mesh should not be called when fsdp_size is None and cached mesh exists"
-    )
