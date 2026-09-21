@@ -12,26 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Context-parallel helpers for the LlamaFactory integration."""
-from .inputs import (
-    _get_cp_dp_ranks,
-    get_cp_group,
-    get_cp_group_ranks,
-    get_cp_rank,
-    get_dp_rank,
-    shard_inputs_for_cp,
+"""Distributed adapters for Qwen3-VL-MoE."""
+
+from hyper_parallel.models.qwen3_vl_moe.adapter.distributed.context_parallel import (
+    qwen3_vl_moe_async_ulysses_cp_wrapper,
+    qwen3_vl_moe_replicated_vision_cp_wrapper,
+    qwen3_vl_moe_text_input_cp_wrapper,
 )
-from .loss import _build_cp_shift_labels, _enable_context_parallel_loss_patch
-from .context_parallel_prepare import cp_prepare_model
+from hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel import (
+    qwen3_vl_moe_ep_compute_fn,
+)
 
 __all__ = [
-    "_enable_context_parallel_loss_patch",
-    "_get_cp_dp_ranks",
-    "_build_cp_shift_labels",
-    "cp_prepare_model",
-    "get_cp_group",
-    "get_cp_group_ranks",
-    "get_cp_rank",
-    "get_dp_rank",
-    "shard_inputs_for_cp",
+    "qwen3_vl_moe_async_ulysses_cp_wrapper",
+    "qwen3_vl_moe_ep_compute_fn",
+    "qwen3_vl_moe_replicated_vision_cp_wrapper",
+    "qwen3_vl_moe_text_input_cp_wrapper",
 ]

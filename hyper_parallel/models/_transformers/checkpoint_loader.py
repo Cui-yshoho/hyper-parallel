@@ -893,6 +893,7 @@ def _mark_loaded_targets_initialized(
     _validate_materialized(loaded_targets)
     for target in loaded_targets:
         target.tensor._is_hf_initialized = True  # pylint: disable=W0212
+        target.module._is_hf_initialized = True  # pylint: disable=W0212
         snapshots[target.fqn] = _snapshot_target(target)
     return snapshots
 
@@ -936,6 +937,8 @@ def _resolve_tied_aliases(
             )
         target.tensor._is_hf_initialized = True  # pylint: disable=W0212
         source.tensor._is_hf_initialized = True  # pylint: disable=W0212
+        target.module._is_hf_initialized = True  # pylint: disable=W0212
+        source.module._is_hf_initialized = True  # pylint: disable=W0212
         initialized_aliases.update((target_name, source_name))
     return initialized_aliases
 

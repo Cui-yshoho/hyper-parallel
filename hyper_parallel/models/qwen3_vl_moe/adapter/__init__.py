@@ -12,8 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public LlamaFactory expert-parallel preparation entry point."""
-
-__all__ = ["ep_prepare_model"]
-
-from .expert_parallel import ep_prepare_model
+"""Qwen3-VL-MoE model adapter."""
