@@ -19,7 +19,6 @@ __all__ = ["VLMTrainer"]
 from collections import defaultdict
 from typing import Any, Dict
 
-from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
@@ -57,9 +56,11 @@ class VLMTrainer:
 
         # get_batch
         self._build_get_batch()
+        self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
@@ -110,7 +111,7 @@ class VLMTrainer:
         )
 
     def _build_get_batch(self) -> None:
-        """Build the DataLoader-to-LLM batch adapter."""
+        """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
@@ -186,6 +187,7 @@ class VLMTrainer:
                 micro_step,
                 num_micro_steps,
             )
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
             self.base.current_token_counts = count_loss_token(loss_inputs)
             self.base.step_token_counts = {
                 name: token_count * num_micro_steps
@@ -205,7 +207,6 @@ class VLMTrainer:
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one VLM training step."""
-        config = self.base.config
         first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
         training_batches = [first_training_batch]
@@ -215,6 +216,7 @@ class VLMTrainer:
         self.on_step_begin(
             micro_batches=[model_inputs for model_inputs, _ in training_batches]
         )
+        self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss, total_loss_dict = self._forward_backward_micro_batches(
@@ -222,16 +224,15 @@ class VLMTrainer:
             num_micro_steps,
         )
 
-        grad_norm = clip_grad_norm_(
-            self.base.model,
-            config.training.max_grad_norm,
-        )
-
+        grad_norm = self.base.prepare_optimizer_step()
         self.base.step_optimizers_and_schedulers()
 
         # Checkpoint and logging callbacks observe completed optimizer updates.
         self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
+        self.base._end_model_integration_step(
+            {"loss": total_loss, "grad_norm": grad_norm_value}
+        )
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,

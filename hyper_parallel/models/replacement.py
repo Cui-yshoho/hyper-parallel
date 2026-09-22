@@ -25,6 +25,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
 from torch import nn
+
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
@@ -159,7 +160,11 @@ def _select_replacement_spec(
         pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
     ]
     if unmatched_patterns:
-        raise ValueError(f"module replacement pattern(s) matched no module: {unmatched_patterns}")
+        raise ValueError(
+            "[HP-REPLACE-001] module replacement pattern(s) matched no final module: "
+            f"{unmatched_patterns}. Inspect the finalized module inventory and update the "
+            "adapter pattern; do not silently skip a required replacement."
+        )
 
 
 def _validate_non_nested_targets(targets: tuple[ModuleReplacementTarget, ...]) -> None:
@@ -303,7 +308,9 @@ def _validate_forward_compatibility(
         replacement_signature.bind(*keyword_probe_positional_args, **keyword_args)
     except (TypeError, ValueError) as error:
         raise ValueError(
-            f"replacement for {fqn!r} has an incompatible forward signature"
+            f"[HP-REPLACE-002] replacement for {fqn!r} has an incompatible "
+            "forward signature; preserve the source call contract or add an explicit "
+            "model-owned wrapper"
         ) from error
 
 
@@ -319,29 +326,41 @@ def _validate_replacement(
     if not isinstance(replacement, nn.Module):
         raise TypeError(f"replacement factory for {fqn!r} must return nn.Module")
     if source.training != replacement.training:
-        raise ValueError(f"replacement for {fqn!r} must preserve training state")
+        raise ValueError(
+            f"[HP-REPLACE-002] replacement for {fqn!r} must preserve training state"
+        )
     if not has_weight_transforms:
         if _registered_names(source) != _registered_names(replacement):
-            raise ValueError(f"replacement for {fqn!r} changed registered module/parameter/buffer names")
+            raise ValueError(
+                f"[HP-REPLACE-002] replacement for {fqn!r} changed registered "
+                "module/parameter/buffer names without checkpoint transforms"
+            )
         for kind in ("parameter", "buffer"):
             source_identities = _named_identities(source, kind=kind)
             replacement_identities = _named_identities(replacement, kind=kind)
             if tuple(source_identities) != tuple(replacement_identities):
-                raise ValueError(f"replacement for {fqn!r} changed {kind} names")
+                raise ValueError(
+                    f"[HP-REPLACE-002] replacement for {fqn!r} changed {kind} names"
+                )
             for name, source_value in source_identities.items():
                 if replacement_identities[name] is not source_value:
                     raise ValueError(
-                        f"replacement for {fqn!r} must preserve {kind} {name!r} identity"
+                        f"[HP-REPLACE-002] replacement for {fqn!r} must preserve "
+                        f"{kind} {name!r} identity"
                     )
         if tuple(source.state_dict()) != tuple(replacement.state_dict()):
-            raise ValueError(f"replacement for {fqn!r} changed state_dict keys")
+            raise ValueError(
+                f"[HP-REPLACE-002] replacement for {fqn!r} changed state_dict keys"
+            )
     _validate_forward_compatibility(source, replacement, fqn)
     hook_registries = {
         name: value for name, value in vars(source).items()
         if "hook" in name and isinstance(value, Mapping) and value
     }
     if hook_registries:
-        raise ValueError(f"replacement for {fqn!r} cannot migrate existing module hooks")
+        raise ValueError(
+            f"[HP-REPLACE-002] replacement for {fqn!r} cannot migrate existing module hooks"
+        )
 
 
 def _apply_module_replacement_actions(
@@ -446,4 +465,13 @@ def apply_module_replacements(
             model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
             model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
         weights_mapping[:0] = extra_transforms
+    previous_replacements = tuple(getattr(model, "_hp_replaced_module_fqns", ()) or ())
+    current_replacements = tuple(
+        fqn
+        for target in plan.targets
+        for fqn in target.module_fqns
+    )
+    model._hp_replaced_module_fqns = tuple(  # pylint: disable=protected-access
+        dict.fromkeys((*previous_replacements, *current_replacements))
+    )
     return model, weights_mapping
