@@ -19,6 +19,8 @@ unrelated optional Omni custom operators. Accessing an Omni-backed module still
 loads and validates that dependency normally.
 """
 
+__all__: list[str] = []
+
 import importlib
 from typing import Any
 
@@ -39,8 +41,7 @@ _EXPORT_TO_MODULE = {
     "SharedExpert": "shared_expert",
     "SwiGLUMLP": "swiglu_mlp",
 }
-
-__all__ = list(_EXPORT_TO_MODULE)
+__all__.extend(_EXPORT_TO_MODULE)
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
