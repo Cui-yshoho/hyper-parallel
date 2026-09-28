@@ -73,6 +73,11 @@ class TestPassConfigDefaults(unittest.TestCase):
             1,
             (f"pp_microbatch_size default should be 1, got {cfg.pp_microbatch_size}"),
         )
+        self.assertEqual(
+            cfg.pp_schedule,
+            "gpipe",
+            (f"pp_schedule default should be 'gpipe', got {cfg.pp_schedule!r}"),
+        )
 
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
@@ -84,6 +89,7 @@ class TestPassConfigDefaults(unittest.TestCase):
             pp_enabled=True,
             pp_degree=4,
             pp_microbatch_size=2,
+            pp_schedule="1f1b",
         )
         self.assertFalse(cfg.enable_overlap)
         self.assertFalse(cfg.fsdp_enabled)
@@ -92,6 +98,7 @@ class TestPassConfigDefaults(unittest.TestCase):
         self.assertTrue(cfg.pp_enabled)
         self.assertEqual(cfg.pp_degree, 4)
         self.assertEqual(cfg.pp_microbatch_size, 2)
+        self.assertEqual(cfg.pp_schedule, "1f1b")
 
 
 class TestPassConfigValidation(unittest.TestCase):
@@ -130,6 +137,17 @@ class TestPassConfigValidation(unittest.TestCase):
         cfg = PassConfig(fsdp_degree=None)
         self.assertIsNone(cfg.fsdp_degree)
 
+    def test_rejects_unknown_pp_schedule(self):
+        """Test an unknown ``pp_schedule`` name raises ValueError."""
+        for bad in ("zbv", "1F-1B", ""):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_schedule=bad)
+            self.assertIn(
+                "pp_schedule",
+                str(ctx.exception),
+                f"error for pp_schedule={bad!r} should mention pp_schedule",
+            )
+
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.
 
@@ -160,7 +178,7 @@ class TestPassConfigTorchFree(unittest.TestCase):
 
     def test_module_does_not_import_torch_at_top(self):
         """Test no top-level torch import in ``pass_config`` module."""
-        import hyper_parallel.compile.pass_config as mod
+        import hyper_parallel.compile.pass_config as mod  # pylint: disable=C0415
 
         # torch / torch.distributed must not be a side-effect of importing
         # the config module. (It may be imported by *something else* in the
