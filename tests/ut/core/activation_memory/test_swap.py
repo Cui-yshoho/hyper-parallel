@@ -1268,6 +1268,15 @@ class TestSwapManager(unittest.TestCase):
         self.assertEqual(mgr._layer_count, 0)
         self.assertIsNone(mgr._copy_stream)
 
+    def test_warn_missing_group_once_is_idempotent(self):
+        """Test warn_missing_group_once emits a single warning per process."""
+        mgr = SwapManager()
+        with patch.object(swap_module.warnings, "warn") as warn_mock:
+            mgr.warn_missing_group_once()
+            mgr.warn_missing_group_once()
+        warn_mock.assert_called_once()
+        self.assertIn("outside an active swap group", warn_mock.call_args.args[0])
+
     def test_ensure_group_creates(self):
         """Test ensure_group creates a new SwapGroup."""
         mgr = SwapManager()

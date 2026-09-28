@@ -886,6 +886,7 @@ class SwapManager:
         )
         self._layer_count: int = 0
         self._copy_stream: Optional[Any] = None
+        self._missing_group_warned: bool = False
 
     def __new__(cls):
         if cls._instance is None:
@@ -969,6 +970,24 @@ class SwapManager:
     def set_current_group_name(self, group_name: str) -> None:
         """Set the name of the currently active swap group."""
         self._current_group_name.set(group_name)
+
+    def warn_missing_group_once(self) -> None:
+        """Warn once per process when ``MUST_SWAP`` runs outside any swap group.
+
+        Activation swap only serves pipeline chunks the schedule marked as
+        swappable; every other region keeps its activations on device. A single
+        warning keeps that fallback discoverable without repeating for every
+        dispatched operator.
+        """
+        if self._missing_group_warned:
+            return
+        self._missing_group_warned = True
+        warnings.warn(
+            "Activation swap requested MUST_SWAP outside an active swap group; "
+            "the activations were kept on device instead of being offloaded.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     def active_group_count(self) -> int:
         """Return the number of live swap groups for lifecycle diagnostics."""
