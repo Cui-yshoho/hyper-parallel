@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # pylint: disable=line-too-long,missing-public-type-hints,missing-public-docstring
 # pylint: disable=unused-argument,invalid-name,missing-module-docstring
 # pylint: disable=missing-function-docstring
+# pylint: disable=forbidden-backend-import
 
 from typing import Optional
 

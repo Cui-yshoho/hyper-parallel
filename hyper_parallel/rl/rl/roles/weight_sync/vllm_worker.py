@@ -235,7 +235,7 @@ def init_direct_reshard_group(
     expected_tensor_parallel_size: int,
 ) -> dict[str, Any]:
     """Join one source-rank-to-target-TP stateless HCCL broadcast group."""
-    unused_topology, dp_rank, tp_rank, target_tp_rank = _direct_worker(
+    _, dp_rank, tp_rank, target_tp_rank = _direct_worker(
         worker,
         target_tp_rank,
         expected_data_parallel_size,
@@ -341,6 +341,19 @@ def _validate_update(worker: Any, policy_version: int, *, transport: str) -> int
     return version
 
 
+def _validate_direct_parameter(
+    parameter: Any, entry: Mapping[str, Any], transport: str, name: str,
+) -> None:
+    """Check that one rollout parameter can receive the planned fragment."""
+    destination_dtype = getattr(torch, str(entry.get("destination_dtype_name", entry["dtype_name"])))
+    destination_element_size = int(entry.get("destination_element_size", entry["element_size"]))
+    if int(parameter.element_size()) != destination_element_size or parameter.dtype != destination_dtype:
+        raise ValueError(
+            f"{transport} parameter {name!r} dtype mismatch: "
+            f"parameter={parameter.dtype}, destination={destination_dtype}"
+        )
+
+
 def _apply_direct_bucket(
     parameters: Mapping[str, Any],
     packed: Any,
@@ -357,29 +370,14 @@ def _apply_direct_bucket(
         if parameter is None:
             raise ValueError(f"{transport} parameter {name!r} is missing")
         source_dtype = getattr(torch, str(entry["dtype_name"]))
-        destination_dtype = getattr(
-            torch,
-            str(entry.get("destination_dtype_name", entry["dtype_name"])),
-        )
-        destination_element_size = int(
-            entry.get("destination_element_size", entry["element_size"])
-        )
-        if (
-            int(parameter.element_size()) != destination_element_size
-            or parameter.dtype != destination_dtype
-        ):
-            raise ValueError(
-                f"{transport} parameter {name!r} dtype mismatch: "
-                f"parameter={parameter.dtype}, destination={destination_dtype}"
-            )
+        _validate_direct_parameter(parameter, entry, transport, name)
         lengths = tuple(
             int(value)
             for value in entry.get("destination_lengths", entry["lengths"])
         )
         starts = tuple(int(value) for value in entry["destination_starts"])
         num_bytes = int(entry["num_bytes"])
-        offset = int(entry["buffer_offset"])
-        fragment = packed.narrow(0, offset, num_bytes).view(source_dtype).view(lengths)
+        fragment = packed.narrow(0, int(entry["buffer_offset"]), num_bytes).view(source_dtype).view(lengths)
         destination_slice = tuple(
             slice(start, start + length) for start, length in zip(starts, lengths)
         )
@@ -425,6 +423,17 @@ def receive_direct_reshard(
     if group is None:
         raise RuntimeError(f"Direct reshard HCCL group {group_id!r} is not initialized")
 
+    received_bytes = _receive_direct_buckets(worker, group, buckets)
+    worker._hyper_pending_policy_version = version
+    return _receive_ack(
+        topology,
+        received_bytes,
+        bucket_count=len(buckets),
+    )
+
+
+def _receive_direct_buckets(worker: Any, group: Any, buckets: list[Mapping[str, Any]]) -> int:
+    """Receive, synchronize and apply each bucket in publication order."""
     parameters = dict(worker.model_runner.get_model().named_parameters())
     received_bytes = 0
     for bucket in buckets:
@@ -439,12 +448,7 @@ def receive_direct_reshard(
             transport="Direct reshard rollout",
         )
         del packed
-    worker._hyper_pending_policy_version = version
-    return _receive_ack(
-        topology,
-        received_bytes,
-        bucket_count=len(buckets),
-    )
+    return received_bytes
 
 
 def _ipc_worker(
@@ -485,32 +489,13 @@ def _import_ipc_buffer(handles: Mapping[Any, Any], physical_npu_id: Any) -> Any:
     return rebuild_npu_tensor(*rebuild_args)
 
 
-def receive_ipc_direct_reshard(
-    worker: Any,
-    *,
-    payload_pickled: str,
-    policy_version: int,
-) -> dict[str, Any]:
-    """Import same-NPU packed buffers and scatter them into TP-local weights."""
-    # Torch and vLLM-Ascend are optional outside the Torch-NPU RL runtime.
-
-    version = _validate_update(worker, policy_version, transport="IPC direct")
-
-    payload = pickle.loads(base64.b64decode(payload_pickled.encode("ascii")))
-    topology, physical_npu_id = _ipc_worker(worker, payload["worker_topology"])
-    tp_rank = int(topology["tp_rank"])
-    worker_tp_size = int(topology.get("tp_size", 1))
-    tensor_parallel_size = int(payload["tensor_parallel_size"])
-    if tensor_parallel_size != worker_tp_size:
-        raise ValueError(
-            "IPC direct payload TP size differs from the worker topology: "
-            f"payload={tensor_parallel_size}, worker={worker_tp_size}"
-        )
-    buckets = payload["buckets_by_target"].get(tp_rank, ())
+def _apply_ipc_direct_buckets(
+    worker: Any, buckets: Any, physical_npu_id: Any,
+) -> int:
+    """Import bounded buffers and apply each bucket to local parameters."""
     parameters = dict(worker.model_runner.get_model().named_parameters())
     received_bytes = 0
     imported_buffers = []
-
     try:
         for bucket in buckets:
             handles = bucket["ipc_handles"]
@@ -532,6 +517,28 @@ def receive_ipc_direct_reshard(
         if imported_buffers:
             torch.npu.current_stream().synchronize()
             imported_buffers.clear()
+    return received_bytes
+
+
+def receive_ipc_direct_reshard(
+    worker: Any,
+    *,
+    payload_pickled: str,
+    policy_version: int,
+) -> dict[str, Any]:
+    """Import same-NPU packed buffers and scatter them into TP-local weights."""
+    version = _validate_update(worker, policy_version, transport="IPC direct")
+    payload = pickle.loads(base64.b64decode(payload_pickled.encode("ascii")))
+    topology, physical_npu_id = _ipc_worker(worker, payload["worker_topology"])
+    worker_tp_size = int(topology.get("tp_size", 1))
+    tensor_parallel_size = int(payload["tensor_parallel_size"])
+    if tensor_parallel_size != worker_tp_size:
+        raise ValueError(
+            "IPC direct payload TP size differs from the worker topology: "
+            f"payload={tensor_parallel_size}, worker={worker_tp_size}"
+        )
+    buckets = payload["buckets_by_target"].get(int(topology["tp_rank"]), ())
+    received_bytes = _apply_ipc_direct_buckets(worker, buckets, physical_npu_id)
 
     worker._hyper_pending_policy_version = version
     return _receive_ack(

@@ -14,6 +14,12 @@
 # ============================================================================
 """One publication transaction composed with a data strategy and an IPC/HCCL transport."""
 
+__all__ = [
+    "WeightPublisher",
+    "build_weight_transfer",
+]
+
+
 import logging
 from typing import Any, Mapping, Optional, Union
 
@@ -88,6 +94,7 @@ class WeightSource:
         state = _local_state_dict(payload, operation="weight publication")
         return alias_tied_embeddings(self.adapter.map_local_state_dict(state), self.model)
 
+
 def _validate_plan_sources(names: frozenset[str], state: Mapping[str, Any]) -> None:
     missing = sorted(names - state.keys())
     if missing:
@@ -128,15 +135,17 @@ class DirectReshardStrategy:
         rank_descriptions = [None] * dist.get_world_size()
         dist.all_gather_object(rank_descriptions, descriptions)
         sources = resolve_source_layouts(rank_descriptions)
+
+        def query_destinations() -> Any:
+            """Query every rollout worker through the synchronized coordinator."""
+            return direct_reshard_workers(
+                client,
+                data_parallel_size=self.data_parallel_size,
+                tensor_parallel_size=self.tensor_parallel_size,
+            )
+
         destinations = resolve_destination_layouts(
-            coordinator_call(
-                "direct reshard rollout layout query",
-                lambda: direct_reshard_workers(
-                    client,
-                    data_parallel_size=self.data_parallel_size,
-                    tensor_parallel_size=self.tensor_parallel_size,
-                ),
-            ),
+            coordinator_call("direct reshard rollout layout query", query_destinations),
             {source.name: source.global_shape for source in sources},
         )
         return sources, destinations
@@ -241,26 +250,30 @@ class FullGatherStrategy:
             raise RuntimeError("Full gather strategy has no prepared buckets")
         max_bucket_bytes = 0
         for bucket_index, bucket in enumerate(self._buckets):
+            def materialize(selected: Any = bucket) -> Any:
+                """Materialize the selected bucket under synchronized failure handling."""
+                return materialize_packed_weight_bucket(state, selected)
+
             packed = synchronized_call(
                 "full-gather bucket materialization",
-                lambda selected=bucket: materialize_packed_weight_bucket(
-                    state,
-                    selected,
-                ),
+                materialize,
             )
+
+            def send_bucket(selected: Any = bucket, payload: Any = packed, index: int = bucket_index) -> Any:
+                """Send the selected payload and retain its bucket identity."""
+                return transport.send_packed_bucket(
+                    client,
+                    self._context,
+                    index,
+                    self.source.adapter.packed_metadata(selected.worker_metadata()),
+                    selected.total_bytes,
+                    payload,
+                    version,
+                )
+
             ack = synchronized_call(
                 "full-gather bucket transfer",
-                lambda selected=bucket, payload=packed, index=bucket_index: (
-                    transport.send_packed_bucket(
-                        client,
-                        self._context,
-                        index,
-                        self.source.adapter.packed_metadata(selected.worker_metadata()),
-                        selected.total_bytes,
-                        payload,
-                        version,
-                    )
-                ),
+                send_bucket,
             )
             if (
                 ack.bucket_index != bucket_index
@@ -326,14 +339,14 @@ class WeightPublisher:
             )
             coordinator_call("weight-sync pause", client.pause)
             coordinator_call("weight-sync start", client.start_weight_update)
+
+            def execute_transfer() -> Optional[dict[str, Any]]:
+                """Execute the prepared publication strategy on every rank."""
+                return self.strategy.execute(client, state, self.transport, snapshot.version)
+
             streaming_stats = synchronized_call(
                 "weight-sync data transfer",
-                lambda: self.strategy.execute(
-                    client,
-                    state,
-                    self.transport,
-                    snapshot.version,
-                ),
+                execute_transfer,
             )
             coordinator_call("weight-sync finish", client.finish_weight_update)
             committed_version = coordinator_call(
@@ -387,9 +400,3 @@ def build_weight_transfer(
         else FullGatherStrategy(source)
     )
     return WeightPublisher(primary, transport)
-
-
-__all__ = [
-    "WeightPublisher",
-    "build_weight_transfer",
-]

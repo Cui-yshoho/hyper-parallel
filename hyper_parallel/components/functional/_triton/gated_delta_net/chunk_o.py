@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # pylint: disable=missing-public-type-hints,missing-public-docstring,disallowed-name
 # pylint: disable=invalid-name,missing-module-docstring,missing-function-docstring
 # pylint: disable=unused-variable,too-many-nested-blocks
+# pylint: disable=forbidden-backend-import
 
 from typing import Optional, Tuple
 
@@ -568,7 +568,7 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    output = torch.empty_like(v)
     if cu_seqlens is None:
         N, chunk_offsets = B, None
     else:
@@ -587,7 +587,7 @@ def chunk_fwd_o(
         h,
         g,
         g_gamma,
-        o,
+        output,
         cu_seqlens,
         chunk_offsets,
         scale,
@@ -601,7 +601,7 @@ def chunk_fwd_o(
         BK=128,
         BV=128,
     )
-    return o
+    return output
 
 bwd_chunk_dqkwg = chunk_bwd_dqkwg
 bwd_chunk_dv_local = chunk_bwd_dv_local

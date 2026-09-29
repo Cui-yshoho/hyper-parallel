@@ -14,6 +14,20 @@
 # ============================================================================
 """Qwen3 Dense training-rollout numerical consistency profile."""
 
+__all__ = [
+    "CONSISTENCY_PROFILE_OFF",
+    "QWEN3_ASCEND_CONSISTENCY_V1",
+    "configure_consistency_profile",
+    "consistency_runtime_state",
+    "consistency_profile",
+    "install_rollout_consistency_profile",
+    "install_qwen3_rollout_rms_norm_diagnostic",
+    "install_trainer_consistency_profile",
+    "trainer_sequence_log_probs",
+    "validate_consistency_model_identity",
+    "validate_rollout_consistency_profile",
+]
+
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -115,27 +129,23 @@ def _install_batch_invariant_sum_compatibility() -> None:
         "npu_reduce_sum_batch_invariant",
     )
 
+    def reduce_last_dimension(moved: Any, preserve_dim: bool) -> Any:
+        """Apply the batch-invariant operator after moving the reduced axis."""
+        return reduce_sum_op(moved, -1, preserve_dim)
+
     def reduce_sum(
         tensor: Any,
         dim: Optional[int] = None,
         keepdim: bool = False,
     ) -> Any:
         """Route non-last NPU reductions through a stable moved last axis."""
-        if (
-            getattr(tensor.device, "type", None) == "npu"
-            and isinstance(dim, int)
-            and tensor.dim() > 0
-            and dim % tensor.dim() != tensor.dim() - 1
-        ):
+        non_last_npu = getattr(tensor.device, "type", None) == "npu" and isinstance(dim, int)
+        if non_last_npu and tensor.dim() > 0 and dim % tensor.dim() != tensor.dim() - 1:
             return _reduce_non_last_dimension(
                 tensor,
                 dim,
                 keepdim,
-                lambda moved, preserve_dim: reduce_sum_op(
-                    moved,
-                    -1,
-                    preserve_dim,
-                ),
+                reduce_last_dimension,
             )
         return original_reduce_sum(tensor, dim, keepdim)
 
@@ -351,6 +361,24 @@ def trainer_sequence_log_probs(
     if sequences.ndim != 2 or tuple(attention_mask.shape) != tuple(sequences.shape):
         raise ValueError("Packed Trainer inputs require aligned two-dimensional sequences and attention_mask")
 
+    packed_sequences, packed_position_ids, cu_seqlens, lengths_cpu = _pack_trainer_inputs(
+        sequences, attention_mask
+    )
+    outputs = model(
+        input_ids=packed_sequences,
+        position_ids=packed_position_ids,
+        use_cache=False,
+        packed_cu_seqlens=cu_seqlens,
+        packed_max_seqlen=max(lengths_cpu),
+    )
+    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+    log_probs = logits.float().log_softmax(dim=-1)
+
+    return _restore_trainer_log_probs(sequences, lengths_cpu, log_probs)
+
+
+def _pack_trainer_inputs(sequences: Any, attention_mask: Any) -> tuple[Any, Any, Any, list[int]]:
+    """Validate right padding and pack model inputs without changing token order."""
     valid_mask = attention_mask.bool()
     lengths = valid_mask.sum(dim=-1, dtype=torch.int32)
     lengths_cpu = lengths.tolist()
@@ -373,16 +401,11 @@ def trainer_sequence_log_probs(
         dtype=torch.int32,
         device=sequences.device,
     )
-    outputs = model(
-        input_ids=packed_sequences,
-        position_ids=packed_position_ids,
-        use_cache=False,
-        packed_cu_seqlens=cu_seqlens,
-        packed_max_seqlen=max(lengths_cpu),
-    )
-    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-    log_probs = logits.float().log_softmax(dim=-1)
+    return packed_sequences, packed_position_ids, cu_seqlens, lengths_cpu
 
+
+def _restore_trainer_log_probs(sequences: Any, lengths_cpu: list[int], log_probs: Any) -> Any:
+    """Restore selected packed log-probabilities to padded next-token rows."""
     rows = []
     start = 0
     output_length = sequences.shape[1] - 1
@@ -512,18 +535,3 @@ def install_trainer_consistency_profile(config: Mapping[str, Any]) -> None:
     _install_batch_invariant_sum_compatibility()
     _install_qwen3_npu_rms_norm()
     _runtime.installed_profile = profile
-
-
-__all__ = [
-    "CONSISTENCY_PROFILE_OFF",
-    "QWEN3_ASCEND_CONSISTENCY_V1",
-    "configure_consistency_profile",
-    "consistency_runtime_state",
-    "consistency_profile",
-    "install_rollout_consistency_profile",
-    "install_qwen3_rollout_rms_norm_diagnostic",
-    "install_trainer_consistency_profile",
-    "trainer_sequence_log_probs",
-    "validate_consistency_model_identity",
-    "validate_rollout_consistency_profile",
-]

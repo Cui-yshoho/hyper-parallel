@@ -14,6 +14,9 @@
 # ============================================================================
 """HCCL routes from Trainer producers to rollout workers."""
 
+__all__ = ["HCCLWeightTransport"]
+
+
 import logging
 import socket
 import time
@@ -160,6 +163,14 @@ class HCCLWeightTransport:
              "expected_tensor_parallel_size": self._tensor_parallel_size},
             join, timeout=180,
         )
+        self._validate_route_workers(worker_results, group_id, tp_rank)
+        if local_rank == source_rank:
+            self._groups[route] = group
+        self._group_ids[route] = group_id
+
+    @staticmethod
+    def _validate_route_workers(worker_results: Any, group_id: str, tp_rank: int) -> None:
+        """Validate joined and skipped worker acknowledgements for one route."""
         if not isinstance(worker_results, list) or not worker_results:
             raise RuntimeError(
                 f"Direct reshard group {group_id!r} returned invalid workers: {worker_results}"
@@ -182,9 +193,6 @@ class HCCLWeightTransport:
                 raise RuntimeError(
                     f"Direct reshard group {group_id!r} returned invalid skip ACK: {result}"
                 )
-        if local_rank == source_rank:
-            self._groups[route] = group
-        self._group_ids[route] = group_id
 
     def ensure_groups(
         self,
@@ -216,6 +224,7 @@ class HCCLWeightTransport:
     ) -> tuple[int, int]:
         """Pack and broadcast the original ordered buckets for one direct route."""
         buckets = plan.for_route(source_rank, tp_rank)
+
         def materialize(index: int) -> Any:
             """Only the route's source rank evaluates the producer callback."""
             return pack_direct_bucket(state_dict, buckets[index], self._groups[(source_rank, tp_rank)].device)
@@ -236,6 +245,29 @@ class HCCLWeightTransport:
         endpoint = self.ensure_groups(client, plan)
         group_seconds = time.perf_counter() - group_started
         transfer_started = time.perf_counter()
+        sent_bytes, fragment_bytes = self._transfer_direct_routes(client, endpoint, state_dict, plan, policy_version)
+        transfer_seconds = time.perf_counter() - transfer_started
+        metric_values: list[Optional[dict[str, Union[float, int]]]] = [None] * plan.source_world_size
+        dist.all_gather_object(metric_values, {"sent_bytes": sent_bytes, "fragment_bytes": fragment_bytes})
+        total_sent = sum(int(value["sent_bytes"]) for value in metric_values if value)
+        total_fragments = sum(int(value["fragment_bytes"]) for value in metric_values if value)
+        if dist.get_rank() == 0:
+            logger.info(
+                "direct reshard completed: group_init=%.6fs transfer=%.6fs "
+                "sent_gib=%.6f delivered_gib=%.6f routes=%d fragments=%d",
+                group_seconds,
+                transfer_seconds,
+                total_sent / 2**30,
+                total_fragments * self._data_parallel_size / 2**30,
+                plan.route_count,
+                plan.fragment_count,
+            )
+
+    def _transfer_direct_routes(
+        self, client: VLLMWeightSyncClientMixin, endpoint: str, state_dict: Mapping[str, Any],
+        plan: DirectReshardPlan, policy_version: int,
+    ) -> tuple[int, int]:
+        """Broadcast each populated route and count the local source's bytes."""
         local_rank = dist.get_rank()
         sent_bytes = 0
         fragment_bytes = 0
@@ -256,30 +288,7 @@ class HCCLWeightTransport:
                     route_sent, route_fragments = result
                     sent_bytes += route_sent
                     fragment_bytes += route_fragments
-        transfer_seconds = time.perf_counter() - transfer_started
-        metric_values: list[Optional[dict[str, Union[float, int]]]] = [
-            None
-        ] * plan.source_world_size
-        dist.all_gather_object(
-            metric_values,
-            {
-                "sent_bytes": sent_bytes,
-                "fragment_bytes": fragment_bytes,
-            },
-        )
-        total_sent = sum(int(value["sent_bytes"]) for value in metric_values if value)
-        total_fragments = sum(int(value["fragment_bytes"]) for value in metric_values if value)
-        if local_rank == 0:
-            logger.info(
-                "direct reshard completed: group_init=%.6fs transfer=%.6fs "
-                "sent_gib=%.6f delivered_gib=%.6f routes=%d fragments=%d",
-                group_seconds,
-                transfer_seconds,
-                total_sent / 2**30,
-                total_fragments * self._data_parallel_size / 2**30,
-                plan.route_count,
-                plan.fragment_count,
-            )
+        return sent_bytes, fragment_bytes
 
     def _broadcast_buffers(
         self, client: VLLMWeightSyncClientMixin, endpoint: str, source_rank: int, tp_rank: int,
@@ -386,12 +395,11 @@ class HCCLWeightTransport:
                 )
             coordinate = (int(result["dp_rank"]), int(result["tp_rank"]))
             expected_rank = 1 + coordinate[0] * self._tensor_parallel_size + coordinate[1]
-            if (
-                coordinate in coordinates
-                or not 0 <= coordinate[0] < self._data_parallel_size
-                or not 0 <= coordinate[1] < self._tensor_parallel_size
-                or int(result["group_rank"]) != expected_rank
-            ):
+            valid_coordinate = (
+                0 <= coordinate[0] < self._data_parallel_size
+                and 0 <= coordinate[1] < self._tensor_parallel_size
+            )
+            if coordinate in coordinates or not valid_coordinate or int(result["group_rank"]) != expected_rank:
                 raise RuntimeError(
                     f"Packed full-gather returned an invalid worker rank: {result}"
                 )
@@ -484,6 +492,3 @@ class HCCLWeightTransport:
         self._packed_group = None
         self._packed_group_id = None
         self._endpoint = None
-
-
-__all__ = ["HCCLWeightTransport"]

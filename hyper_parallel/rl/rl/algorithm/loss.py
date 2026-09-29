@@ -340,8 +340,8 @@ class GRPOAlgorithm:
             action_mask=action_mask,
         )
 
+    @staticmethod
     def compute_critic_loss(
-        self,
         current_values: Any,
         old_values: Any,
         returns: Any,
@@ -414,8 +414,8 @@ class PPOAlgorithm:
         )
         self._kl_coefficient = config.kl_coef
 
+    @staticmethod
     def compute_advantages(
-        self,
         rewards: Any,
         group_ids: Optional[tuple[Optional[str], ...]] = None,
     ) -> Any:

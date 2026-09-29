@@ -14,6 +14,15 @@
 # ============================================================================
 """Actor-to-rollout policy publication and synchronization lifecycle."""
 
+__all__ = [
+    "ActorRolloutWeightSync",
+    "PolicySnapshot",
+    "coordinator_call",
+    "synchronized_call",
+    "synchronize_error",
+]
+
+
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
@@ -189,11 +198,12 @@ class ActorRolloutWeightSync:
             "sleep before training",
             lambda: client.sleep(level=1, mode="wait"),
         )
+
         def verify_sleeping() -> None:
             """Require every rank's connected replica to be sleeping."""
             if not client.is_sleeping():
                 raise RuntimeError("vLLM did not enter sleep mode before training")
-        synchronized_call("sleep residency check", verify_sleeping)
+        _ = synchronized_call("sleep residency check", verify_sleeping)
         self._phase = "training"
 
     def update_weights(self, snapshot: PolicySnapshot) -> None:
@@ -254,13 +264,14 @@ class ActorRolloutWeightSync:
                 "post-publication cache reset",
                 client.pause,
             )
+
             def verify_post_publication_pause() -> None:
                 """Require admission to remain closed after publication."""
                 if not client.is_paused():
                     raise RuntimeError(
                         "vLLM did not remain paused after the publication cache reset"
                     )
-            synchronized_call(
+            _ = synchronized_call(
                 "post-publication pause check",
                 verify_post_publication_pause,
             )
@@ -293,10 +304,3 @@ class ActorRolloutWeightSync:
         """Release resources owned by the selected transfer implementation."""
         if self._weight_transfer is not None:
             self._weight_transfer.close()
-__all__ = [
-    "ActorRolloutWeightSync",
-    "PolicySnapshot",
-    "coordinator_call",
-    "synchronized_call",
-    "synchronize_error",
-]

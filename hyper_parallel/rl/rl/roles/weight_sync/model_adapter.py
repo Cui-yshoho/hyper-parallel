@@ -14,6 +14,12 @@
 # ============================================================================
 """Model-owned mappings between Trainer, canonical, and rollout weights."""
 
+__all__ = [
+    "ModelWeightAdapter",
+    "build_model_weight_adapter",
+]
+
+
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -157,12 +163,6 @@ def build_model_weight_adapter(
     raise ValueError(f"Unsupported weight-sync model family: {model.family!r}")
 
 
-__all__ = [
-    "ModelWeightAdapter",
-    "build_model_weight_adapter",
-]
-
-
 def alias_tied_embeddings(
     state_dict: dict[str, Any],
     model: VLLMModelRegistration,
@@ -207,14 +207,12 @@ def _direct_tensor_description(
             f"Native direct tensor {source_name!r} has invalid permutation {permutation}"
         )
     physical_lengths = tuple(local_shape[axis] for axis in permutation)
-    if any(
-        start < 0 or start + length > int(limit)
-        for start, length, limit in zip(
-            destination_starts,
-            physical_lengths,
-            parameter.shape,
-        )
-    ):
+    exceeds_destination = False
+    for start, length, limit in zip(destination_starts, physical_lengths, parameter.shape):
+        if start < 0 or start + length > int(limit):
+            exceeds_destination = True
+            break
+    if exceeds_destination:
         raise ValueError(
             f"Native direct tensor {source_name!r} exceeds {destination_name!r}: "
             f"offset={destination_starts}, logical={local_shape}, "
@@ -234,13 +232,8 @@ def _direct_tensor_description(
     }
 
 
-def _native_qwen3_qkv_descriptions(
-    name: str,
-    parameter: Any,
-    hf_config: Any,
-    tp_size: int,
-) -> list[dict[str, Any]]:
-    """Map native fused QKV storage to the three canonical Actor tensors."""
+def _native_qwen3_qkv_local_sizes(hf_config: Any, tp_size: int) -> tuple[int, int]:
+    """Validate native Qwen3 head partitioning and return local Q/KV widths."""
     num_heads = int(hf_config.num_attention_heads)
     num_kv_heads = int(hf_config.num_key_value_heads)
     hidden_size = int(hf_config.hidden_size)
@@ -266,6 +259,17 @@ def _native_qwen3_qkv_descriptions(
             f"Native Qwen3 KV heads {num_kv_heads} are not divisible by TP {tp_size}"
         )
     kv_local_size = kv_size // tp_size
+    return q_local_size, kv_local_size
+
+
+def _native_qwen3_qkv_descriptions(
+    name: str,
+    parameter: Any,
+    hf_config: Any,
+    tp_size: int,
+) -> list[dict[str, Any]]:
+    """Map native fused QKV storage to the three canonical Actor tensors."""
+    q_local_size, kv_local_size = _native_qwen3_qkv_local_sizes(hf_config, tp_size)
     tail_shape = tuple(int(size) for size in parameter.shape[1:])
     expected_shape = (q_local_size + 2 * kv_local_size,) + tail_shape
     if tuple(int(size) for size in parameter.shape) != expected_shape:
@@ -273,11 +277,13 @@ def _native_qwen3_qkv_descriptions(
             f"Native Qwen3 fused QKV parameter {name!r} has shape "
             f"{tuple(parameter.shape)}, expected {expected_shape}"
         )
-    source_suffixes = ("q_proj", "k_proj", "v_proj")
-    local_sizes = (q_local_size, kv_local_size, kv_local_size)
     descriptions = []
     destination_offset = 0
-    for source_suffix, local_size in zip(source_suffixes, local_sizes):
+    for source_suffix, local_size in (
+        ("q_proj", q_local_size),
+        ("k_proj", kv_local_size),
+        ("v_proj", kv_local_size),
+    ):
         source_name = name.replace("qkv_proj", source_suffix)
         local_shape = (local_size,) + tail_shape
         destination_starts = (destination_offset,) + (0,) * len(tail_shape)
@@ -368,9 +374,8 @@ def _native_qwen3_direct_tensors(
         parameter_shape = tuple(int(size) for size in parameter.shape)
         destination_starts = (0,) * len(parameter_shape)
         if name in ("model.embed_tokens.weight", "lm_head.weight"):
-            partition_size = parameter_shape[0]
-            source_start = tp_rank * partition_size
-            local_size = max(0, min(partition_size, vocab_size - source_start))
+            source_start = tp_rank * parameter_shape[0]
+            local_size = max(0, min(parameter_shape[0], vocab_size - source_start))
             if local_size <= 0:
                 raise ValueError(
                     f"Native Qwen3 vocabulary shard {tp_rank} contains no Actor rows"

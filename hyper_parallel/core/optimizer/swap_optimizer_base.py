@@ -660,9 +660,8 @@ class PipelineSwapRuntime:
         if not self._packed_enabled or not batches:
             return False
         units = itertools.chain.from_iterable(batches)
-        swappable_slots = [
-            slot for unit in units for slot in unit.slots if slot.swappable
-        ]
+        slots = itertools.chain.from_iterable(unit.slots for unit in units)
+        swappable_slots = [slot for slot in slots if slot.swappable]
         if not swappable_slots:
             return False
         devices = {slot.device for slot in swappable_slots}
@@ -694,7 +693,8 @@ class PipelineSwapRuntime:
     def _first_swappable_slot(batches: Sequence[Sequence[UpdateUnit]]) -> SwapSlot:
         """Return the first swappable slot across ``batches``, in iteration order."""
         units = itertools.chain.from_iterable(batches)
-        swappable = (slot for unit in units for slot in unit.slots if slot.swappable)
+        slots = itertools.chain.from_iterable(unit.slots for unit in units)
+        swappable = (slot for slot in slots if slot.swappable)
         return next(swappable)
 
     def begin_packed_step(self, batches: Sequence[Sequence[UpdateUnit]]) -> None:
@@ -1154,8 +1154,8 @@ class OptimizerSwapAdapter:
         """Resolve the decoupled weight decay flag for one parameter group."""
         return self.decoupled_weight_decay or group.get("decoupled_weight_decay", False)
 
+    @staticmethod
     def _step_new_adamw(
-            self,
             group: Dict[str, Any],
             params: Sequence[Any],
             grads: Sequence[Any],

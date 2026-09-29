@@ -14,6 +14,8 @@
 # ============================================================================
 """Top-level persistent checkpoint lifecycle for synchronous RL training."""
 
+__all__ = ["RLCheckpointManager"]
+
 import json
 import logging
 import os
@@ -25,11 +27,12 @@ import torch
 import torch.distributed as dist
 import yaml
 
+from rl.utils.monitoring.config import sanitize_config
+
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
 from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from rl.utils.monitoring.config import sanitize_config
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +372,3 @@ class RLCheckpointManager:
             dist.get_rank(),
             checkpoint_dir,
         )
-
-
-__all__ = ["RLCheckpointManager"]

@@ -32,6 +32,6 @@ Triton-Ascend, the NPU backend registrations, and all staged KDA APIs. Missing
 or incompatible dependencies raise `RuntimeError`; there is no silent eager
 fallback.
 
-The `triton/state_summary.py` file is Hyper-Parallel's own fixed-shape affine
-summary implementation. It is retained because FLA's public KDA API does not
-expose the P2P boundary required by Hyper-Parallel.
+The `_triton/kimi_delta_attention/state_summary.py` file is Hyper-Parallel's
+own fixed-shape affine summary implementation. It is retained because FLA's
+public KDA API does not expose the P2P boundary required by Hyper-Parallel.

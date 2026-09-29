@@ -243,6 +243,28 @@ class SwapTensor:
         if self.cpu_pool is None:
             self.val_cpu = None
 
+    def _copy_to_host(self):
+        """Copy the device tensor to its host buffer, releasing the pooled buffer on failure."""
+        try:
+            if self.cpu_pool is not None or self.is_slice_tensor:
+                self.val_cpu.copy_(self.val, non_blocking=True)
+            else:
+                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+        except Exception as exc:
+            if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
+                release_event = _backend.new_event()
+                release_event.record(_backend.get_current_stream())
+                self.release_cpu_buffer(release_event)
+            self.val_cpu = None
+            copy_mode = "tensor" if self.cpu_pool is not None or self.is_slice_tensor else "storage"
+            raise RuntimeError(
+                "Failed to offload activation tensor from device to CPU: "
+                f"source={self.funcname!r}, shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
+                f"device={self.val.device}, copy_mode={copy_mode}, "
+                f"cpu_pool={'enabled' if self.cpu_pool is not None else 'disabled'}. "
+                f"Original error: {exc}"
+            ) from exc
+
     def async_offload(self):
         """async offload tensor from device to host"""
         if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
@@ -287,25 +309,8 @@ class SwapTensor:
                         f"logical_bytes={logical_bytes}, pool_buffer_shape={tuple(pool_buffer.shape)}, "
                         f"pool_buffer_dtype={pool_buffer.dtype}. Original error: {exc}"
                     ) from exc
-        try:
-            if self.cpu_pool is not None or self.is_slice_tensor:
-                self.val_cpu.copy_(self.val, non_blocking=True)
-            else:
-                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
-        except Exception as exc:
-            if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
-                release_event = _backend.new_event()
-                release_event.record(_backend.get_current_stream())
-                self.release_cpu_buffer(release_event)
-            self.val_cpu = None
-            copy_mode = "tensor" if self.cpu_pool is not None or self.is_slice_tensor else "storage"
-            raise RuntimeError(
-                "Failed to offload activation tensor from device to CPU: "
-                f"source={self.funcname!r}, shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
-                f"device={self.val.device}, copy_mode={copy_mode}, "
-                f"cpu_pool={'enabled' if self.cpu_pool is not None else 'disabled'}. "
-                f"Original error: {exc}"
-            ) from exc
+
+        self._copy_to_host()
         self._state = self.STATE_D2H
 
     def wait_offload(self):
@@ -541,7 +546,8 @@ class SwapGroup:
         bucket["total_numel"] += x.val.numel()
         return x
 
-    def _finalize_packed_buckets(self, candidate_buckets, packed_info, packed_buckets, packed_by_bucket) -> int:
+    @staticmethod
+    def _finalize_packed_buckets(candidate_buckets, packed_info, packed_buckets, packed_by_bucket) -> int:
         """Turn multi-tensor candidate buckets into packed buckets; return owned bytes."""
         total_bytes = 0
         for dtype_bucket_list in candidate_buckets.values():
@@ -880,6 +886,7 @@ class SwapManager:
         )
         self._layer_count: int = 0
         self._copy_stream: Optional[Any] = None
+        self._missing_group_warned: bool = False
 
     def __new__(cls):
         if cls._instance is None:
@@ -963,6 +970,24 @@ class SwapManager:
     def set_current_group_name(self, group_name: str) -> None:
         """Set the name of the currently active swap group."""
         self._current_group_name.set(group_name)
+
+    def warn_missing_group_once(self) -> None:
+        """Warn once per process when ``MUST_SWAP`` runs outside any swap group.
+
+        Activation swap only serves pipeline chunks the schedule marked as
+        swappable; every other region keeps its activations on device. A single
+        warning keeps that fallback discoverable without repeating for every
+        dispatched operator.
+        """
+        if self._missing_group_warned:
+            return
+        self._missing_group_warned = True
+        warnings.warn(
+            "Activation swap requested MUST_SWAP outside an active swap group; "
+            "the activations were kept on device instead of being offloaded.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     def active_group_count(self) -> int:
         """Return the number of live swap groups for lifecycle diagnostics."""

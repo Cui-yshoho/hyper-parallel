@@ -376,8 +376,9 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
         if func in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
             return CheckpointPolicy.MUST_RECOMPUTE
         if func in _SELECTIVE_AC_MATMUL_OPS:
-            matmul_counts[ctx.is_recompute] += 1
-            if matmul_counts[ctx.is_recompute] % 2:
+            matmul_count = matmul_counts.get(ctx.is_recompute, 0) + 1
+            matmul_counts[ctx.is_recompute] = matmul_count
+            if matmul_count % 2:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.MUST_RECOMPUTE
         if func in _SELECTIVE_AC_MUST_SAVE_OPS:
@@ -728,7 +729,7 @@ def _detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
 def _try_disable_use_cache(sub_config: Any) -> None:
     """Best-effort disable of ``use_cache`` on one config object."""
     try:
-        sub_config.use_cache = False
+        setattr(sub_config, "use_cache", False)
     except Exception:  # pylint: disable=broad-exception-caught
         # Configuration objects may reject assignment with custom errors.
         pass

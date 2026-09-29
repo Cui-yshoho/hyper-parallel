@@ -14,12 +14,21 @@
 # ============================================================================
 """Affine state-summary operations used by GDN State-P2P."""
 
+# pylint: disable=forbidden-backend-import
+
+__all__ = [
+    "apply_gdn_state_gradient_summary",
+    "apply_gdn_state_summary",
+    "chunk_gated_delta_rule_state_gradient_summary_bwd",
+    "chunk_gated_delta_rule_state_summary_fwd",
+]
+
 from typing import Optional
 
 import torch
 import triton
 
-from ._gdn_triton.state_summary import (
+from ._triton.gated_delta_net.state_summary import (
     gdn_packed_state_summary_kernel,
     gdn_state_grad_ext_kernel,
 )
@@ -48,7 +57,7 @@ def chunk_gated_delta_rule_state_summary_fwd(
     block_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the local affine map ``state_out = M @ state_in + S``."""
-    if key.ndim != 4 or w.ndim != 4 or u.ndim != 4 or g.ndim != 3:
+    if (key.ndim, w.ndim, u.ndim, g.ndim) != (4, 4, 4, 3):
         raise ValueError("GDN state summary expects key/w/u [B,T,H,D] and g [B,T,H].")
     batch, seq_len, heads, key_dim = key.shape
     value_dim = u.shape[-1]
@@ -96,6 +105,37 @@ def chunk_gated_delta_rule_state_summary_fwd(
     return state_ext, transition
 
 
+def _validate_gdn_gradient_summary_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    w: torch.Tensor,
+    g: torch.Tensor,
+    grad_output: torch.Tensor,
+    dv: torch.Tensor,
+    chunk_size: int,
+) -> tuple[int, int, int, int, int]:
+    """Validate the reverse summary inputs before launching its kernel."""
+    batch, seq_len, heads, key_dim = query.shape
+    value_dim = grad_output.shape[-1]
+    _validate_fixed_summary_shape(key_dim, value_dim, chunk_size)
+    if seq_len % chunk_size != 0:
+        raise ValueError(
+            f"GDN state-gradient sequence length {seq_len} must be divisible by {chunk_size}."
+        )
+    qk_shape = (batch, seq_len, heads, key_dim)
+    value_shape = (batch, seq_len, heads, value_dim)
+    if (key.shape, w.shape, g.shape, grad_output.shape, dv.shape) != (
+        qk_shape, qk_shape, qk_shape[:3], value_shape, value_shape
+    ):
+        raise ValueError(
+            "Incompatible GDN state-gradient summary shapes: "
+            f"query={tuple(query.shape)}, key={tuple(key.shape)}, "
+            f"w={tuple(w.shape)}, g={tuple(g.shape)}, "
+            f"grad_output={tuple(grad_output.shape)}, dv={tuple(dv.shape)}."
+        )
+    return batch, seq_len, heads, key_dim, value_dim
+
+
 @torch.compiler.disable
 def chunk_gated_delta_rule_state_gradient_summary_bwd(
     query: torch.Tensor,
@@ -109,28 +149,9 @@ def chunk_gated_delta_rule_state_gradient_summary_bwd(
     chunk_size: int = 64,
 ) -> torch.Tensor:
     """Return the local-loss contribution to the incoming state gradient."""
-    batch, seq_len, heads, key_dim = query.shape
-    value_dim = grad_output.shape[-1]
-    _validate_fixed_summary_shape(key_dim, value_dim, chunk_size)
-    if seq_len % chunk_size != 0:
-        raise ValueError(
-            f"GDN state-gradient sequence length {seq_len} must be divisible by {chunk_size}."
-        )
-    qk_shape = (batch, seq_len, heads, key_dim)
-    value_shape = (batch, seq_len, heads, value_dim)
-    if (
-        key.shape != qk_shape
-        or w.shape != qk_shape
-        or g.shape != qk_shape[:3]
-        or grad_output.shape != value_shape
-        or dv.shape != value_shape
-    ):
-        raise ValueError(
-            "Incompatible GDN state-gradient summary shapes: "
-            f"query={tuple(query.shape)}, key={tuple(key.shape)}, "
-            f"w={tuple(w.shape)}, g={tuple(g.shape)}, "
-            f"grad_output={tuple(grad_output.shape)}, dv={tuple(dv.shape)}."
-        )
+    batch, seq_len, heads, key_dim, value_dim = _validate_gdn_gradient_summary_inputs(
+        query, key, w, g, grad_output, dv, chunk_size
+    )
 
     query, key, w, g, grad_output, dv = (
         tensor.contiguous() for tensor in (query, key, w, g, grad_output, dv)
@@ -186,11 +207,3 @@ def apply_gdn_state_gradient_summary(
         torch.matmul(transition.transpose(-2, -1), grad_final_state.float())
         + grad_state_ext
     )
-
-
-__all__ = [
-    "apply_gdn_state_gradient_summary",
-    "apply_gdn_state_summary",
-    "chunk_gated_delta_rule_state_gradient_summary_bwd",
-    "chunk_gated_delta_rule_state_summary_fwd",
-]

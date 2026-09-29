@@ -95,6 +95,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     _ULYSSES_WRAPPED_FLAG,
     _UlyssesContext,
     _slice_sequence,
+    _validate_ulysses_head_counts,
     flex_cp_allgather,
     hybrid_cp_attention,
     ulysses_head_to_seq,
@@ -268,6 +269,9 @@ def _ulysses_attention_call(
         attention_fn, cp_mesh, query, key, value, kwargs,
         *, seq_dim=2, head_dim=1):
     """Run attention in the Pure Ulysses full-sequence/head-sharded layout."""
+    _validate_ulysses_head_counts(
+        query, key, value, cp_mesh.size(), "Pure Ulysses CP"
+    )
     query, key, value = (
         ulysses_seq_to_head(tensor, seq_dim, head_dim, cp_mesh)
         for tensor in (query, key, value)
@@ -291,6 +295,9 @@ def _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs):
         raise TypeError(
             "Ulysses QKV wrapper requires query, key, and value inputs"
         ) from exc
+    _validate_ulysses_head_counts(
+        query, key, value, cp_mesh.size(), "Pure Ulysses CP"
+    )
     query, key, value = (
         ulysses_seq_to_head(tensor, 2, 1, cp_mesh)
         for tensor in (query, key, value)
@@ -308,113 +315,6 @@ def _require_ulysses_cp_mesh(cp_mesh, wrapper_name):
         raise ValueError(
             f"Ulysses wrapper {wrapper_name!r} requires an active CP mesh"
         )
-
-
-def _normalize_hf_sdpa_gqa(
-        query: Any, key: Any, value: Any,
-        call_kwargs: dict[str, Any]) -> tuple[Any, Any, Any, dict[str, Any]]:
-    """Give every CP rank the same explicit KV-head layout before gather.
-
-    HF may keep compact GQA K/V when no mask is present but expand K/V on a
-    rank with an explicit padding mask.  CP communication starts after that
-    decision, so the rank-local layouts must be normalized first.
-    """
-    query_heads = query.shape[1]
-    key_heads = key.shape[1]
-    value_heads = value.shape[1]
-    if key_heads != value_heads:
-        raise ValueError(
-            "HF CP SDPA requires matching K/V head counts, got "
-            f"key_heads={key_heads}, value_heads={value_heads}"
-        )
-    if query_heads % key_heads:
-        raise ValueError(
-            "HF CP SDPA requires Q heads divisible by KV heads, "
-            f"got query_heads={query_heads}, key_heads={key_heads}"
-        )
-    if query_heads != key_heads:
-        groups = query_heads // key_heads
-        key = key.repeat_interleave(groups, dim=1)
-        value = value.repeat_interleave(groups, dim=1)
-    normalized_kwargs = dict(call_kwargs)
-    normalized_kwargs.pop("enable_gqa", None)
-    return query, key, value, normalized_kwargs
-
-
-def _bind_qkv_invocation(
-        original_forward: Callable[..., Any], args: tuple[Any, ...],
-        kwargs: dict[str, Any], wrapper_name: str):
-    """Bind a QKV call once and return a local-tensor attention callback."""
-    signature = inspect.signature(original_forward)
-    parameter_names = tuple(signature.parameters)
-    if len(parameter_names) < 3:
-        raise TypeError(
-            f"CP wrapper {wrapper_name!r} requires at least three forward inputs"
-        )
-    qkv_names = parameter_names[:3]
-    bound = signature.bind(*args, **kwargs)
-    bound.apply_defaults()
-    try:
-        query, key, value = (
-            bound.arguments[name] for name in qkv_names
-        )
-    except KeyError as exc:
-        raise TypeError(
-            f"CP wrapper {wrapper_name!r} requires query, key, and value inputs"
-        ) from exc
-
-    var_keyword_name = next(
-        (
-            name for name, parameter in signature.parameters.items()
-            if parameter.kind is inspect.Parameter.VAR_KEYWORD
-        ),
-        None,
-    )
-    attention_kwargs = {}
-    for name, parameter in signature.parameters.items():
-        if name in qkv_names or name not in bound.arguments:
-            continue
-        value_item = bound.arguments[name]
-        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-            attention_kwargs.update(value_item)
-        elif parameter.kind is not inspect.Parameter.VAR_POSITIONAL:
-            attention_kwargs[name] = value_item
-
-    base_arguments = dict(bound.arguments)
-    if var_keyword_name is not None:
-        base_arguments[var_keyword_name] = dict(
-            base_arguments.get(var_keyword_name, {})
-        )
-
-    def attention_call(
-            call_query: Any, call_key: Any, call_value: Any,
-            call_kwargs: dict[str, Any]) -> Any:
-        """Invoke the original forward without duplicating bound Q/K/V args."""
-        call_arguments = dict(base_arguments)
-        if var_keyword_name is not None:
-            call_arguments[var_keyword_name] = dict(
-                base_arguments[var_keyword_name]
-            )
-        call_arguments[qkv_names[0]] = call_query
-        call_arguments[qkv_names[1]] = call_key
-        call_arguments[qkv_names[2]] = call_value
-        for name, item in call_kwargs.items():
-            parameter = signature.parameters.get(name)
-            if (parameter is not None
-                    and parameter.kind is not inspect.Parameter.VAR_KEYWORD):
-                call_arguments[name] = item
-            elif var_keyword_name is not None:
-                call_arguments[var_keyword_name][name] = item
-            else:
-                raise TypeError(
-                    f"CP wrapper {wrapper_name!r} needs to pass attention "
-                    f"argument {name!r}, but the original forward does not "
-                    "accept it"
-                )
-        call_bound = inspect.BoundArguments(signature, call_arguments)
-        return original_forward(*call_bound.args, **call_bound.kwargs)
-
-    return query, key, value, attention_kwargs, attention_call
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -644,24 +544,22 @@ def sdpa_qkv_load_balance_cp_wrapper(
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+    def cp_forward(q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
         """Route local Q/K/V tensors through Head-Tail communication."""
-        query, key, value, call_kwargs, attention_call = (
-            _bind_qkv_invocation(
-                original_forward,
-                args,
-                kwargs,
-                "sdpa_qkv_load_balance",
-            )
-        )
+        def attention_call(
+                query: Any, key: Any, value: Any,
+                call_kwargs: dict[str, Any]) -> Any:
+            """Invoke the original QKV forward with transformed tensors."""
+            return original_forward(query, key, value, **call_kwargs)
+
         keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
-            call_kwargs, query, key, cp_mesh
+            kwargs, q, k, cp_mesh
         )
         return head_tail_load_balance_attention(
             attention_call,
-            query,
-            key,
-            value,
+            q,
+            k,
+            v,
             keep_kwargs,
             cp_mesh,
             peer_attention_kwargs=peer_kwargs,
@@ -702,9 +600,6 @@ def sdpa_hf_load_balance_cp_wrapper(
                 **call_kwargs: Any) -> Any:
             """Run one intercepted SDPA call with Head-Tail communication."""
             fired["hit"] = True
-            q, k, v, call_kwargs = _normalize_hf_sdpa_gqa(
-                q, k, v, call_kwargs
-            )
             keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
                 call_kwargs, q, k, cp_mesh
             )
@@ -907,26 +802,24 @@ def _apply_qkv_hybrid_wrapper(
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+    def cp_forward(q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
         """Run the original QKV forward through local-tensor Hybrid CP."""
-        query, key, value, call_kwargs, attention_call = (
-            _bind_qkv_invocation(
-                original_forward,
-                args,
-                kwargs,
-                wrapper_name,
-            )
-        )
+        def attention_call(
+                query: Any, key: Any, value: Any,
+                call_kwargs: dict[str, Any]) -> Any:
+            """Invoke the original QKV forward with transformed tensors."""
+            return original_forward(query, key, value, **call_kwargs)
+
         if prepare_sdpa_mask:
-            call_kwargs = _prepare_hybrid_sdpa_kwargs(
-                call_kwargs, query, key, cp_mesh, ulysses_degree
+            kwargs = _prepare_hybrid_sdpa_kwargs(
+                kwargs, q, k, cp_mesh, ulysses_degree
             )
         return hybrid_cp_attention(
             attention_call,
-            query,
-            key,
-            value,
-            call_kwargs,
+            q,
+            k,
+            v,
+            kwargs,
             cp_mesh,
             ulysses_degree,
         )
@@ -984,9 +877,6 @@ def sdpa_hf_hybrid_cp_wrapper(
                 **attention_kwargs: Any) -> Any:
             """Route one intercepted SDPA call through Hybrid CP."""
             fired["hit"] = True
-            query, key, value, attention_kwargs = _normalize_hf_sdpa_gqa(
-                query, key, value, attention_kwargs
-            )
             attention_kwargs = _prepare_hybrid_sdpa_kwargs(
                 attention_kwargs,
                 query,

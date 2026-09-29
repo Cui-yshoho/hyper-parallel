@@ -522,6 +522,30 @@ def ulysses_head_to_seq(
     )
 
 
+def _validate_ulysses_head_counts(
+        query: Tensor, key: Tensor, value: Tensor,
+        ulysses_degree: int, context: str) -> None:
+    """Require every Q/K/V head dimension to be shardable by Ulysses."""
+    head_counts = {
+        "query": query.shape[1],
+        "key": key.shape[1],
+        "value": value.shape[1],
+    }
+    invalid = {
+        name: count
+        for name, count in head_counts.items()
+        if count % ulysses_degree
+    }
+    if invalid:
+        details = ", ".join(
+            f"{name}_heads={count}" for name, count in invalid.items()
+        )
+        raise ValueError(
+            f"{context} requires every Q/K/V head count to be divisible by "
+            f"ulysses_degree ({ulysses_degree}), got {details}"
+        )
+
+
 class _AllGatherAlongDim(torch.autograd.Function):
     """all-gather along cp_dim + backward reduce-scatter semantics (sum across
     ranks, then take this rank's chunk)."""
@@ -653,6 +677,9 @@ def hybrid_cp_attention(
     ``attention_kwargs`` are forwarded unchanged. Mask construction and other
     model-input semantics belong to the caller's input-preparation contract.
     """
+    _validate_ulysses_head_counts(
+        query, key, value, ulysses_degree, "Hybrid CP"
+    )
     ulysses_mesh, colossal_mesh = (
         _build_hybrid_cp_submeshes(cp_mesh, ulysses_degree)
     )

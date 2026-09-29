@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Copyright (c) 2026, Huawei Technologies Co., Ltd.  All rights reserved.
 
 # pylint: disable=line-too-long,missing-public-type-hints,missing-public-docstring
 # pylint: disable=invalid-name,missing-module-docstring,missing-function-docstring
+# pylint: disable=forbidden-backend-import
 
 from typing import Optional, Tuple
 

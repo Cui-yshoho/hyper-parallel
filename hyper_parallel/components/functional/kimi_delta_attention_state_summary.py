@@ -14,6 +14,15 @@
 # ============================================================================
 """Affine KDA state summary built from prepared WY intermediates."""
 
+# pylint: disable=forbidden-backend-import
+
+__all__ = [
+    "apply_kda_state_gradient_summary",
+    "apply_kda_state_summary",
+    "kda_state_gradient_summary_from_prepared",
+    "kda_state_summary_forward_from_prepared",
+]
+
 from typing import Optional
 
 import torch
@@ -28,7 +37,7 @@ def _validate_prepared_summary_inputs(
     chunk_size: int,
 ) -> tuple[int, int, int, int, int]:
     """Validate the fixed Kimi K3 summary contract and return dimensions."""
-    if key.ndim != 4 or w.ndim != 4 or u.ndim != 4 or gate.ndim != 4:
+    if (key.ndim, w.ndim, u.ndim, gate.ndim) != (4, 4, 4, 4):
         raise ValueError("KDA prepared summary expects rank-4 key/w/u/gate tensors.")
     batch, sequence_length, heads, key_dim = key.shape
     value_dim = u.shape[-1]
@@ -141,7 +150,7 @@ def _launch_kda_state_gradient_summary(
     block_size: int = 64,
 ) -> torch.Tensor:
     """Launch the reverse-wavefront Triton-Ascend summary kernel."""
-    from ._kda_triton.state_summary import (  # pylint: disable=import-outside-toplevel
+    from ._triton.kimi_delta_attention.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_state_grad_ext_kernel,
     )
 
@@ -202,7 +211,7 @@ def _launch_kda_mixed_state_summary(
     chunk_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build ``S_ext`` and ``M`` in compile-time-separated BV=128 modes."""
-    from ._kda_triton.state_summary import (  # pylint: disable=import-outside-toplevel
+    from ._triton.kimi_delta_attention.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_split_state_summary_kernel,
     )
 
@@ -340,11 +349,3 @@ def apply_kda_state_gradient_summary(
         torch.matmul(transition.transpose(-2, -1), grad_final_state.float())
         + grad_state_ext
     )
-
-
-__all__ = [
-    "apply_kda_state_gradient_summary",
-    "apply_kda_state_summary",
-    "kda_state_gradient_summary_from_prepared",
-    "kda_state_summary_forward_from_prepared",
-]
