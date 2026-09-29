@@ -4,9 +4,9 @@
 [![WeChat 微信交流群](https://img.shields.io/badge/WeChat-64A519?style=flat&logo=wechat&logoColor=07C160)](#parallel-training-system-sig)
 [![小红书 HyperParallel（小红书号：hyperparallel）](https://img.shields.io/badge/%E5%B0%8F%E7%BA%A2%E4%B9%A6-FF2442?style=flat&logo=xiaohongshu&logoColor=white)](#xiaohongshu-qrcode)
 [![Document 文档中心](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
-
+[![Papers](https://img.shields.io/badge/Papers-red?style=flat&logo=arxiv&logoColor=white)](#technical-reports)
   <h3>简化超节点编程 &nbsp;·&nbsp; 释放并行算力</h3>
-  <p><sub>昇腾超节点亲和的分布式并行加速库</sub></p>
+
 
   <p>
     <a href="#-快速开始">快速开始</a>
@@ -14,6 +14,8 @@
     <a href="docs/index.md">文档中心</a>
     &emsp;·&emsp;
     <a href="docs/api/api_reference.md">API 参考</a>
+    &emsp;·&emsp;
+    <a href="#technical-reports">技术报告</a>
   </p>
 </div>
 
@@ -138,39 +140,6 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 - [社区贡献](./docs/contributing/) — 开发环境、测试规范和发布流程
 - [版本说明](./hyper_parallel_v1.0.0_release_notes.md) — 版本变更记录
 
----
-
-## 🗂️ 项目结构
-
-```text
-HyperParallel/
-├── hyper_parallel/
-│   ├── models/                         # 模型族适配层与 recipes/train.yaml，对外入口 api.py
-│   │   └── _transformers/              # Transformers 模型构建与预训练权重加载
-│   ├── trainer/                        # TrainerConfig、TextTrainer/VLMTrainer 和训练生命周期
-│   ├── components/                     # 高性能 modules/functional、优化器、loss 和 checkpoint
-│   ├── data/                           # 数据集读取、样本转换与 dataloader
-│   ├── distributed/                    # 分布式模型构建、并行计划应用与激活管理
-│   ├── core/
-│   │   ├── dtensor/                    # DeviceMesh、Layout、placement 和 DTensor
-│   │   ├── shard/                      # sharding plan、自定义 shard 和 DFunction
-│   │   ├── fully_shard/                # FSDP/HSDP 参数与执行调度
-│   │   ├── tensor_parallel/            # TP styles 与 loss parallel
-│   │   ├── context_parallel/           # Context Parallel
-│   │   ├── expert_parallel/            # Expert Parallel
-│   │   ├── pipeline_parallel/          # Pipeline stage 与调度
-│   │   └── distributed_checkpoint/     # 分布式保存、加载与 reshard
-│   └── collectives/                    # 集合通信接口与实现
-├── examples/
-│   ├── training_demo/                  # 训练示例（数据准备、离线/在线 YAML）
-│   ├── data/                           # 数据准备脚本
-│   ├── generate/                       # 生成与精度对齐校验脚本
-│   └── torch/                          # PyTorch 后端 Core API 组合示例
-├── docs/
-│   ├── guide/                          # 使用指南
-│   └── api/                            # API 参考
-└── tests/                              # models、Core 和后端测试
-```
 
 ---
 
@@ -195,6 +164,18 @@ HyperParallel/
 
 ---
 
-## 📄 许可证
+<a id="technical-reports"></a>
+
+## 📄 技术报告
+
+- HyperParallel-FSDP: Topology-Aware Fully Sharded Training with Layout-Driven Muon on Ascend SuperPods [[paper](https://arxiv.org/abs/2609.21594)]
+- HyperParallel-Mpipe: A Composable Algebra System for Optimizing MLLM Training over Supernode Clusters [[paper](https://arxiv.org/abs/2607.03229)]
+- HyperParallel-MoE: Multi-Core Interleaved Scheduling for Fast MoE Training on Ascend NPUs [[paper](https://arxiv.org/abs/2605.23764)]
+- HyperParallel: A Supernode-Affinity AI Framework [[paper](https://arxiv.org/abs/2603.03731)]
+- HyperOffload: Graph-Driven Hierarchical Memory Management for Large Language Models on SuperNode Architectures [[paper](https://arxiv.org/abs/2602.00748)]
+
+---
+
+## ⚖️ 许可证
 
 [Apache 2.0许可证](LICENSE)
