@@ -87,7 +87,9 @@ class PassConfig:
             ``"gpipe"`` (default) runs all forwards before all backwards
             (simplest ordering, largest bubble). ``"1f1b"`` interleaves one
             backward per forward in steady state, shrinking the pipeline
-            bubble; it requires ``num_microbatches >= pp_degree``.
+            bubble and freeing each microbatch's activations as soon as its
+            backward runs (GPipe retains all of them until the sweep ends);
+            it requires ``num_microbatches >= pp_degree``.
             ``PpPass`` resolves the name to a schedule class via
             ``pp_schedule.get_schedule_class``.
 

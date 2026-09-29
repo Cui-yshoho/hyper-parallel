@@ -51,6 +51,11 @@ Schedule driver (mocked subgraphs + mocked dist):
 15. ``PpPass`` dispatches ``PassConfig.pp_schedule`` to the right schedule
     class; the registry stays consistent with ``PP_SCHEDULES`` and rejects
     unknown names.
+16. 1F1B frees each microbatch's saved activations as soon as its backward
+    consumed them (the last stage keeps only the per-microbatch loss) and
+    drains its boundary send buffers one turn later (only the final
+    microbatch's sends wait for step end); ``num_microbatches ==
+    pp_degree`` stays correct.
 
 Review follow-ups:
 10. Skip-stage dataflow (values crossing 2+ cuts) is rejected up front
@@ -69,8 +74,10 @@ import queue
 import threading
 import unittest
 import warnings
+import weakref
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, Sequence, Tuple
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Iterator, List, Sequence, Tuple
 from unittest.mock import MagicMock, patch
 
 
@@ -1405,6 +1412,11 @@ def _patch_threaded_p2p() -> Iterator[Any]:
 
     Stages run in their own thread and identify through the yielded
     thread-local ``rank``; ``isend``/``irecv`` need no distributed backend.
+    ``isend``'s returned ``Work.wait`` only returns once the matching
+    ``irecv`` consumed the value, so a schedule that waits on a transfer the
+    peer has not posted blocks here and surfaces as a test error instead of
+    passing silently. A plain namespace (not ``MagicMock``) is used so mock
+    call history cannot pin the very buffers whose release these tests assert.
     """
     tls = threading.local()
     queues: dict = {}
@@ -1414,95 +1426,280 @@ def _patch_threaded_p2p() -> Iterator[Any]:
         with lock:
             return queues.setdefault(key, queue.Queue())
 
-    def isend(tensor: torch.Tensor, dst: int = 0, group: Any = None) -> MagicMock:
-        """Queue a detached copy of the value being sent."""
-        del group
-        _queue_for((tls.rank, dst)).put(tensor.detach().clone())
-        return MagicMock()
+    def _await_delivery(delivered: threading.Event, label: str) -> None:
+        """Fail if a send is waited for before the peer received the value."""
+        if not delivered.wait(timeout=30):
+            raise AssertionError(
+                f"isend {label} waited before the peer received the value"
+            )
 
-    def irecv(buffer: torch.Tensor, src: int = 0, group: Any = None) -> MagicMock:
+    def isend(tensor: torch.Tensor, dst: int = 0, group: Any = None) -> Any:
+        """Queue a detached copy; ``wait`` completes once the peer receives it."""
+        del group
+        delivered = threading.Event()
+        _queue_for((tls.rank, dst)).put((tensor.detach().clone(), delivered))
+        sender = tls.rank
+        return SimpleNamespace(
+            wait=lambda: _await_delivery(delivered, f"rank {sender}->{dst}")
+        )
+
+    def irecv(buffer: torch.Tensor, src: int = 0, group: Any = None) -> Any:
         """Fill ``buffer`` from the queue the source stage filled."""
         del group
-        item = _queue_for((src, tls.rank)).get(timeout=30)
+        item, delivered = _queue_for((src, tls.rank)).get(timeout=30)
         if buffer.shape == ():
             buffer.fill_(item.reshape(()).to(torch.int64))
         else:
             buffer.copy_(item)
-        return MagicMock()
+        delivered.set()
+        return SimpleNamespace(wait=lambda: None)
 
-    mock_dist = MagicMock()
-    mock_dist.isend.side_effect = isend
-    mock_dist.irecv.side_effect = irecv
-    mock_dist.get_global_rank.side_effect = lambda _g, r: r
-    with patch(_SCHED_DIST_PATH, mock_dist):
+    shim = SimpleNamespace(
+        isend=isend,
+        irecv=irecv,
+        get_global_rank=lambda _group, rank: rank,
+    )
+    with patch(_SCHED_DIST_PATH, shim):
         yield tls
+
+
+def _three_stage_1f1b() -> Tuple[Dict[int, nn.Module], Dict[int, Any]]:
+    """Build the degree-3 1F1B stage set (embed/lin0 | lin1 | head).
+
+    Stages are traced at the ``pp_microbatch_size=2`` sample (static shapes)
+    and run on whatever full batch the caller feeds the schedules.
+    """
+    plan = GraphParallelPlan()
+    plan.pp_stage(0, ["embed", "lin0"])
+    plan.pp_stage(1, ["lin1"])
+    plan.pp_stage(2, ["head"])
+    cfg = PassConfig(
+        fsdp_enabled=False,
+        pp_enabled=True,
+        pp_degree=3,
+        pp_microbatch_size=2,
+        pp_schedule="1f1b",
+    )
+    return _build_pp_stages(
+        lambda: _tiny_lm_joint_graph(batch=2)[0],
+        _tiny_lm_stage_model,
+        plan,
+        cfg,
+        pp_degree=3,
+    )
+
+
+def _run_threaded_1f1b(
+    models: Dict[int, nn.Module],
+    scheds: Dict[int, Any],
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> Tuple[Dict[int, Any], Dict[int, BaseException], List[threading.Thread]]:
+    """Run every stage's full 1F1B step concurrently on the threaded shim.
+
+    Returns ``(results, errors, alive_threads)``: a non-empty ``errors`` means
+    a stage raised; a non-empty ``alive_threads`` means the schedules
+    deadlocked.
+    """
+    states = {r: [p.detach() for p in models[r].parameters()] for r in models}
+    results: Dict[int, Any] = {}
+    errors: Dict[int, BaseException] = {}
+
+    def run_stage(rank: int, tls: Any) -> None:
+        """Run one stage's full 1F1B step under its thread-local rank."""
+        tls.rank = rank
+        try:
+            results[rank] = scheds[rank](*states[rank], x, y)
+        except Exception as exc:  # pylint: disable=broad-except
+            errors[rank] = exc
+
+    with _patch_threaded_p2p() as tls:
+        threads = [
+            threading.Thread(target=run_stage, args=(rank, tls)) for rank in models
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+    return results, errors, [thread for thread in threads if thread.is_alive()]
+
+
+def _assert_threaded_grads_match(
+    case: unittest.TestCase,
+    models: Dict[int, nn.Module],
+    scheds: Dict[int, Any],
+    results: Dict[int, Any],
+    ref_by_fqn: Dict[str, torch.Tensor],
+) -> None:
+    """Assert every stage's returned grads (slot 1:) cover and match the reference."""
+    pp_by_fqn: Dict[str, torch.Tensor] = {}
+    for rank in models:
+        case.assertIsInstance(scheds[rank], Schedule1F1B)
+        pp_by_fqn.update(_stage_grads_by_fqn(models[rank], results[rank][1:]))
+    _assert_grads_match(case, pp_by_fqn, ref_by_fqn)
 
 
 class TestSchedule1F1BGradEquivalence(unittest.TestCase):
     """1F1B grads equal the non-PP full-batch mean-loss gradient.
 
     Three stages run concurrently against the threaded FIFO shim, exercising
-    the REAL warmup/steady/cooldown loop and its deadlock-freedom; four
-    microbatches cover warmup, steady turns, and cooldown on every stage.
+    the REAL warmup/steady/cooldown loop and its deadlock-freedom. The shim
+    completes a send's ``Work.wait`` only after the peer's ``irecv``, so these
+    cases also pin the schedule's "wait only after the peer consumed the
+    values" invariant.
     """
 
     def test_pp_grads_match_full_batch_mean(self):
         """Test degree-3 1F1B grads match the full-batch mean gradient."""
-        plan = GraphParallelPlan()
-        plan.pp_stage(0, ["embed", "lin0"])
-        plan.pp_stage(1, ["lin1"])
-        plan.pp_stage(2, ["head"])
-        cfg = PassConfig(
-            fsdp_enabled=False,
-            pp_enabled=True,
-            pp_degree=3,
-            pp_microbatch_size=2,
-            pp_schedule="1f1b",
-        )
-
-        # Reference: single-card full-batch gradient on the plain joint graph.
+        # Four microbatches cover warmup, steady turns, and cooldown on every
+        # stage.
         ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=8)
         ref_by_fqn = _reference_grads_by_fqn(ref_jg, ref_model, {"x": x, "y": y})
-
-        # PP: one pruned model + 1F1B schedule per rank. Each stage is traced
-        # with a MICRO-batch sample and run on the full batch (the schedule
-        # slices it back into matching micro-batches).
-        models, scheds = _build_pp_stages(
-            lambda: _tiny_lm_joint_graph(batch=2)[0],
-            _tiny_lm_stage_model,
-            plan,
-            cfg,
-            pp_degree=3,
-        )
-        states = {r: [p.detach() for p in models[r].parameters()] for r in range(3)}
-        results: dict = {}
-        errors: dict = {}
-
-        def run_stage(rank: int) -> None:
-            """Run one stage's full 1F1B step under its thread-local rank."""
-            tls.rank = rank
-            try:
-                results[rank] = scheds[rank](*states[rank], x, y)
-            except Exception as exc:  # pylint: disable=broad-except
-                errors[rank] = exc
-
-        with _patch_threaded_p2p() as tls:
-            threads = [
-                threading.Thread(target=run_stage, args=(rank,)) for rank in range(3)
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=60)
-            alive = [thread for thread in threads if thread.is_alive()]
+        models, scheds = _three_stage_1f1b()
+        results, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
         self.assertFalse(alive, "1F1B schedule deadlocked across stages")
         self.assertFalse(errors, f"stage raised: {errors}")
+        _assert_threaded_grads_match(self, models, scheds, results, ref_by_fqn)
 
-        pp_by_fqn: Dict[str, torch.Tensor] = {}
-        for rank in range(3):
-            self.assertIsInstance(scheds[rank], Schedule1F1B)
-            pp_by_fqn.update(_stage_grads_by_fqn(models[rank], results[rank][1:]))
-        _assert_grads_match(self, pp_by_fqn, ref_by_fqn)
+    def test_pp_grads_match_full_batch_mean_mb_equals_degree(self):
+        """Test the ``num_microbatches == pp_degree`` edge keeps grads correct.
+
+        Warmup fills the whole step on the early stages, so their deferred
+        pending activation ships on the first cooldown turn.
+        """
+        ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=6)
+        ref_by_fqn = _reference_grads_by_fqn(ref_jg, ref_model, {"x": x, "y": y})
+        models, scheds = _three_stage_1f1b()
+        results, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
+        self.assertFalse(alive, "1F1B schedule deadlocked across stages")
+        self.assertFalse(errors, f"stage raised: {errors}")
+        _assert_threaded_grads_match(self, models, scheds, results, ref_by_fqn)
+
+    def test_1f1b_frees_saved_activations_after_backward(self):
+        """Test saved activations die once the NEXT microbatch's backward runs.
+
+        On the last stage each backward must leave only its predecessor's
+        per-microbatch loss alive (needed for the step mean) — the schedule no
+        longer holds every microbatch's activations until step end.
+        """
+        _, _, x, y = _tiny_lm_joint_graph(batch=8)
+        models, scheds = _three_stage_1f1b()
+        last = scheds[2]
+        checks: List[Tuple[bool, bool]] = []
+        # Weakrefs per backward turn: the free happens after _apply_backward
+        # returns, so a turn can only verify its predecessor; _finalize_loss
+        # then verifies the final microbatch.
+        turn_refs: Dict[int, List[Any]] = {}
+        orig_backward = last._apply_backward
+        orig_finalize = last._finalize_loss
+
+        def _check_refs(refs: List[Any]) -> Tuple[bool, bool]:
+            """Report (loss alive, non-loss activations freed) for one turn."""
+            return (
+                refs[0]() is not None,
+                all(ref is None or ref() is None for ref in refs[1:]),
+            )
+
+        def spy_backward(
+            state: Sequence[Any],
+            grad_in: Sequence[Any],
+            fwd_outs: Sequence[Any],
+            mb_index: int,
+        ) -> Sequence[torch.Tensor]:
+            """Check the previous microbatch was freed; record this one's refs."""
+            turn = len(turn_refs)
+            if turn > 0:
+                checks.append(_check_refs(turn_refs[turn - 1]))
+            # Non-tensor saved values (e.g. sym-size ints) cannot weakref and
+            # cannot leak device memory.
+            turn_refs[turn] = [
+                weakref.ref(v) if isinstance(v, torch.Tensor) else None
+                for v in fwd_outs
+            ]
+            return orig_backward(state, grad_in, fwd_outs, mb_index)
+
+        def spy_finalize(
+            fwd_outs_per_mb: Sequence[Sequence[Any]], user_inputs: Sequence[Any]
+        ) -> torch.Tensor:
+            """Verify the final microbatch: loss alive, activations freed."""
+            checks.append(_check_refs(turn_refs[len(turn_refs) - 1]))
+            return orig_finalize(fwd_outs_per_mb, user_inputs)
+
+        last._apply_backward = spy_backward
+        last._finalize_loss = spy_finalize
+        results, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
+        self.assertFalse(alive, "1F1B schedule deadlocked across stages")
+        self.assertFalse(errors, f"stage raised: {errors}")
+        self.assertEqual(len(checks), 4)
+        for loss_alive, rest_dead in checks:
+            self.assertTrue(loss_alive, "loss must stay alive for the step mean")
+            self.assertTrue(rest_dead, "saved activations must be freed")
+
+    def test_1f1b_releases_boundary_send_buffers(self):
+        """Test a middle stage's boundary sends drain before the step ends.
+
+        Stage 1 ships its cut activation downstream and its boundary grads
+        upstream; each turn's gradient receipt proves those transfers for the
+        previous microbatch completed, so by turn ``i`` every microbatch up to
+        ``i - 2`` — boundary AND saved values — must already be released, and
+        everything must be gone by ``_finalize_loss``.
+        """
+        _, _, x, y = _tiny_lm_joint_graph(batch=8)
+        models, scheds = _three_stage_1f1b()
+        mid = scheds[1]
+        fwd_refs: Dict[int, List[Any]] = {}
+        stale: List[Tuple[Any, ...]] = []
+        turn_count = [0]
+        orig_forward = mid._apply_forward
+        orig_recv_grad = mid._recv_gradient
+        orig_finalize = mid._finalize_loss
+
+        def _alive(refs: List[Any]) -> List[int]:
+            """Indices of still-live tensor outputs (non-tensors never live)."""
+            return [i for i, r in enumerate(refs) if r is not None and r() is not None]
+
+        def spy_forward(
+            state: Sequence[Any],
+            act_in: Sequence[Any],
+            owned_inputs: Sequence[Any],
+            mb_index: int,
+        ) -> Tuple[Any, ...]:
+            """Weakref this microbatch's forward outputs (element 0 = boundary)."""
+            out = orig_forward(state, act_in, owned_inputs, mb_index)
+            fwd_refs[mb_index] = [
+                weakref.ref(v) if isinstance(v, torch.Tensor) else None for v in out
+            ]
+            return out
+
+        def spy_recv_gradient(fwd_outs: Sequence[Any]) -> List[Any]:
+            """At turn ``i`` microbatches 0..i-2 must be fully released."""
+            turn = turn_count[0]
+            turn_count[0] += 1
+            for mb in range(turn - 1):
+                alive = _alive(fwd_refs[mb])
+                if alive:
+                    stale.append(("turn", turn, mb, alive))
+            return orig_recv_grad(fwd_outs)
+
+        def spy_finalize(
+            fwd_outs_per_mb: Sequence[Sequence[Any]], user_inputs: Sequence[Any]
+        ) -> torch.Tensor:
+            """Everything must be released once the step drained."""
+            for mb, refs in fwd_refs.items():
+                alive = _alive(refs)
+                if alive:
+                    stale.append(("finalize", mb, alive))
+            return orig_finalize(fwd_outs_per_mb, user_inputs)
+
+        mid._apply_forward = spy_forward
+        mid._recv_gradient = spy_recv_gradient
+        mid._finalize_loss = spy_finalize
+        results, errors, alive = _run_threaded_1f1b(models, scheds, x, y)
+        self.assertFalse(alive, "1F1B schedule deadlocked across stages")
+        self.assertFalse(errors, f"stage raised: {errors}")
+        self.assertEqual(len(fwd_refs), 4)
+        self.assertFalse(stale, f"buffers still held: {stale}")
+        self.assertIsInstance(results[1][0], torch.Tensor)
 
 
 if __name__ == "__main__":
