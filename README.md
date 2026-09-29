@@ -140,39 +140,6 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 - [社区贡献](./docs/contributing/) — 开发环境、测试规范和发布流程
 - [版本说明](./hyper_parallel_v1.0.0_release_notes.md) — 版本变更记录
 
----
-
-## 🗂️ 项目结构
-
-```text
-HyperParallel/
-├── hyper_parallel/
-│   ├── models/                         # 模型族适配层与 recipes/train.yaml，对外入口 api.py
-│   │   └── _transformers/              # Transformers 模型构建与预训练权重加载
-│   ├── trainer/                        # TrainerConfig、TextTrainer/VLMTrainer 和训练生命周期
-│   ├── components/                     # 高性能 modules/functional、优化器、loss 和 checkpoint
-│   ├── data/                           # 数据集读取、样本转换与 dataloader
-│   ├── distributed/                    # 分布式模型构建、并行计划应用与激活管理
-│   ├── core/
-│   │   ├── dtensor/                    # DeviceMesh、Layout、placement 和 DTensor
-│   │   ├── shard/                      # sharding plan、自定义 shard 和 DFunction
-│   │   ├── fully_shard/                # FSDP/HSDP 参数与执行调度
-│   │   ├── tensor_parallel/            # TP styles 与 loss parallel
-│   │   ├── context_parallel/           # Context Parallel
-│   │   ├── expert_parallel/            # Expert Parallel
-│   │   ├── pipeline_parallel/          # Pipeline stage 与调度
-│   │   └── distributed_checkpoint/     # 分布式保存、加载与 reshard
-│   └── collectives/                    # 集合通信接口与实现
-├── examples/
-│   ├── training_demo/                  # 训练示例（数据准备、离线/在线 YAML）
-│   ├── data/                           # 数据准备脚本
-│   ├── generate/                       # 生成与精度对齐校验脚本
-│   └── torch/                          # PyTorch 后端 Core API 组合示例
-├── docs/
-│   ├── guide/                          # 使用指南
-│   └── api/                            # API 参考
-└── tests/                              # models、Core 和后端测试
-```
 
 ---
 
