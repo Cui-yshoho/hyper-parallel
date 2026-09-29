@@ -6,7 +6,7 @@
 [![Document 文档中心](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
 [![Papers](https://img.shields.io/badge/Papers-red?style=flat&logo=arxiv&logoColor=white)](#technical-reports)
   <h3>简化超节点编程 &nbsp;·&nbsp; 释放并行算力</h3>
-  <p><sub>昇腾超节点亲和的分布式并行加速库</sub></p>
+
 
   <p>
     <a href="#-快速开始">快速开始</a>
