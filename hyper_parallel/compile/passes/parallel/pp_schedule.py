@@ -34,14 +34,18 @@ microbatches and share the same P2P / loss / gradient contract:
   0-d int64 tensors and unwrapped with ``item()`` on arrival — mirroring how
   ``torch.distributed.pipelining``'s ``PipelineStage`` ships full argument
   lists. The P2P exchange uses eager ``dist.isend``/``irecv`` on the PP
-  process group; sends are async (``Work`` handles waited at the end of the
-  step) so the sweeps overlap receive/compute across stages, receives wait
-  before first use.
+  process group; sends are async so the sweeps overlap receive/compute across
+  stages, receives wait before first use, and each microbatch's boundary sends
+  are retained under that microbatch's key — forward and backward boundaries
+  share the key — until their ``Work`` handles are waited (1F1B: one turn
+  after the backward posts, so a forward send rides along; GPipe: at the end
+  of the step).
 - Microbatch gradients are un-normalized sums while sweeping, then divided by
   ``num_microbatches`` at the end, so the step gradient matches the non-PP
   semantics of a full-batch mean loss.
 
-The schedules differ only in their action order:
+The schedules differ in their action order — and in the activation lifetime
+that order allows:
 
 ``ScheduleGPipe``
     1. Forward sweep: run every microbatch's forward (shipping boundary
@@ -161,9 +165,12 @@ class PipelineScheduleBase(nn.Module):
         self.user_input_stages = list(user_input_stages)
         self.is_first = stage_idx == 0
         self.is_last = stage_idx == pp_degree - 1
-        # Work handles of in-flight isend ops; tensors are kept referenced
-        # so the underlying buffers stay alive until the send completes.
-        self._pending_sends: List[Tuple[Any, torch.Tensor]] = []
+        # In-flight isend Work handles keyed by microbatch index — forward and
+        # backward boundaries of one microbatch share the key; the sent
+        # tensors stay referenced so their buffers outlive the send. Schedules
+        # release a microbatch's buffers once its sends provably completed
+        # (1F1B: next turn's gradient receipt) or at the end of the step.
+        self._pending_sends: Dict[int, List[Tuple[Any, torch.Tensor]]] = {}
 
     # ------------------------------------------------------------------
     # Input / microbatch resolution
@@ -264,10 +271,12 @@ class PipelineScheduleBase(nn.Module):
         act_in = self._recv_activation()
         return self._apply_forward(state, act_in, owned_inputs, mb_index)
 
-    def _send_forward(self, out: Sequence[Any]) -> None:
-        """Ship the boundary activations (forward outputs' prefix) downstream."""
+    def _send_forward(self, out: Sequence[Any], mb_index: int) -> None:
+        """Ship microbatch ``mb_index``'s boundary activations downstream."""
         if self.num_send:
-            self._send_values(out[: self.num_send], dst=self.stage_idx + 1)
+            self._send_values(
+                out[: self.num_send], dst=self.stage_idx + 1, mb_index=mb_index
+            )
 
     def _recv_gradient(self, fwd_outs: Sequence[Any]) -> List[Any]:
         """Receive the next stage's output grads (a seed on the last stage).
@@ -284,25 +293,29 @@ class PipelineScheduleBase(nn.Module):
         state: Sequence[Any],
         grad_in: Sequence[Any],
         fwd_outs: Sequence[Any],
+        mb_index: int,
     ) -> Sequence[torch.Tensor]:
-        """Run one microbatch's backward subgraph and ship boundary grads.
+        """Run microbatch ``mb_index``'s backward subgraph and ship grads.
 
         Gradients flow UPSTREAM, so the previous stage is the destination,
         mirroring the forward direction. The grads returned are un-normalized
-        sums over the microbatches.
+        sums over the microbatches; the shipped boundary grads are keyed by
+        ``mb_index`` so the schedule can release their buffers later.
         """
         out = self.bwd_gm(*state, *grad_in, *fwd_outs)
         param_grads = out[: self.num_trainable]
         if self.grad_send_count:
-            self._send_values(out[self.num_trainable :], dst=self.stage_idx - 1)
+            self._send_values(
+                out[self.num_trainable :], dst=self.stage_idx - 1, mb_index=mb_index
+            )
         return param_grads
 
     def _backward_microbatch(
-        self, state: Sequence[Any], fwd_outs: Sequence[Any]
+        self, state: Sequence[Any], fwd_outs: Sequence[Any], mb_index: int
     ) -> Sequence[torch.Tensor]:
         """Receive boundary grads then run one microbatch's backward subgraph."""
         grad_in = self._recv_gradient(fwd_outs)
-        return self._apply_backward(state, grad_in, fwd_outs)
+        return self._apply_backward(state, grad_in, fwd_outs, mb_index)
 
     @staticmethod
     def _accumulate_grads(
@@ -336,10 +349,20 @@ class PipelineScheduleBase(nn.Module):
     # ------------------------------------------------------------------
 
     def _flush_pending_sends(self) -> None:
-        """Wait for in-flight isend ops and drop their buffer references."""
-        for work, _ in self._pending_sends:
+        """Wait every in-flight isend and drop all buffer references."""
+        for sends in self._pending_sends.values():
+            for work, _ in sends:
+                work.wait()
+        self._pending_sends = {}
+
+    def _wait_sends(self, mb_index: int) -> None:
+        """Wait microbatch ``mb_index``'s in-flight sends, freeing its buffers.
+
+        Callers must only invoke this once the sends are provably complete
+        (e.g. the peer consumed the values), so the wait never blocks.
+        """
+        for work, _ in self._pending_sends.pop(mb_index, ()):
             work.wait()
-        self._pending_sends = []
 
     @staticmethod
     def _anchor_device(user_inputs: Sequence[Any]) -> torch.device:
@@ -349,16 +372,18 @@ class PipelineScheduleBase(nn.Module):
                 return value.device
         return torch.device("cpu")
 
-    def _send_values(self, values: Sequence[Any], dst: int) -> None:
+    def _send_values(self, values: Sequence[Any], dst: int, mb_index: int) -> None:
         """Async-send boundary values to the neighbouring stage ``dst``.
 
         Tensors go as-is (made contiguous, with THAT buffer retained); int
         scalars (dynamic-shape ``sym_size`` nodes) are packed as 0-d int64
         tensors on the first tensor value's device — CPU tensors cannot ride
         an NCCL/NPU-backend group — and unwrapped with ``item()`` on the
-        receiving side. The ``Work`` handles are queued (waited at the end of
-        the step) and the sent tensors kept referenced so their buffers
-        outlive the send.
+        receiving side. The ``Work`` handles are queued under ``mb_index``
+        (forward and backward boundaries of a microbatch share the key) and
+        the sent tensors kept referenced so their buffers outlive the send;
+        the schedule waits them (per turn or at step end) before the buffers
+        are released.
         """
         dst_rank = self._global_rank(dst)
         anchor_device = next(
@@ -370,7 +395,7 @@ class PipelineScheduleBase(nn.Module):
             else:
                 tensor = torch.tensor(value, dtype=torch.int64, device=anchor_device)
             work = dist.isend(tensor, dst=dst_rank, group=self.pp_group)
-            self._pending_sends.append((work, tensor))
+            self._pending_sends.setdefault(mb_index, []).append((work, tensor))
 
     def _recv_values(self, spec: Sequence[Tuple[Any, ...]], src: int) -> List[Any]:
         """Receive boundary values from the neighbouring stage ``src``, in order.
@@ -453,7 +478,7 @@ class ScheduleGPipe(PipelineScheduleBase):
         for mb_index in range(num_microbatches):
             out = self._forward_microbatch(state, owned_inputs, mb_index)
             fwd_outs_per_mb.append(out)
-            self._send_forward(out)
+            self._send_forward(out, mb_index)
         return fwd_outs_per_mb
 
     def _backward_sweep(
@@ -475,7 +500,7 @@ class ScheduleGPipe(PipelineScheduleBase):
         for mb_index in reversed(range(num_microbatches)):
             grads = self._accumulate_grads(
                 grads,
-                self._backward_microbatch(state, fwd_outs_per_mb[mb_index]),
+                self._backward_microbatch(state, fwd_outs_per_mb[mb_index], mb_index),
             )
         return self._average_grads(grads, num_microbatches)
 
@@ -493,9 +518,16 @@ class Schedule1F1B(PipelineScheduleBase):
     constraint ``torch.distributed.pipelining.Schedule1F1B`` enforces.
 
     Note:
-        Like ``ScheduleGPipe``, in-flight sends are waited at the end of the
-        step, so boundary-activation buffers stay referenced until then; this
-        class fixes the action order, not yet the activation lifetime.
+        Unlike GPipe, each microbatch's saved activations are freed as soon
+        as its backward consumes them. Its boundary sends share one key for
+        both directions and are released one turn after the backward posts —
+        the next turn's gradient receipt proves the previous microbatch's
+        transfers completed, so the wait cannot deadlock. Peak memory
+        therefore tracks the warmup depth (``pp_degree - stage_idx``) instead
+        of ``num_microbatches``; only the final microbatch's sends are still
+        waited at the end of the step. The last stage has no downstream
+        gradient to mark that progress, so its per-turn wait may briefly block
+        on the upstream peer.
     """
 
     def forward(self, *flat_inputs: Any) -> Tuple[torch.Tensor, ...]:
@@ -530,9 +562,11 @@ class Schedule1F1B(PipelineScheduleBase):
         grads: List[torch.Tensor] = []
         fwd_index = 0
         bwd_index = 0
-        # Forward output whose boundary activation has not shipped yet; the
-        # send is deferred one slot to keep the pair's FIFO complementary.
-        pending: Any = None
+        # Forward output whose boundary activation has not shipped yet, with
+        # its microbatch index; the send is deferred one slot to keep the
+        # pair's FIFO complementary.
+        pending_index = -1
+        pending_out: Any = None
         even = self.stage_idx % 2 == 0
 
         # Warmup: fill the pipeline with ``pp_degree - stage_idx`` in-flight
@@ -544,47 +578,74 @@ class Schedule1F1B(PipelineScheduleBase):
         for k in range(warmup):
             act_in = self._recv_activation()
             if not even and k > 0:
-                self._send_forward(pending)
-                pending = None
+                self._send_forward(pending_out, pending_index)
+                pending_out = None
             out = self._apply_forward(state, act_in, owned_inputs, fwd_index)
             fwd_outs_per_mb[fwd_index] = out
             fwd_index += 1
             if even:
                 if k != warmup - 1:
-                    self._send_forward(out)
+                    self._send_forward(out, fwd_index - 1)
                 else:
-                    pending = out
+                    pending_index, pending_out = fwd_index - 1, out
             else:
-                pending = out
+                pending_index, pending_out = fwd_index - 1, out
 
-        # Steady turn: recv_grad, send_activation, backward, send_grad,
-        # recv_activation, forward.
+        # Steady turn: recv_grad (+ release the previous turn's boundary
+        # buffers), send_activation, backward, send_grad, recv_activation,
+        # forward.
         for _ in range(num_microbatches - warmup):
             grad_in = self._recv_gradient(fwd_outs_per_mb[bwd_index])
-            if pending is not None:
-                self._send_forward(pending)
-                pending = None
+            if bwd_index > 0:
+                # This gradient's arrival proves the peer consumed microbatch
+                # ``bwd_index - 1``'s boundary values on both directions, so
+                # its in-flight sends completed and their buffers can go.
+                self._wait_sends(bwd_index - 1)
+            if pending_out is not None:
+                self._send_forward(pending_out, pending_index)
+                pending_out = None
             grads = self._accumulate_grads(
                 grads,
-                self._apply_backward(state, grad_in, fwd_outs_per_mb[bwd_index]),
+                self._apply_backward(
+                    state, grad_in, fwd_outs_per_mb[bwd_index], bwd_index
+                ),
+            )
+            # Backward was the last consumer of these outputs; keep only the
+            # last stage's loss scalar for _finalize_loss.
+            fwd_outs_per_mb[bwd_index] = (
+                fwd_outs_per_mb[bwd_index][:1] if self.is_last else None
             )
             bwd_index += 1
             act_in = self._recv_activation()
             out = self._apply_forward(state, act_in, owned_inputs, fwd_index)
             fwd_outs_per_mb[fwd_index] = out
             fwd_index += 1
-            pending = out
+            pending_index, pending_out = fwd_index - 1, out
+        # Drop the frame-local reference to the final forward's outputs (the
+        # warmup's when the steady state never runs); it would otherwise pin
+        # them through the cooldown.
+        out = None
 
         # Cooldown: drain the remaining backwards; the final forward's
         # activation ships on the first turn.
-        for k in range(warmup):
+        for _ in range(warmup):
             grad_in = self._recv_gradient(fwd_outs_per_mb[bwd_index])
-            if k == 0 and pending is not None:
-                self._send_forward(pending)
-                pending = None
+            if bwd_index > 0:
+                # Same release invariant as the steady state.
+                self._wait_sends(bwd_index - 1)
+            if pending_out is not None:
+                self._send_forward(pending_out, pending_index)
+                pending_out = None
             grads = self._accumulate_grads(
                 grads,
-                self._apply_backward(state, grad_in, fwd_outs_per_mb[bwd_index]),
+                self._apply_backward(
+                    state, grad_in, fwd_outs_per_mb[bwd_index], bwd_index
+                ),
+            )
+            # Backward was the last consumer of these outputs; keep only the
+            # last stage's loss scalar for _finalize_loss.
+            fwd_outs_per_mb[bwd_index] = (
+                fwd_outs_per_mb[bwd_index][:1] if self.is_last else None
             )
             bwd_index += 1
 

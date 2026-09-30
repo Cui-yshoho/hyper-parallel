@@ -100,7 +100,10 @@ Both come from `GraphParallelPlan.pp_stage(stage_idx, fqns)` /
 - **Schedule choice**: `pp_schedule: gpipe` (default) runs all forwards
   before all backwards; `pp_schedule: 1f1b` interleaves one backward per
   forward in steady state, shrinking the pipeline bubble at the cost of a
-  `num_microbatches >= pp_degree` requirement. Interleaved / ZB-V schedules
-  land in `passes/parallel/pp_schedule.py` as additional classes.
+  `num_microbatches >= pp_degree` requirement. 1F1B also frees each
+  microbatch's activations once its backward runs, so peak activation memory
+  follows the pipeline depth instead of the microbatch count. Interleaved /
+  ZB-V schedules land in `passes/parallel/pp_schedule.py` as additional
+  classes.
 - Loss is only real on the last stage; other stages return a zero scalar
   (see `Last-stage loss:` in the run output for convergence).
