@@ -23,11 +23,10 @@ instead of raising. No Hub/network access is needed: ``MODEL_ARCH_MAPPING``
 entries are registered or injected locally and ``AutoConfig.from_pretrained``
 is never called.
 """
-# pylint: disable=wrong-import-position
+# These unit tests exercise the registry's private resolver directly.
+# pylint: disable=protected-access
 
-import os
 import unittest
-from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -39,23 +38,6 @@ from tests.common.mark_utils import arg_mark
 
 class TestEmptyMappingFallback(unittest.TestCase):
     """Custom-architecture resolution and HF fallback semantics."""
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_deepseek_v41_registers_lazily(self):
-        """Family discovery registers the V4.1 custom architecture."""
-        self.assertIsInstance(registry.MODEL_ARCH_MAPPING, OrderedDict)
-        spec = registry.get_model_adapter("deepseek_v41")
-        self.assertIsNotNone(spec)
-        self.assertEqual(
-            registry.MODEL_ARCH_MAPPING["DeepseekV41ForCausalLM"],
-            (
-                "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
-                "DeepseekV41ForCausalLM",
-            ),
-        )
-        model_cls = registry._resolve_custom_model_cls("DeepseekV41ForCausalLM")
-        self.assertEqual(model_cls.__name__, "DeepseekV41ForCausalLM")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

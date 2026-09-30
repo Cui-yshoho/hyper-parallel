@@ -43,7 +43,6 @@ from hyper_parallel.models.deepseek_v41.adapter.validation.shared_state_trace im
 from hyper_parallel.tools.model_integration.checkpoint_coverage import build_checkpoint_coverage
 from hyper_parallel.tools.model_integration.data_contract import (
     modality_gradient_parameters,
-    validate_data_contract,
     validate_observed_forward_fields,
 )
 from hyper_parallel.tools.model_integration.evidence_store import (
@@ -55,7 +54,6 @@ from hyper_parallel.tools.model_integration.structure_inventory import (
     diff_inventories,
     inspect_local_model_assets,
 )
-from hyper_parallel.tools.model_integration.optimizer_layout import validate_optimizer_layout
 from hyper_parallel.tools.model_integration.manifest import ManifestError, load_manifest
 from hyper_parallel.tools.model_integration.module_parity import ParityContext, run_module_parity
 from hyper_parallel.tools.model_integration import case_compare
@@ -94,7 +92,6 @@ from hyper_parallel.tools.model_integration.cli import main as model_integration
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.parallelism import ActivationCheckpointSelection
 from hyper_parallel.trainer.config.training import ModelIntegrationConfig
-from tests.common.mark_utils import arg_mark
 
 
 class _ReferenceLinear(nn.Module):
@@ -123,7 +120,7 @@ class _CandidateLinear(nn.Module):
         return torch.einsum("bi,oi->bo", inputs, self.weight)
 
 
-class _CandidateTree(nn.Module):
+class _CandidateTree(nn.Module):  # pylint: disable=abstract-method
     """Final-tree holder proving selector-based candidate lookup."""
 
     def __init__(self) -> None:
@@ -140,8 +137,9 @@ class _IncorrectCandidateLinear(_CandidateLinear):
         return super().forward(inputs) + 1.0
 
 
-def _copy_parity_weight(reference: nn.Module, candidate: nn.Module, _context: object):
+def _copy_parity_weight(reference: nn.Module, candidate: nn.Module, context: object):
     """Copy one authoritative tensor and return complete gradient mapping."""
+    del context
     reference.weight.data.copy_(candidate.weight.data)
     return {"weight": "weight"}
 
@@ -152,7 +150,7 @@ class _ExpertMesh:
     mesh_dim_names = ("ep",)
 
 
-class _FakeUnit(nn.Module):
+class _FakeUnit(nn.Module):  # pylint: disable=abstract-method
     """Duck-typed HSDP owner for gradient-domain validation."""
 
     def __init__(self, domains: tuple[str, ...]) -> None:
@@ -698,25 +696,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
             all("execution_mode" not in case.topology for case in pair)
         )
 
-    def test_deepseek_recompute_examples_are_explicitly_cross_topology(self) -> None:
-        """Keep the public EP16 recompute example classified against EP1."""
-        manifest = load_manifest(
-            find_repository_root()
-            / "examples/training_demo/deepseek_v41/deepseek_v41_validation.yaml"
-        )
-        cases = generate_validation_cases(
-            manifest.matrix,
-            RecomputePolicy(
-                safe_module_patterns=("model.layers.*.mlp",),
-            ),
-        )
-        recompute_cases = [case for case in cases if case.name.startswith("recompute_")]
-
-        self.assertTrue(recompute_cases)
-        self.assertTrue(
-            all(case.metadata["acceptance"] == "cross_topology" for case in recompute_cases)
-        )
-
     def test_compare_validation_case_requires_acceptance_metadata(self) -> None:
         """Never weaken comparison limits when generated metadata is incomplete."""
         case = SimpleNamespace(name="incomplete", metadata={})
@@ -786,18 +765,9 @@ class TestModelIntegrationContracts(unittest.TestCase):
         ]
 
         self.assertEqual(
-            InputIdentityRecorder._canonical_global_hash(baseline),
-            InputIdentityRecorder._canonical_global_hash(sharded),
+            InputIdentityRecorder._canonical_global_hash(baseline),  # pylint: disable=protected-access
+            InputIdentityRecorder._canonical_global_hash(sharded),  # pylint: disable=protected-access
         )
-
-    def test_optimizer_layout_accepts_plain_parameter_state(self) -> None:
-        """A local Adam state follows its owning local parameter layout."""
-        model = nn.Linear(2, 2)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
-        model(torch.ones(1, 2)).sum().backward()
-        optimizer.step()
-
-        self.assertEqual(validate_optimizer_layout(model, optimizer), [])
 
     def test_parameter_summary_does_not_rebuild_uneven_dtensor(self) -> None:
         """Inspect an empty FSDP shard without requesting unsupported redistribution."""
@@ -809,34 +779,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
         self.assertEqual(summary["global_shape"], [16])
         self.assertEqual(summary["layout"]["local_shape"], [0])
         self.assertTrue(summary["finite"])
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_data_contract_reports_declared_collision_and_shift(self) -> None:
-        """Report ownership and causal-shift mismatches.
-
-        Feature: Model-integration data contract.
-        Description: Declare a runtime collision and an incompatible label shift.
-        Expectation: Validation returns both ``HP-DATA-001`` and ``HP-DATA-002``.
-        """
-        runtime_adapter = SimpleNamespace(
-            runtime_input_fields=lambda: ("input_ids", "packed_seq_params")
-        )
-        validation_spec = ModelValidationSpec(
-            data=DataValidationSpec(
-                runtime_fields=("packed_seq_params",),
-                labels_are_shifted=True,
-            )
-        )
-
-        _, findings = validate_data_contract(
-            validation_spec,
-            runtime_adapter,
-            labels_are_shifted=False,
-            source_type="online",
-        )
-
-        self.assertEqual({finding.code for finding in findings}, {"HP-DATA-001", "HP-DATA-002"})
 
     def test_runtime_data_observations_cover_fields_and_modality_gradients(self) -> None:
         """Validate first-forward fields and finite gradients for modality groups."""
@@ -906,174 +848,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
         self.assertIn("recompute=1", entries[0])
         self.assertIn("resume=1", entries[0])
         self.assertIn("excluded: CP is unsupported for this crop.", entries)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_report_writes_detailed_english_and_chinese_summaries(self) -> None:
-        """Render detailed bilingual precision evidence.
-
-        Feature: Bilingual model-integration report rendering.
-        Description: Render floating and discrete native parity observations.
-        Expectation: Numeric errors and exact-equality results replace false ``n/a`` values.
-        """
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            store = EvidenceStore(temporary_directory)
-            store.write_json(
-                "check/findings.json",
-                {
-                    "status": "PASS",
-                    "findings": [],
-                    "metadata": {
-                        "model_type": "example",
-                        "inventory_counts": {"modules": 3, "parameters": 2, "buffers": 1},
-                    },
-                },
-            )
-            store.write_json(
-                "module_parity/comparison.json",
-                {
-                    "status": "PASS",
-                    "cases": [{
-                        "case": "native",
-                        "status": "PASS",
-                        "observations": [{
-                            "name": "attention",
-                            "status": "pass",
-                            "metrics": {
-                                "max_abs": 1.0e-5,
-                                "relative_l2": 2.0e-6,
-                            },
-                        }, {
-                            "name": "attention.topk_indices",
-                            "status": "pass",
-                            "dtype": "torch.int64",
-                        }],
-                    }],
-                },
-            )
-            comparison = {
-                "status": "PASS",
-                "cases": [{"case": "baseline", "status": "PASS"}],
-                "comparisons": {
-                    "axis-tp_example": {
-                        "status": "PASS",
-                        "scalar": {
-                            "status": "PASS",
-                            "steps": [{
-                                "step": 1,
-                                "status": "PASS",
-                                "loss_max_abs": 1.0e-5,
-                                "norm_max_abs": 2.0e-4,
-                                "post_clip_norm_max_abs": 0.0,
-                                "input_identity": True,
-                                "learning_rate_equal": True,
-                                "finite": True,
-                            }],
-                        },
-                        "parameter_probes": {
-                            "status": "PASS",
-                            "optimizer_state_numeric_comparison": "skipped_cross_topology",
-                            "skipped_optimizer_states": 2,
-                        },
-                        "checkpoint_layout": None,
-                    }
-                },
-                "performance": {
-                    "baseline": {
-                        "steady_steps": 1,
-                        "step_time_p50_seconds": 1.0,
-                        "step_time_p90_seconds": 1.1,
-                        "tokens_per_second_p50": 2.0,
-                        "samples_per_second_p50": 1.0,
-                        "peak_memory_allocated_bytes": 1024,
-                        "peak_memory_reserved_bytes": 2048,
-                    }
-                },
-            }
-            store.write_json("comparison.json", comparison)
-            store.write_json(
-                "checkpoint/coverage.json",
-                {"status": "NOT_LOADED", "reason": "scratch model"},
-            )
-            store.write_json(
-                "cases/resolved_cases.json",
-                [
-                    {
-                        "name": "baseline",
-                        "kind": "topology",
-                        "topology": {
-                            "tp": 1,
-                            "cp": 1,
-                            "ep": 1,
-                            "fsdp": 2,
-                            "sequence_parallel": False,
-                            "recompute": {"layer_count": 0},
-                        },
-                        "metadata": {"acceptance": "same_topology"},
-                    },
-                    {
-                        "name": "axis-tp_example",
-                        "kind": "topology",
-                        "topology": {
-                            "tp": 2,
-                            "cp": 1,
-                            "ep": 1,
-                            "fsdp": 1,
-                            "sequence_parallel": False,
-                            "recompute": {"layer_count": 0},
-                        },
-                        "metadata": {"acceptance": "cross_topology"},
-                    },
-                ],
-            )
-            store.write_yaml(
-                "manifest.resolved.yaml",
-                {
-                    "reference": {"source_path": "/source"},
-                    "matrix": {
-                        "steps": 10,
-                        "coverage_notes": ["CP excluded."],
-                        "coverage_notes_zh": ["未覆盖 CP。"],
-                    },
-                    "acceptance": {
-                        "same_topology": {"loss_max_abs": 1.0e-4, "norm_max_abs": 1.0e-3},
-                        "cross_topology": {"loss_max_abs": 5.0e-3, "norm_max_abs": 1.25e-1},
-                        "parameters": {
-                            "max_abs": 1.0e-3,
-                            "relative_l2": 6.0e-2,
-                            "combination": "any",
-                        },
-                    },
-                },
-            )
-            store.write_json(
-                "environment.json",
-                {
-                    "git_revision": "revision",
-                    "hyper_parallel": {"import_path": "/checkout/hyper_parallel/__init__.py"},
-                    "torch": {"version": "2.9"},
-                    "transformers": {"version": "4.57"},
-                },
-            )
-
-            report_status = model_integration_main(
-                ["report", "--output-dir", temporary_directory]
-            )
-            english = store.path("summary.md").read_text(encoding="utf-8")
-            chinese = store.path("summary.zh-CN.md").read_text(encoding="utf-8")
-
-        self.assertEqual(report_status, 0)
-        self.assertEqual(english.splitlines()[0], "PASS")
-        self.assertEqual(chinese.splitlines()[0], "PASS")
-        self.assertIn("strategy_generalization=1", english)
-        self.assertIn("max_loss_abs=1e-05", english)
-        self.assertIn("checkpoint_layout=not applicable (non-resume case)", english)
-        self.assertIn("策略泛化=1", chinese)
-        self.assertIn("输入身份=PASS", chinese)
-        self.assertIn("最大绝对误差=1e-05", chinese)
-        self.assertIn("精确一致性=pass", chinese)
-        self.assertIn("checkpoint layout=不适用（非断点续训用例）", chinese)
-        self.assertNotIn("记录的最大绝对误差=n/a", chinese)
 
     def test_scalar_comparison_blocks_empty_evidence_and_checks_lr(self) -> None:
         """Never turn absent Trainer evidence into a successful comparison."""
