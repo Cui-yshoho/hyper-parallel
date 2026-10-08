@@ -389,7 +389,6 @@ class CheckpointerCallback(Callback):
         if self._restore_train_state:
             self._apply_extra_state(checkpoint_state["extra_state"])
         else:
-            self._set_start_position_from_state()
             logger.info(
                 "restore_train_state=False: loaded weights only from %s "
                 "(step, scheduler, dataloader and RNG start fresh).",

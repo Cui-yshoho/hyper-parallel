@@ -41,7 +41,6 @@ from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Shar
 from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import EP, resolve_placements
-from hyper_parallel.platform import get_platform
 
 # Mesh dimensions whose sharding semantics belong to FSDP (or to other
 # parallelism concerns), never to the source layout recorded here:

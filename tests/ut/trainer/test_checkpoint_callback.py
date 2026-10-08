@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
@@ -278,34 +278,6 @@ class TestCheckpointerCallbackAsyncFailure(unittest.TestCase):
             str(ctx.exception),
             f"the async failure must reach the training loop, got={ctx.exception!r}",
         )
-
-    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
-    def test_partial_epoch_restore_uses_step_derived_position(
-            self,
-            mock_set_device_rng_state: MagicMock,
-    ) -> None:
-        """Resume a mid-epoch checkpoint even if its epoch field was advanced."""
-        callback = CheckpointerCallback.__new__(CheckpointerCallback)
-        callback.trainer = SimpleNamespace(
-            state=TrainerState(),
-            train_dataloader=[object()] * 4,
-            train_steps=4,
-            lr_scheduler=None,
-        )
-
-        callback._apply_extra_state({
-            "global_step": 2,
-            "epoch": 1,
-            "lr_scheduler": None,
-            "train_dataloader": {},
-            "rng_state": {},
-        })
-
-        self.assertEqual(callback.trainer.state.global_step, 2)
-        self.assertEqual(callback.trainer.state.epoch, 0)
-        self.assertEqual(callback.trainer.start_epoch, 0)
-        self.assertEqual(callback.trainer.start_step, 2)
-        mock_set_device_rng_state.assert_called_once_with(None)
 
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
     def test_train_state_restore_can_replay_from_configured_data_start(

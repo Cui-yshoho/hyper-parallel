@@ -45,7 +45,6 @@ from hyper_parallel.distributed._builder.source_shard import (
 )
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.registry import get_model_adapter
-from hyper_parallel.platform import get_platform
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import (
