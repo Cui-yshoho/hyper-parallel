@@ -56,7 +56,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAIndexer,
     build_sliding_window_indices as _window_indices,
 )
-from hyper_parallel.models.deepseek_v41.adapter.image_processor import (
+from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
