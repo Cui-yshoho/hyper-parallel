@@ -45,12 +45,16 @@ class DeepseekV41OmniTransform(OmniDataTransform):
             max_seq_len: int = 4096,
             thinking_mode: str = "chat",
             drop_thinking: bool = True,
+            sequence_alignment: int = 2,
     ) -> None:
         """Bind the native processor to the generic Omni lifecycle."""
         if not isinstance(processor, DeepseekV41Processor):
             raise TypeError("DeepseekV41OmniTransform requires DeepseekV41Processor")
+        if sequence_alignment <= 0 or sequence_alignment % 2:
+            raise ValueError("sequence_alignment must be a positive multiple of two")
         self.thinking_mode = thinking_mode
         self.drop_thinking = drop_thinking
+        self.sequence_alignment = sequence_alignment
         super().__init__(
             max_seq_len=max_seq_len,
             processor=processor,
@@ -81,13 +85,21 @@ class DeepseekV41OmniTransform(OmniDataTransform):
         normalized_image_inputs = [] if image_inputs is None else image_inputs
         assistant_start = self._get_assistant_start(messages, normalized_image_inputs)
         labels = self._build_labels(input_ids, token_types, assistant_start)
-        # Packed boundaries must align with the V4.1 ratio-two KV compressor.
-        # Padding before packing leaves image starts local to their source sample.
-        if input_ids.numel() % 2:
+        # Caller-selected alignment prevents downstream CP sharding from adding
+        # topology-specific tail padding while retaining ratio-two KV.
+        pad_length = (-input_ids.numel()) % self.sequence_alignment
+        if pad_length:
             pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
-            input_ids = torch.cat((input_ids, input_ids.new_tensor([0 if pad_token_id is None else pad_token_id])))
-            labels = torch.cat((labels, labels.new_tensor([IGNORE_INDEX])))
-            token_types = torch.cat((token_types, token_types.new_tensor([TEXT])))
+            resolved_pad_token_id = 0 if pad_token_id is None else pad_token_id
+            input_ids = torch.cat(
+                (input_ids, input_ids.new_full((pad_length,), resolved_pad_token_id))
+            )
+            labels = torch.cat(
+                (labels, labels.new_full((pad_length,), IGNORE_INDEX))
+            )
+            token_types = torch.cat(
+                (token_types, token_types.new_full((pad_length,), TEXT))
+            )
         if input_ids.numel() > self.max_seq_len:
             raise ValueError(
                 f"DeepSeek-V4.1 sample length {input_ids.numel()} exceeds max_seq_len={self.max_seq_len}"
@@ -247,6 +259,7 @@ def build_deepseek_v41_omni_transform(
         max_seq_len: int = 4096,
         thinking_mode: str = "chat",
         drop_thinking: bool = True,
+        sequence_alignment: int = 2,
 ) -> DeepseekV41OmniTransform:
     """Build the native DeepSeek-V4.1 transform from a prebuilt processor."""
     data_transform = DeepseekV41OmniTransform(
@@ -254,6 +267,7 @@ def build_deepseek_v41_omni_transform(
         max_seq_len=max_seq_len,
         thinking_mode=thinking_mode,
         drop_thinking=drop_thinking,
+        sequence_alignment=sequence_alignment,
     )
     return data_transform
 

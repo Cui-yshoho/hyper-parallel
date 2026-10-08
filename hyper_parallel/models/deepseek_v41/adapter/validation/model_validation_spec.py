@@ -212,7 +212,15 @@ def get_validation_spec() -> ModelValidationSpec:
         data=DataValidationSpec(
             required_forward_fields=("input_ids", "labels"),
             runtime_fields=("packed_seq_params",),
-            cp_replicated_forward_fields=("packed_seq_params",),
+            cp_replicated_forward_fields=(
+                "packed_seq_params",
+                "pixel_values",
+                "image_patch_offsets",
+                "image_vit_grid_hw",
+                "image_llm_grid_hw",
+                "image_batch_indices",
+                "image_token_starts",
+            ),
             modality_fields=(
                 "token_types",
                 "pixel_values",

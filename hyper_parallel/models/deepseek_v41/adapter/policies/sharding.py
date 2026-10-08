@@ -24,6 +24,12 @@ def build_parameter_sharding_rules() -> list[tuple[list[str] | str, Any]]:
     )
 
     return [
+        # The multimodal aligner runs on complete, CP-replicated image
+        # features before their rows are inserted into local decoder shards.
+        # Its w1/w2 pair is a pointwise projector, not an attention boundary;
+        # force both linears to stay replicated so the generic colwise/rowwise
+        # heuristic cannot require a mathematically invalid CP attention wrapper.
+        (["aligner.w1", "aligner.w2"], ParamRole.REPLICATED),
         (["indexer.q_b_proj", "indexer.weights_proj"], ParamRole.COLWISE),
         (
             ["q_a_proj", "kv_proj", "compressor", "indexer.wk", "indexer.k_norm"],
