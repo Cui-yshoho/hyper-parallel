@@ -360,6 +360,7 @@ FORBIDDEN = ("auto_models.recipes", "_transformers", "hyper_parallel.models",
 # level; ``registry`` is the planner's function-level adapter lookup. Both
 # stay acyclic; every other ``hyper_parallel.models.*`` edge is forbidden.
 ALLOWED_MODELS_EDGES = ("hyper_parallel.models.build_options",
+                        "hyper_parallel.models.adapter_spec",
                         "hyper_parallel.models.registry")
 
 
