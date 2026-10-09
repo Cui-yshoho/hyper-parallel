@@ -25,8 +25,8 @@ from torch import nn
 from hyper_parallel.components.quantization.tensor.hifloat8_tensor import HiFloat8Tensor, HiFloat8TensorStorage
 from hyper_parallel.components.quantization.functional.hifloat8_linear_func import hifloat8_linear
 from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import hifloat8_grouped_linear
-from hyper_parallel.components.quantization.functional.npu_hifloat8 import hifloat8_matmul
-from hyper_parallel.components.quantization.modules.mxfp8_grouped_linear import MXFP8GroupedExperts
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import hifloat8_matmul
+from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.quantization.modules.hifloat8_grouped_linear import HiFloat8GroupedExperts
 
 from tests.common.mark_utils import arg_mark
@@ -178,7 +178,9 @@ class MemoryContractsTests(unittest.TestCase):
         Description: Poison fresh allocations with NaN before constructing experts.
         Expectation: All weights are finite, nonzero and within fan-in bounds.
         """
-        for cls in (MXFP8GroupedExperts, HiFloat8GroupedExperts):
+        # GroupedExperts is a no-allocation shell whose weights arrive via
+        # from_module, so the initialization contract only applies to HiFloat8.
+        for cls in (HiFloat8GroupedExperts,):
             with self.subTest(cls=cls):
                 # Deterministic poison proves initialization; random torch.empty values do not.
                 original_empty = torch.empty
@@ -201,7 +203,7 @@ class MemoryContractsTests(unittest.TestCase):
         Description: Convert existing expert parameters.
         Expectation: Parameter identity and RNG state are preserved.
         """
-        for cls in (MXFP8GroupedExperts, HiFloat8GroupedExperts):
+        for cls in (GroupedExperts, HiFloat8GroupedExperts):
             with self.subTest(cls=cls):
                 source = nn.Module()
                 source.gate_up_proj = nn.Parameter(torch.randn(2, 12, 4))
@@ -221,7 +223,9 @@ class MemoryContractsTests(unittest.TestCase):
         Description: Pass negative and overflowing expert indices.
         Expectation: Both fail before grouped computation.
         """
-        for cls in (MXFP8GroupedExperts, HiFloat8GroupedExperts):
+        # Only HiFloat8GroupedExperts gates expert ids before the grouped pass;
+        # GroupedExperts defers that validation to the shared GMM contract.
+        for cls in (HiFloat8GroupedExperts,):
             for index in (-1, 2):
                 with self.subTest(cls=cls, index=index):
                     module = cls(2, 4, 6)
