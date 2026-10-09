@@ -75,9 +75,16 @@ class TestApplyParameterFreezing(unittest.TestCase):
 
     @staticmethod
     def _freeze(model, patterns):
-        from hyper_parallel.models._transformers.model_builder import (
-            _apply_parameter_freezing,
-        )
+        try:
+            from hyper_parallel.models._transformers.model_builder import (
+                _apply_parameter_freezing,
+            )
+        except ImportError as exc:
+            # The ci310 smoke image ships torch_npu without libhccl, which
+            # breaks the transformers import chain; skip like the liblzma guard.
+            raise unittest.SkipTest(
+                f"model_builder import chain unavailable: {exc}"
+            ) from exc
 
         return _apply_parameter_freezing(model, patterns)
 
