@@ -1464,10 +1464,14 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "evidence_dir": str(root / "case"),
             }
             completed = SimpleNamespace(returncode=0, stdout="", stderr="")
-            with mock.patch(
-                "hyper_parallel.tools.model_integration.cli.subprocess.run",
-                return_value=completed,
-            ) as run:
+            launch["port_slot"] = 3
+            with (
+                mock.patch.dict(os.environ, {"HCCL_IF_BASE_PORT": "40000"}),
+                mock.patch(
+                    "hyper_parallel.tools.model_integration.cli.subprocess.run",
+                    return_value=completed,
+                ) as run,
+            ):
                 returncode, error = model_integration_cli._execute_case_launch(  # pylint: disable=protected-access
                     manifest,
                     case,
@@ -1480,6 +1484,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             run.call_args.kwargs["cwd"],
             find_repository_root(),
         )
+        self.assertEqual(run.call_args.kwargs["env"]["HCCL_IF_BASE_PORT"], "40768")
 
     def test_case_environment_isolates_inherited_hccl_port(self) -> None:
         """A failed NPU launch must not poison the next matrix case port."""
@@ -1488,14 +1493,14 @@ class TestModelIntegrationContracts(unittest.TestCase):
             kind="topology",
             compare_to="baseline",
         )
-        with mock.patch.dict(os.environ, {"HCCL_IF_BASE_PORT": "62500"}):
+        with mock.patch.dict(os.environ, {"HCCL_IF_BASE_PORT": "40000"}):
             first = model_integration_cli._case_environment(  # pylint: disable=protected-access
                 case,
                 "train",
                 Path("case-1"),
                 Path("resume-1"),
                 port_slot=3,
-                port_stride=32,
+                port_stride=256,
             )
             second = model_integration_cli._case_environment(  # pylint: disable=protected-access
                 case,
@@ -1503,11 +1508,11 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 Path("case-2"),
                 Path("resume-2"),
                 port_slot=4,
-                port_stride=32,
+                port_stride=256,
             )
 
-        self.assertEqual(first["HCCL_IF_BASE_PORT"], "62596")
-        self.assertEqual(second["HCCL_IF_BASE_PORT"], "62628")
+        self.assertEqual(first["HCCL_IF_BASE_PORT"], "40768")
+        self.assertEqual(second["HCCL_IF_BASE_PORT"], "41024")
 
     def test_parameter_probes_persist_only_canonical_rank(self) -> None:
         """Global probe summaries are not duplicated into every rank file."""
@@ -1576,6 +1581,36 @@ class TestModelIntegrationContracts(unittest.TestCase):
             )
 
         self.assertEqual(names, ("exp_avg", "exp_avg_sq"))
+
+    def test_validate_manifest_rejects_resume_at_shared_warm_start(self) -> None:
+        """Require a resume prepare phase to advance beyond shared step one."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            manifest_path = root / "validation.yaml"
+            (root / "trainer.yaml").write_text("training: {}\n", encoding="utf-8")
+            manifest_path.write_text(
+                "schema_version: 1\n"
+                "model:\n  adapter: example\n"
+                "launcher:\n"
+                "  module: examples.training_demo.train_text\n"
+                "  config: trainer.yaml\n"
+                "matrix:\n"
+                "  devices: 16\n"
+                "  steps: 3\n"
+                "  resume_split_step: 1\n"
+                "  shared_initial_checkpoint: true\n"
+                "  baseline: {tp: 1, cp: 1, ep: 1, fsdp: 16}\n"
+                "  same_topology_resume: true\n",
+                encoding="utf-8",
+            )
+
+            manifest = load_manifest(manifest_path)
+
+            with self.assertRaisesRegex(
+                ManifestError,
+                "resume_split_step > 1 because the shared warm-start is global step 1",
+            ):
+                manifest.validate_for("validate")
 
     def test_validate_manifest_builds_standard_trainer_launches(self) -> None:
         """Keep user validation input limited to recipe and experiment choices."""

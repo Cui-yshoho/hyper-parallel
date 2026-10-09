@@ -232,12 +232,18 @@ class ValidationManifest:
             )
             split_step = self.matrix.get("resume_split_step")
             if has_resume_case and (
-                not isinstance(split_step, int)
+                isinstance(split_step, bool)
+                or not isinstance(split_step, int)
                 or split_step <= 0
                 or split_step >= steps
             ):
                 raise ManifestError(
                     "resume cases require 0 < matrix.resume_split_step < matrix.steps"
+                )
+            if has_resume_case and shared_initial_checkpoint and split_step <= 1:
+                raise ManifestError(
+                    "resume cases with matrix.shared_initial_checkpoint=true require "
+                    "matrix.resume_split_step > 1 because the shared warm-start is global step 1"
                 )
             handoff = self.integration_handoff_path
             if handoff is not None and not handoff.is_file():

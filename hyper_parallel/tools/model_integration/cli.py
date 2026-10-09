@@ -75,6 +75,7 @@ from hyper_parallel.models.validation_spec import ModelValidationSpec
 
 _REPOSITORY_ROOT = find_repository_root()
 _SHARED_INITIAL_CHECKPOINT_STEP = 1
+_HCCL_PORT_STRIDE = 256
 
 
 def _manifest_from_args(args: argparse.Namespace) -> ValidationManifest:
@@ -728,7 +729,10 @@ def _execute_case_launch(
                 evidence_dir,
                 resume_dir,
                 port_slot=int(launch.get("port_slot", 0)),
-                port_stride=max(32, int(manifest.matrix.get("devices", 1))),
+                port_stride=max(
+                    _HCCL_PORT_STRIDE,
+                    int(manifest.matrix.get("devices", 1)),
+                ),
             ),
             cwd=_REPOSITORY_ROOT,
             timeout=manifest.launcher.get("timeout_seconds"),
