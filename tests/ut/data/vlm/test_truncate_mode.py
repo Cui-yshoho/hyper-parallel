@@ -32,7 +32,6 @@ the rebuilt truncation on synthetic samples -- no processor is involved.
 # the white-box access to protected members is intended.
 # pylint: disable=wrong-import-position,protected-access
 
-import importlib.util
 import os
 import unittest
 from typing import Optional
@@ -45,7 +44,21 @@ from tests.common.mark_utils import arg_mark
 
 # The VLM package facade pulls transformers.AutoProcessor, whose lazy import chain
 # ends in torchvision; some CI pythons lack liblzma and cannot import it.
-_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
+def _has_vlm_chain() -> bool:
+    """Probe the fragile transformers endpoint instead of a liblzma proxy.
+
+    The VLM facade pulls transformers.AutoProcessor, whose lazy import chain
+    can die in minimal CI images (missing liblzma/torchvision, or a torch_npu
+    install without libhccl).
+    """
+    try:
+        from transformers import AutoProcessor  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_HAS_VLM_CHAIN = _has_vlm_chain()
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 
@@ -75,7 +88,7 @@ def _run(transform, sample: dict) -> dict:
     return transform._truncate_and_pad({key: value.clone() for key, value in sample.items()})
 
 
-@unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
+@unittest.skipIf(not _HAS_VLM_CHAIN, "transformers AutoProcessor import chain unavailable")
 class TestInferSeqlen(unittest.TestCase):
     """The MindSpeed-MM budget split, one case per branch."""
 
@@ -107,7 +120,7 @@ class TestInferSeqlen(unittest.TestCase):
         self.assertEqual(int(8192 * (5131 / 13934)), 3016)
 
 
-@unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
+@unittest.skipIf(not _HAS_VLM_CHAIN, "transformers AutoProcessor import chain unavailable")
 class TestTruncateMode(unittest.TestCase):
     """Truncation keeps the response head under ``"proportional"``."""
 

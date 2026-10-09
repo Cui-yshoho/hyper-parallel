@@ -30,7 +30,6 @@ survives.
 # white-box access to protected members is intended.
 # pylint: disable=wrong-import-position,protected-access
 
-import importlib.util
 import os
 import unittest
 
@@ -42,7 +41,21 @@ from tests.common.mark_utils import arg_mark
 
 # The VLM facade pulls transformers.AutoProcessor, whose lazy import chain ends
 # in torchvision; some CI pythons lack liblzma and cannot import it.
-_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
+def _has_vlm_chain() -> bool:
+    """Probe the fragile transformers endpoint instead of a liblzma proxy.
+
+    The VLM facade pulls transformers.AutoProcessor, whose lazy import chain
+    can die in minimal CI images (missing liblzma/torchvision, or a torch_npu
+    install without libhccl).
+    """
+    try:
+        from transformers import AutoProcessor  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_HAS_VLM_CHAIN = _has_vlm_chain()
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 
@@ -58,7 +71,7 @@ def _sample(seq_len: int) -> dict:
     }
 
 
-@unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
+@unittest.skipIf(not _HAS_VLM_CHAIN, "transformers AutoProcessor import chain unavailable")
 class TestPadTarget(unittest.TestCase):
     """The transform stops padding at the granularity when one is configured."""
 

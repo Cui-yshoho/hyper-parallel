@@ -24,7 +24,6 @@ real sharder without a process group.
 """
 # pylint: disable=wrong-import-position
 
-import importlib.util
 import os
 import unittest
 
@@ -40,7 +39,21 @@ from hyper_parallel.data.parallel import CPBatchSharder
 # Some CI pythons are built without liblzma: the lazy transformers ->
 # torchvision import chain dies on "from _lzma import *". The data facade pulls
 # transformers.AutoProcessor, so these tests run only where lzma is available.
-_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
+def _has_vlm_chain() -> bool:
+    """Probe the fragile transformers endpoint instead of a liblzma proxy.
+
+    The VLM facade pulls transformers.AutoProcessor, whose lazy import chain
+    can die in minimal CI images (missing liblzma/torchvision, or a torch_npu
+    install without libhccl).
+    """
+    try:
+        from transformers import AutoProcessor  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_HAS_VLM_CHAIN = _has_vlm_chain()
 
 
 class _FakeParallelContext:
@@ -76,7 +89,7 @@ def _build_sharder(cp_size, cp_rank=0):
     return CPBatchSharder(_FakeParallelContext(cp_size, cp_rank), token_pad_values=token_pad_values)
 
 
-@unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
+@unittest.skipIf(not _HAS_VLM_CHAIN, "transformers AutoProcessor import chain unavailable")
 class TestOmniBatchCpSharding(unittest.TestCase):
     """Token fields shard per CP rank; modality metadata stays complete."""
 

@@ -43,7 +43,21 @@ from tests.common.mark_utils import arg_mark
 
 # The VLM facade pulls transformers.AutoProcessor, whose lazy import chain ends
 # in torchvision; some CI pythons lack liblzma and cannot import it.
-_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
+def _has_vlm_chain() -> bool:
+    """Probe the fragile transformers endpoint instead of a liblzma proxy.
+
+    The VLM facade pulls transformers.AutoProcessor, whose lazy import chain
+    can die in minimal CI images (missing liblzma/torchvision, or a torch_npu
+    install without libhccl).
+    """
+    try:
+        from transformers import AutoProcessor  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_HAS_VLM_CHAIN = _has_vlm_chain()
 # The transform imports PIL lazily, so probe it before relying on it too.
 _HAS_PIL = importlib.util.find_spec("PIL") is not None
 
@@ -81,7 +95,7 @@ def _transform(image_max_pixels):
                                 image_max_pixels=image_max_pixels)
 
 
-@unittest.skipIf(not (_HAS_LZMA and _HAS_PIL), "needs liblzma (_lzma) and PIL")
+@unittest.skipIf(not (_HAS_VLM_CHAIN and _HAS_PIL), "needs the transformers AutoProcessor chain and PIL")
 class TestResizeMediaAreaBudget(unittest.TestCase):
     """``_resize_media`` applies MindSpeed's area budget to a single image."""
 
@@ -150,7 +164,7 @@ class TestResizeMediaAreaBudget(unittest.TestCase):
                 self.assertIs(transform._resize_media(media), media)
 
 
-@unittest.skipIf(not (_HAS_LZMA and _HAS_PIL), "needs liblzma (_lzma) and PIL")
+@unittest.skipIf(not (_HAS_VLM_CHAIN and _HAS_PIL), "needs the transformers AutoProcessor chain and PIL")
 class TestResizeMediaImagesRewrite(unittest.TestCase):
     """``_resize_media_images`` rewrites only ``image`` content items."""
 
@@ -197,7 +211,7 @@ class TestResizeMediaImagesRewrite(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not (_HAS_LZMA and _HAS_PIL), "needs liblzma (_lzma) and PIL")
+@unittest.skipIf(not (_HAS_VLM_CHAIN and _HAS_PIL), "needs the transformers AutoProcessor chain and PIL")
 class TestImageMaxPixelsOption(unittest.TestCase):
     """The option is validated on the class and forwarded by the builder."""
 
