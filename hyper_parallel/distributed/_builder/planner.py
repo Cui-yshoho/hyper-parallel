@@ -353,6 +353,45 @@ class ShardingPlanner:
         arch = _get_architecture(model)
         self._check_overrides_no_dp()   # fail-first: the plan's coordinate system = a single dp slice
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
+        plan, param_roles, param_metadata = self._build_plan(
+            model,
+            mesh,
+            mesh_dim_names,
+            arch,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            sequence_parallel=sequence_parallel,
+            loss_parallel=loss_parallel,
+        )
+
+        # D-14 invariants, Phase 5/6, F4 lints, DX guard, tied weights
+        plan = self._finalize_plan(
+            plan,
+            model,
+            param_roles,
+            param_metadata,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            ep_size=ep_size,
+        )
+
+        self._log_explanation(plan, explain)
+
+        return plan
+
+    def _build_plan(
+        self,
+        model: Any,
+        mesh: DeviceMesh,
+        mesh_dim_names: Tuple[str, ...],
+        arch: str,
+        *,
+        tp_size: int,
+        ep_size: int,
+        sequence_parallel: bool,
+        loss_parallel: bool,
+    ) -> Tuple[ShardingPlan, Dict[str, ParamRole], Tuple[Dict[str, int], Dict[str, Tuple[int, ...]]]]:
+        """Run Phases 1-4.5: classify, derive, and merge boundary specs."""
         # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
         # size (the a2a communication domain, extended from the TP group to
         # neighboring dp/cp ranks; expert weights are sharded only along
@@ -398,7 +437,20 @@ class ShardingPlanner:
             mesh=mesh,
             mesh_dim_names=mesh_dim_names,
         )
+        return plan, param_roles, param_metadata
 
+    def _finalize_plan(
+        self,
+        plan: ShardingPlan,
+        model: Any,
+        param_roles: Dict[str, ParamRole],
+        param_metadata: Tuple[Dict[str, int], Dict[str, Tuple[int, ...]]],
+        *,
+        tp_size: int,
+        cp_size: int,
+        ep_size: int,
+    ) -> ShardingPlan:
+        """Run the D-14 invariants, Phase 5/6, the F4 lints, and tied pairs."""
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)
         self._check_full_declaration(plan)
@@ -427,9 +479,6 @@ class ShardingPlanner:
 
         # tied-weight detection (embed <-> lm_head sharing storage)
         plan.tied_pairs = self._detect_tied_pairs(model)
-
-        self._log_explanation(plan, explain)
-
         return plan
 
     # ── Architecture detection ──────────────────────────────────────────

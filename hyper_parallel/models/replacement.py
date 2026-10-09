@@ -404,6 +404,52 @@ def _apply_module_replacement_actions(
     )
 
 
+def _install_replacement_target(
+    model: nn.Module,
+    target: ModuleReplacementTarget,
+    context: Mapping[str, Any],
+    extra_transforms: list[WeightRenaming | WeightConverter],
+    weights_mapping: list[WeightRenaming | WeightConverter] | None,
+) -> None:
+    """Build, validate, and install one replacement target in place."""
+    source = target.source
+    replacement = target.spec.factory(
+        module=source,
+        module_fqn=target.module_fqns[0],
+        context=context,
+    )
+    transforms = []
+    if getattr(replacement, "make_transforms", None) is not None:
+        transforms = replacement.make_transforms()
+    if not isinstance(transforms, list) or any(
+        not isinstance(transform, (WeightRenaming, WeightConverter))
+        for transform in transforms
+    ):
+        raise TypeError(
+            "replacement make_transforms() must return "
+            "list[WeightRenaming | WeightConverter]"
+        )
+    for transform in transforms:
+        transform.scope_prefix = target.module_fqns[0]
+        extra_transforms.append(transform)
+    _validate_replacement(
+        source,
+        replacement,
+        target.module_fqns[0],
+        has_weight_transforms=bool(transforms),
+    )
+    if transforms and callable(getattr(replacement, "reset_parameters", None)):
+        replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
+    _validate_target_binding(model, target)
+    if transforms and weights_mapping is None:
+        raise ValueError(
+            "weights_mapping is required when a replacement defines make_transforms()"
+        )
+    for fqn in target.module_fqns:
+        parent, name = _parent_and_name(model, fqn)
+        parent._modules[name] = replacement  # pylint: disable=protected-access
+
+
 def apply_module_replacements(
     model: nn.Module,
     plan: ModuleReplacementPlan,
@@ -423,43 +469,13 @@ def apply_module_replacements(
     source_shapes = _named_tensor_shapes(model) if plan.targets and capture_checkpoint_metadata else None
     extra_transforms: list[WeightRenaming | WeightConverter] = []
     for target in plan.targets:
-        source = target.source
-        replacement = target.spec.factory(
-            module=source,
-            module_fqn=target.module_fqns[0],
-            context=context,
+        _install_replacement_target(
+            model,
+            target,
+            context,
+            extra_transforms,
+            weights_mapping,
         )
-        transforms = []
-        if getattr(replacement, "make_transforms", None) is not None:
-            transforms = replacement.make_transforms()
-        if not isinstance(transforms, list) or any(
-            not isinstance(transform, (WeightRenaming, WeightConverter))
-            for transform in transforms
-        ):
-            raise TypeError(
-                "replacement make_transforms() must return "
-                "list[WeightRenaming | WeightConverter]"
-            )
-        for transform in transforms:
-            transform.scope_prefix = target.module_fqns[0]
-            extra_transforms.append(transform)
-        _validate_replacement(
-            source,
-            replacement,
-            target.module_fqns[0],
-            has_weight_transforms=bool(transforms),
-        )
-        if transforms and callable(getattr(replacement, "reset_parameters", None)):
-            replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
-        _validate_target_binding(model, target)
-        if transforms and weights_mapping is None:
-            raise ValueError(
-                "weights_mapping is required when a replacement defines make_transforms()"
-            )
-        for fqn in target.module_fqns:
-            parent, name = _parent_and_name(model, fqn)
-            parent._modules[name] = replacement  # pylint: disable=protected-access
-        del source
     if extra_transforms:
         if capture_checkpoint_metadata:
             model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access

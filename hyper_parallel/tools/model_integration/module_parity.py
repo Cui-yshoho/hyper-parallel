@@ -255,7 +255,8 @@ def _input_gradients(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[torc
     ]
 
 
-def _run_in_process_case(case: ModuleParityCase, context: ParityContext) -> dict[str, Any]:
+def _build_parity_modules(case: ModuleParityCase, context: ParityContext) -> tuple[Any, Any]:
+    """Instantiate reference/candidate and reject aliased implementations."""
     candidate_builder = case.candidate_builder
     reference_builder = case.reference_builder
     input_builder = case.input_builder
@@ -269,29 +270,34 @@ def _run_in_process_case(case: ModuleParityCase, context: ParityContext) -> dict
             "reference and candidate must be independent implementations; "
             f"got {type(candidate).__module__}.{type(candidate).__qualname__}"
         )
-    mapping = _parameter_mapping(case, reference, candidate, context)
-    inputs = input_builder(context)
-    reference_args, reference_kwargs = _clone_call_inputs(inputs)
-    candidate_args, candidate_kwargs = _clone_call_inputs(inputs)
-    reference_output = reference(*reference_args, **reference_kwargs)
-    candidate_output = candidate(*candidate_args, **candidate_kwargs)
+    return candidate, reference
+
+
+def _resolve_parity_tolerance(
+        context: ParityContext,
+) -> tuple[float, float, float | None]:
+    """Read the scalar tolerance contract from the parity context options."""
     tolerance = context.options.get("tolerance", {})
     atol = tolerance_value(tolerance, "atol", "max_abs")
     rtol = tolerance_value(tolerance, "rtol")
     relative_l2_limit = tolerance.get("relative_l2")
     if relative_l2_limit is not None:
         relative_l2_limit = float(relative_l2_limit)
-    metrics = _compare_tree(
-        "output",
-        reference_output,
-        candidate_output,
-        exact=False,
-        atol=atol,
-        rtol=rtol,
-        relative_l2_limit=relative_l2_limit,
-    )
-    reference_execution = ParityExecution(reference, reference_output, reference_args, reference_kwargs)
-    candidate_execution = ParityExecution(candidate, candidate_output, candidate_args, candidate_kwargs)
+    return atol, rtol, relative_l2_limit
+
+
+def _observation_metrics(
+        case: ModuleParityCase,
+        reference_execution: ParityExecution,
+        candidate_execution: ParityExecution,
+        reference_output: Any,
+        candidate_output: Any,
+        atol: float,
+        rtol: float,
+        relative_l2_limit: float | None,
+) -> list[ComparisonMetric]:
+    """Compare every declared observation between reference and candidate."""
+    metrics = []
     for observation in case.observations:
         reference_value = (
             observation.reference_getter(reference_execution)
@@ -323,9 +329,20 @@ def _run_in_process_case(case: ModuleParityCase, context: ParityContext) -> dict
                 relative_l2_limit=relative_l2_limit,
             )
         )
-    objective = case.objective or _default_objective
-    objective(reference_output).backward()
-    objective(candidate_output).backward()
+    return metrics
+
+
+def _input_gradient_metrics(
+        reference_args: tuple[Any, ...],
+        reference_kwargs: dict[str, Any],
+        candidate_args: tuple[Any, ...],
+        candidate_kwargs: dict[str, Any],
+        atol: float,
+        rtol: float,
+        relative_l2_limit: float | None,
+) -> list[ComparisonMetric]:
+    """Compare flattened input gradients pairwise after backward."""
+    metrics = []
     reference_input_grads = _input_gradients(reference_args, reference_kwargs)
     candidate_input_grads = _input_gradients(candidate_args, candidate_kwargs)
     for index, (reference_grad, candidate_grad) in enumerate(
@@ -346,6 +363,19 @@ def _run_in_process_case(case: ModuleParityCase, context: ParityContext) -> dict
                 relative_l2_limit=relative_l2_limit,
             )
         )
+    return metrics
+
+
+def _parameter_gradient_metrics(
+        mapping: dict[str, str],
+        reference: Any,
+        candidate: Any,
+        atol: float,
+        rtol: float,
+        relative_l2_limit: float | None,
+) -> list[ComparisonMetric]:
+    """Compare mapped parameter gradients pairwise after backward."""
+    metrics = []
     reference_parameters = dict(reference.named_parameters())
     candidate_parameters = dict(candidate.named_parameters())
     for candidate_name, reference_name in sorted(mapping.items()):
@@ -368,6 +398,65 @@ def _run_in_process_case(case: ModuleParityCase, context: ParityContext) -> dict
                 relative_l2_limit=relative_l2_limit,
             )
         )
+    return metrics
+
+
+def _run_in_process_case(case: ModuleParityCase, context: ParityContext) -> dict[str, Any]:
+    candidate, reference = _build_parity_modules(case, context)
+    mapping = _parameter_mapping(case, reference, candidate, context)
+    inputs = case.input_builder(context)
+    reference_args, reference_kwargs = _clone_call_inputs(inputs)
+    candidate_args, candidate_kwargs = _clone_call_inputs(inputs)
+    reference_output = reference(*reference_args, **reference_kwargs)
+    candidate_output = candidate(*candidate_args, **candidate_kwargs)
+    atol, rtol, relative_l2_limit = _resolve_parity_tolerance(context)
+    metrics = _compare_tree(
+        "output",
+        reference_output,
+        candidate_output,
+        exact=False,
+        atol=atol,
+        rtol=rtol,
+        relative_l2_limit=relative_l2_limit,
+    )
+    reference_execution = ParityExecution(reference, reference_output, reference_args, reference_kwargs)
+    candidate_execution = ParityExecution(candidate, candidate_output, candidate_args, candidate_kwargs)
+    metrics.extend(
+        _observation_metrics(
+            case,
+            reference_execution,
+            candidate_execution,
+            reference_output,
+            candidate_output,
+            atol,
+            rtol,
+            relative_l2_limit,
+        )
+    )
+    objective = case.objective or _default_objective
+    objective(reference_output).backward()
+    objective(candidate_output).backward()
+    metrics.extend(
+        _input_gradient_metrics(
+            reference_args,
+            reference_kwargs,
+            candidate_args,
+            candidate_kwargs,
+            atol,
+            rtol,
+            relative_l2_limit,
+        )
+    )
+    metrics.extend(
+        _parameter_gradient_metrics(
+            mapping,
+            reference,
+            candidate,
+            atol,
+            rtol,
+            relative_l2_limit,
+        )
+    )
     status = "PASS" if all(metric.status == "PASS" for metric in metrics) else "FAIL"
     return {
         "case": case.name,

@@ -619,6 +619,166 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     return last_user_index
 
 
+def _render_content_block(block: Dict[str, Any]) -> str:
+    """Render one user content block into its V4.1 encoded text."""
+    block_type = block.get("type")
+    if block_type == "text":
+        return block.get("text", "")
+    if block_type == "tool_result":
+        tool_content = block.get("content", "")
+        if isinstance(tool_content, list):
+            text_parts = []
+            for b in tool_content:
+                if b.get("type") == "text":
+                    text_parts.append(b.get("text", ""))
+                else:
+                    text_parts.append(f"[Unsupported {b.get('type')}]")
+            tool_content = "\n\n".join(text_parts)
+        return tool_output_template.format(content=tool_content)
+    return f"[Unsupported {block_type}]"
+
+
+def _render_system_message(index: int, content: Any, tools: Any, response_format: Any) -> str:
+    """Render the body of a system-role message."""
+    prompt = ""
+    if index > 0:
+        # Mid-conversation system message
+        prompt += SYSTEM_SP_TOKEN
+    prompt += system_msg_template.format(content=content or "")
+    if tools:
+        prompt += "\n\n" + render_tools(tools)
+    if response_format:
+        prompt += "\n\n" + response_format_template.format(schema=to_json(response_format))
+    return prompt
+
+
+def _render_user_message(msg: Dict[str, Any], content: Any) -> str:
+    """Render the body of a user-role message."""
+    prompt = USER_SP_TOKEN
+
+    # Handle content blocks (tool results mixed with text)
+    content_blocks = msg.get("content_blocks")
+    if content_blocks:
+        parts = [_render_content_block(block) for block in content_blocks]
+        prompt += "\n\n".join(parts)
+    else:
+        prompt += content or ""
+    return prompt
+
+
+def _render_tool_calls_content(tool_calls: List[Dict[str, Any]]) -> str:
+    """Render the DSML tool-calls block of an assistant message."""
+    tc_list = [
+        tool_call_template.format(
+            dsml_token=dsml_token,
+            tool_call_tag_name=tool_call_tag_name,
+            name=_tool_name_for_encoding(tc),
+            arguments=encode_arguments_to_dsml(tc)
+        )
+        for tc in tool_calls
+    ]
+    return '\n\n' + tool_calls_template.format(
+        dsml_token=dsml_token,
+        tool_calls="\n".join(tc_list),
+        tc_block_name=tool_calls_block_name,
+    )
+
+
+def _render_assistant_message(
+    index: int,
+    messages: List[Dict[str, Any]],
+    content: Any,
+    tool_calls: Any,
+    reasoning_content: Any,
+    wo_eos: bool,
+    thinking_mode: str,
+    drop_thinking: bool,
+    last_user_idx: int,
+) -> str:
+    """Render the body of an assistant-role message."""
+    thinking_part = ""
+    tc_content = ""
+
+    if tool_calls:
+        tc_content += _render_tool_calls_content(tool_calls)
+
+    summary_content = content or ""
+    rc = reasoning_content or ""
+
+    # Check if previous message has a task - if so, this is a task output (no thinking)
+    prev_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
+
+    if thinking_mode == "thinking" and not prev_has_task:
+        if not drop_thinking or index > last_user_idx:
+            thinking_part = thinking_template.format(reasoning_content=rc) + thinking_end_token
+        else:
+            thinking_part = ""
+
+    if wo_eos:
+        return assistant_msg_wo_eos_template.format(
+            reasoning=thinking_part,
+            content=summary_content,
+            tool_calls=tc_content,
+        )
+    return assistant_msg_template.format(
+        reasoning=thinking_part,
+        content=summary_content,
+        tool_calls=tc_content,
+    )
+
+
+def _append_task_token(
+    prompt: str,
+    task: str,
+    thinking_mode: str,
+) -> str:
+    """Append the task special token transition for classification tasks."""
+    # Task special token for internal classification tasks
+    if task not in VALID_TASKS:
+        raise ValueError(f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}")
+    task_sp_token = DS_TASK_SP_TOKENS[task]
+
+    if task != "action":
+        # Non-action tasks: append task sp token directly after the message
+        prompt += task_sp_token
+    else:
+        # Action task: append Assistant + thinking token + action sp token
+        prompt += ASSISTANT_SP_TOKEN
+        prompt += thinking_end_token if thinking_mode != "thinking" else thinking_start_token
+        prompt += task_sp_token
+    return prompt
+
+
+def _append_transition_tokens(
+    prompt: str,
+    index: int,
+    messages: List[Dict[str, Any]],
+    role: Any,
+    thinking_mode: str,
+    drop_thinking: bool,
+    last_user_idx: int,
+) -> str:
+    """Append the transition tokens implied by the following message."""
+    if index + 1 < len(messages) and messages[index + 1].get("role") not in ["assistant", "latest_reminder"]:
+        return prompt
+
+    task = messages[index].get("task")
+    if task is not None:
+        return _append_task_token(prompt, task, thinking_mode)
+
+    if role == "user" or (role == "system" and index > 0):
+        # Normal generation: append Assistant + thinking token
+        # (mid-conversation system messages also trigger the assistant header)
+        prompt += ASSISTANT_SP_TOKEN
+        if not drop_thinking and thinking_mode == "thinking":
+            prompt += thinking_start_token
+        elif drop_thinking and thinking_mode == "thinking" and index >= last_user_idx:
+            prompt += thinking_start_token
+        else:
+            prompt += thinking_end_token
+    return prompt
+
+
 def render_message(
     index: int,
     messages: List[Dict[str, Any]],
@@ -638,9 +798,6 @@ def render_message(
     Returns:
         Encoded text for the selected message.
     """
-    # This is a direct dispatcher for the externally defined role/content-block
-    # schema; splitting it would obscure the required ordering of emitted tokens.
-    #lizard forgives(cyclomatic_complexity, nloc)
     if not 0 <= index < len(messages):
         raise ValueError(f"message index is out of range: {index}")
     if thinking_mode not in ("chat", "thinking"):
@@ -670,130 +827,33 @@ def render_message(
     prompt += reasoning_effort_prompt
 
     if role == "system":
-        if index > 0:
-            # Mid-conversation system message
-            prompt += SYSTEM_SP_TOKEN
-        prompt += system_msg_template.format(content=content or "")
-        if tools:
-            prompt += "\n\n" + render_tools(tools)
-        if response_format:
-            prompt += "\n\n" + response_format_template.format(schema=to_json(response_format))
-
+        prompt += _render_system_message(index, content, tools, response_format)
     elif role == "user":
-        prompt += USER_SP_TOKEN
-
-        # Handle content blocks (tool results mixed with text)
-        content_blocks = msg.get("content_blocks")
-        if content_blocks:
-            parts = []
-            for block in content_blocks:
-                block_type = block.get("type")
-                if block_type == "text":
-                    parts.append(block.get("text", ""))
-                elif block_type == "tool_result":
-                    tool_content = block.get("content", "")
-                    if isinstance(tool_content, list):
-                        text_parts = []
-                        for b in tool_content:
-                            if b.get("type") == "text":
-                                text_parts.append(b.get("text", ""))
-                            else:
-                                text_parts.append(f"[Unsupported {b.get('type')}]")
-                        tool_content = "\n\n".join(text_parts)
-                    parts.append(tool_output_template.format(content=tool_content))
-                else:
-                    parts.append(f"[Unsupported {block_type}]")
-            prompt += "\n\n".join(parts)
-        else:
-            prompt += content or ""
-
+        prompt += _render_user_message(msg, content)
     elif role == "latest_reminder":
         prompt += LATEST_REMINDER_SP_TOKEN + latest_reminder_msg_template.format(content=content)
-
     elif role == "tool":
         raise NotImplementedError(
             "deepseek_v41 merges tool messages into user; please preprocess with merge_tool_messages()"
         )
-
     elif role == "assistant":
-        thinking_part = ""
-        tc_content = ""
-
-        if tool_calls:
-            tc_list = [
-                tool_call_template.format(
-                    dsml_token=dsml_token,
-                    tool_call_tag_name=tool_call_tag_name,
-                    name=_tool_name_for_encoding(tc),
-                    arguments=encode_arguments_to_dsml(tc)
-                )
-                for tc in tool_calls
-            ]
-            tc_content += '\n\n' + tool_calls_template.format(
-                dsml_token=dsml_token,
-                tool_calls="\n".join(tc_list),
-                tc_block_name=tool_calls_block_name,
-            )
-
-        summary_content = content or ""
-        rc = reasoning_content or ""
-
-        # Check if previous message has a task - if so, this is a task output (no thinking)
-        prev_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
-
-        if thinking_mode == "thinking" and not prev_has_task:
-            if not drop_thinking or index > last_user_idx:
-                thinking_part = thinking_template.format(reasoning_content=rc) + thinking_end_token
-            else:
-                thinking_part = ""
-
-        if wo_eos:
-            prompt += assistant_msg_wo_eos_template.format(
-                reasoning=thinking_part,
-                content=summary_content,
-                tool_calls=tc_content,
-            )
-        else:
-            prompt += assistant_msg_template.format(
-                reasoning=thinking_part,
-                content=summary_content,
-                tool_calls=tc_content,
-            )
+        prompt += _render_assistant_message(
+            index,
+            messages,
+            content,
+            tool_calls,
+            reasoning_content,
+            wo_eos,
+            thinking_mode,
+            drop_thinking,
+            last_user_idx,
+        )
     else:
         raise NotImplementedError(f"Unknown role: {role}")
 
-    # Append transition tokens based on what follows
-    if index + 1 < len(messages) and messages[index + 1].get("role") not in ["assistant", "latest_reminder"]:
-        return prompt
-
-    task = messages[index].get("task")
-    if task is not None:
-        # Task special token for internal classification tasks
-        if task not in VALID_TASKS:
-            raise ValueError(f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}")
-        task_sp_token = DS_TASK_SP_TOKENS[task]
-
-        if task != "action":
-            # Non-action tasks: append task sp token directly after the message
-            prompt += task_sp_token
-        else:
-            # Action task: append Assistant + thinking token + action sp token
-            prompt += ASSISTANT_SP_TOKEN
-            prompt += thinking_end_token if thinking_mode != "thinking" else thinking_start_token
-            prompt += task_sp_token
-
-    elif role == "user" or (role == "system" and index > 0):
-        # Normal generation: append Assistant + thinking token
-        # (mid-conversation system messages also trigger the assistant header)
-        prompt += ASSISTANT_SP_TOKEN
-        if not drop_thinking and thinking_mode == "thinking":
-            prompt += thinking_start_token
-        elif drop_thinking and thinking_mode == "thinking" and index >= last_user_idx:
-            prompt += thinking_start_token
-        else:
-            prompt += thinking_end_token
-
-    return prompt
+    return _append_transition_tokens(
+        prompt, index, messages, role, thinking_mode, drop_thinking, last_user_idx
+    )
 
 
 # ============================================================

@@ -41,6 +41,215 @@ def _scaled_dimension(value: int, divisor: int, field_name: str) -> int:
     return value // divisor
 
 
+def _load_validation_sources(
+        config_path: str,
+        engram_assets_path: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], Path, int]:
+    """Read the released config and Engram assets and check their consistency."""
+    model_dir = Path(config_path).expanduser().resolve()
+    assets_path = Path(engram_assets_path).expanduser().resolve()
+    with (model_dir / "config.json").open("r", encoding="utf-8") as config_file:
+        source = json.load(config_file)
+    with assets_path.open("r", encoding="utf-8") as assets_file:
+        assets = json.load(assets_file)
+    if source.get("model_type") != "deepseek_v41":
+        raise ValueError(
+            "config_path must contain DeepSeek-V4.1; "
+            f"got model_type={source.get('model_type')!r}"
+        )
+    if assets.get("source_model_type") != "deepseek_v41":
+        raise ValueError("engram_assets_path is not a DeepSeek-V4.1 validation asset")
+    text = source["text_config"]
+    released_hidden_layers = int(text["num_hidden_layers"])
+    if assets.get("num_hidden_layers") != released_hidden_layers:
+        raise ValueError(
+            "Engram assets must retain the released decoder depth: expected "
+            f"{released_hidden_layers}, got {assets.get('num_hidden_layers')}"
+        )
+    return source, text, assets, assets_path, released_hidden_layers
+
+
+def _resolve_routed_experts(text: dict[str, Any], num_routed_experts: int) -> int:
+    """Validate the requested routed-expert crop against the released config."""
+    released_routed_experts = int(text["n_routed_experts"])
+    resolved_routed_experts = int(num_routed_experts)
+    if not 0 < resolved_routed_experts <= released_routed_experts:
+        raise ValueError(
+            "num_routed_experts must be in [1, "
+            f"{released_routed_experts}], got {resolved_routed_experts}"
+        )
+    if resolved_routed_experts < int(text["num_experts_per_tok"]):
+        raise ValueError("num_routed_experts must be at least num_experts_per_tok")
+    return resolved_routed_experts
+
+
+def _scale_text_dimensions(
+        text: dict[str, Any],
+        text_parameter_divisor: int,
+        assets: dict[str, Any],
+) -> dict[str, int]:
+    """Compute the uniformly scaled text dimensions and check their ratios."""
+    dimensions = {
+        "hidden_size": _scaled_dimension(
+            int(text["hidden_size"]), text_parameter_divisor, "hidden_size"
+        ),
+        "moe_intermediate_size": _scaled_dimension(
+            int(text["moe_intermediate_size"]), text_parameter_divisor, "moe_intermediate_size"
+        ),
+        "num_attention_heads": _scaled_dimension(
+            int(text["num_attention_heads"]), text_parameter_divisor, "num_attention_heads"
+        ),
+        "head_dim": int(text["head_dim"]),
+        "q_lora_rank": _scaled_dimension(
+            int(text["q_lora_rank"]), text_parameter_divisor, "q_lora_rank"
+        ),
+        "o_lora_rank": _scaled_dimension(
+            int(text["o_lora_rank"]), text_parameter_divisor, "o_lora_rank"
+        ),
+        "index_n_heads": _scaled_dimension(
+            int(text["index_n_heads"]), text_parameter_divisor, "index_n_heads"
+        ),
+        "index_head_dim": int(text["index_head_dim"]),
+    }
+    # ``o_groups`` partitions attention heads; it is not an independent
+    # parameter-width dimension. Dividing it changes the grouped projection
+    # semantics and can make a memory-equivalent crop incompatible with TP.
+    dimensions["o_groups"] = int(text["o_groups"])
+    if dimensions["num_attention_heads"] % dimensions["o_groups"]:
+        raise ValueError(
+            "scaled num_attention_heads must remain divisible by released o_groups: "
+            f"{dimensions['num_attention_heads']} versus {dimensions['o_groups']}"
+        )
+    expected_engram_head_dim = _scaled_dimension(
+        int(text["engram_head_dim"]), text_parameter_divisor, "engram_head_dim"
+    )
+    if int(assets["head_dim"]) != expected_engram_head_dim:
+        raise ValueError(
+            "Engram assets and text parameter crop use different head dimensions: "
+            f"expected {expected_engram_head_dim}, got {assets['head_dim']}"
+        )
+    return dimensions
+
+
+def _build_text_config(
+        source: dict[str, Any],
+        text: dict[str, Any],
+        dimensions: dict[str, int],
+        released_hidden_layers: int,
+        resolved_routed_experts: int,
+) -> DeepseekV4Config:
+    """Assemble the Transformers config for the parameter-cropped text stack."""
+    return DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
+        vocab_size=text["vocab_size"],
+        hidden_size=dimensions["hidden_size"],
+        moe_intermediate_size=dimensions["moe_intermediate_size"],
+        num_hidden_layers=released_hidden_layers,
+        num_attention_heads=dimensions["num_attention_heads"],
+        num_key_value_heads=text["num_key_value_heads"],
+        head_dim=dimensions["head_dim"],
+        q_lora_rank=dimensions["q_lora_rank"],
+        num_experts_per_tok=text["num_experts_per_tok"],
+        n_routed_experts=resolved_routed_experts,
+        n_shared_experts=text["n_shared_experts"],
+        scoring_func=text["scoring_func"],
+        norm_topk_prob=text["norm_topk_prob"],
+        routed_scaling_factor=text["routed_scaling_factor"],
+        max_position_embeddings=text["max_position_embeddings"],
+        rope_theta=text["rope_theta"],
+        rope_parameters=text["rope_scaling"],
+        layer_types=["sliding_attention"] * released_hidden_layers,
+        mlp_layer_types=["moe"] * released_hidden_layers,
+        compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
+        compress_rope_theta=text["compress_rope_theta"],
+        hc_mult=text["hc_mult"],
+        hc_sinkhorn_iters=text["hc_sinkhorn_iters"],
+        hc_eps=text["hc_eps"],
+        swiglu_limit=text["swiglu_limit"],
+        sliding_window=text["sliding_window"],
+        o_groups=dimensions["o_groups"],
+        o_lora_rank=dimensions["o_lora_rank"],
+        index_n_heads=dimensions["index_n_heads"],
+        index_head_dim=dimensions["index_head_dim"],
+        index_topk=text["index_topk"],
+        hidden_act=text["hidden_act"],
+        initializer_range=text["initializer_range"],
+        rms_norm_eps=text["rms_norm_eps"],
+        use_cache=False,
+        pad_token_id=source["pad_token_id"],
+        bos_token_id=source["bos_token_id"],
+        eos_token_id=source["eos_token_id"],
+        tie_word_embeddings=text["tie_word_embeddings"],
+        partial_rotary_factor=text["qk_rope_head_dim"] / text["head_dim"],
+        attention_bias=text["attention_bias"],
+        attention_dropout=text["attention_dropout"],
+    )
+
+
+def _apply_v41_extension_fields(
+        config: DeepseekV4Config,
+        source: dict[str, Any],
+        text: dict[str, Any],
+        assets: dict[str, Any],
+        assets_path: Path,
+        released_hidden_layers: int,
+        exercise_post_training_indexer: bool,
+        indexer_loss_coeff: float,
+) -> None:
+    """Fill the V4.1 shared-attention and Engram extension fields."""
+    config.architectures = ["DeepseekV41ForCausalLM"]
+    config.v41_compress_ratios = list(text["compress_ratios"][:released_hidden_layers])
+    config.v41_kv_source_layer_ids = list(text["kv_source_layer_ids"])
+    config.v41_index_source_layer_ids = list(text["index_source_layer_ids"])
+    config.v41_candidate_source_layer_id = int(text.get("candidate_source_layer_id", -1))
+    config.v41_candidate_topk_blocks = int(text.get("candidate_topk_blocks", 0))
+    config.v41_candidate_block_size = int(text.get("candidate_block_size", 1))
+    config.v41_indexer_loss_coeff = float(indexer_loss_coeff)
+    if exercise_post_training_indexer:
+        # At 4K with eight-token blocks this retains 1024 candidates for
+        # Top-512. The released 2048-block value would retain every key.
+        config.v41_candidate_topk_blocks = min(config.v41_candidate_topk_blocks, 128)
+    config.v41_engram_layer_ids = list(assets["layer_ids"])
+    config.v41_engram_num_embeddings = list(assets["num_embeddings"])
+    config.v41_engram_bucket_base = int(assets["bucket_base"])
+    config.v41_engram_table_pad_multiple = int(assets.get("table_pad_multiple", 16))
+    config.v41_engram_assets_path = str(assets_path)
+    config.v41_source_model_type = source["model_type"]
+    config.v41_model_mode = "validation_crop"
+
+
+def _apply_v41_vision_fields(
+        config: DeepseekV4Config,
+        source: dict[str, Any],
+        enable_vision: bool,
+        vision_parameter_divisor: int,
+) -> None:
+    """Fill the V4.1 vision-tower extension fields."""
+    vision = source["vision_config"]
+    released_vision_layers = int(vision["num_hidden_layers"])
+    config.v41_vision_enabled = bool(enable_vision)
+    config.v41_vision_num_hidden_layers = released_vision_layers
+    config.v41_vision_hidden_size = _scaled_dimension(
+        int(vision["hidden_size"]), vision_parameter_divisor, "vision_hidden_size"
+    )
+    config.v41_vision_num_attention_heads = _scaled_dimension(
+        int(vision["num_attention_heads"]),
+        vision_parameter_divisor,
+        "vision_num_attention_heads",
+    )
+    config.v41_vision_intermediate_size = _scaled_dimension(
+        int(vision["intermediate_size"]),
+        vision_parameter_divisor,
+        "vision_intermediate_size",
+    )
+    config.v41_vision_patch_size = int(vision["patch_size"])
+    config.v41_vision_rope_theta = float(vision["rope_theta"])
+    config.v41_vision_downsample_ratio = int(vision["downsample_ratio"])
+    config.v41_vision_max_image_tokens = int(vision["max_image_tokens"])
+    config.v41_vision_min_pixels = int(vision["min_pixels"])
+    config.v41_vision_max_wh_ratio = vision["max_wh_ratio"]
+    config.v41_image_token_id = int(source["image_token_id"])
+
+
 def build_deepseek_v41_validation_config(
         config_path: str,
         engram_assets_path: str,
@@ -80,159 +289,25 @@ def build_deepseek_v41_validation_config(
     Raises:
         ValueError: If the source, parameter crop, or assets are inconsistent.
     """
-    model_dir = Path(config_path).expanduser().resolve()
-    assets_path = Path(engram_assets_path).expanduser().resolve()
-    with (model_dir / "config.json").open("r", encoding="utf-8") as config_file:
-        source = json.load(config_file)
-    with assets_path.open("r", encoding="utf-8") as assets_file:
-        assets = json.load(assets_file)
-    if source.get("model_type") != "deepseek_v41":
-        raise ValueError(
-            "config_path must contain DeepSeek-V4.1; "
-            f"got model_type={source.get('model_type')!r}"
-        )
-    if assets.get("source_model_type") != "deepseek_v41":
-        raise ValueError("engram_assets_path is not a DeepSeek-V4.1 validation asset")
-    text = source["text_config"]
-    released_hidden_layers = int(text["num_hidden_layers"])
-    if assets.get("num_hidden_layers") != released_hidden_layers:
-        raise ValueError(
-            "Engram assets must retain the released decoder depth: expected "
-            f"{released_hidden_layers}, got {assets.get('num_hidden_layers')}"
-        )
-    released_routed_experts = int(text["n_routed_experts"])
-    resolved_routed_experts = int(num_routed_experts)
-    if not 0 < resolved_routed_experts <= released_routed_experts:
-        raise ValueError(
-            "num_routed_experts must be in [1, "
-            f"{released_routed_experts}], got {resolved_routed_experts}"
-        )
-    if resolved_routed_experts < int(text["num_experts_per_tok"]):
-        raise ValueError("num_routed_experts must be at least num_experts_per_tok")
-    hidden_size = _scaled_dimension(
-        int(text["hidden_size"]), text_parameter_divisor, "hidden_size"
+    source, text, assets, assets_path, released_hidden_layers = _load_validation_sources(
+        config_path, engram_assets_path
     )
-    moe_intermediate_size = _scaled_dimension(
-        int(text["moe_intermediate_size"]), text_parameter_divisor, "moe_intermediate_size"
+    resolved_routed_experts = _resolve_routed_experts(text, num_routed_experts)
+    dimensions = _scale_text_dimensions(text, text_parameter_divisor, assets)
+    config = _build_text_config(
+        source, text, dimensions, released_hidden_layers, resolved_routed_experts
     )
-    num_attention_heads = _scaled_dimension(
-        int(text["num_attention_heads"]), text_parameter_divisor, "num_attention_heads"
+    _apply_v41_extension_fields(
+        config,
+        source,
+        text,
+        assets,
+        assets_path,
+        released_hidden_layers,
+        exercise_post_training_indexer,
+        indexer_loss_coeff,
     )
-    head_dim = int(text["head_dim"])
-    q_lora_rank = _scaled_dimension(
-        int(text["q_lora_rank"]), text_parameter_divisor, "q_lora_rank"
-    )
-    o_lora_rank = _scaled_dimension(
-        int(text["o_lora_rank"]), text_parameter_divisor, "o_lora_rank"
-    )
-    index_n_heads = _scaled_dimension(
-        int(text["index_n_heads"]), text_parameter_divisor, "index_n_heads"
-    )
-    index_head_dim = int(text["index_head_dim"])
-    # ``o_groups`` partitions attention heads; it is not an independent
-    # parameter-width dimension. Dividing it changes the grouped projection
-    # semantics and can make a memory-equivalent crop incompatible with TP.
-    o_groups = int(text["o_groups"])
-    if num_attention_heads % o_groups:
-        raise ValueError(
-            "scaled num_attention_heads must remain divisible by released o_groups: "
-            f"{num_attention_heads} versus {o_groups}"
-        )
-    expected_engram_head_dim = _scaled_dimension(
-        int(text["engram_head_dim"]), text_parameter_divisor, "engram_head_dim"
-    )
-    if int(assets["head_dim"]) != expected_engram_head_dim:
-        raise ValueError(
-            "Engram assets and text parameter crop use different head dimensions: "
-            f"expected {expected_engram_head_dim}, got {assets['head_dim']}"
-        )
-    config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
-        vocab_size=text["vocab_size"],
-        hidden_size=hidden_size,
-        moe_intermediate_size=moe_intermediate_size,
-        num_hidden_layers=released_hidden_layers,
-        num_attention_heads=num_attention_heads,
-        num_key_value_heads=text["num_key_value_heads"],
-        head_dim=head_dim,
-        q_lora_rank=q_lora_rank,
-        num_experts_per_tok=text["num_experts_per_tok"],
-        n_routed_experts=resolved_routed_experts,
-        n_shared_experts=text["n_shared_experts"],
-        scoring_func=text["scoring_func"],
-        norm_topk_prob=text["norm_topk_prob"],
-        routed_scaling_factor=text["routed_scaling_factor"],
-        max_position_embeddings=text["max_position_embeddings"],
-        rope_theta=text["rope_theta"],
-        rope_parameters=text["rope_scaling"],
-        layer_types=["sliding_attention"] * released_hidden_layers,
-        mlp_layer_types=["moe"] * released_hidden_layers,
-        compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
-        compress_rope_theta=text["compress_rope_theta"],
-        hc_mult=text["hc_mult"],
-        hc_sinkhorn_iters=text["hc_sinkhorn_iters"],
-        hc_eps=text["hc_eps"],
-        swiglu_limit=text["swiglu_limit"],
-        sliding_window=text["sliding_window"],
-        o_groups=o_groups,
-        o_lora_rank=o_lora_rank,
-        index_n_heads=index_n_heads,
-        index_head_dim=index_head_dim,
-        index_topk=text["index_topk"],
-        hidden_act=text["hidden_act"],
-        initializer_range=text["initializer_range"],
-        rms_norm_eps=text["rms_norm_eps"],
-        use_cache=False,
-        pad_token_id=source["pad_token_id"],
-        bos_token_id=source["bos_token_id"],
-        eos_token_id=source["eos_token_id"],
-        tie_word_embeddings=text["tie_word_embeddings"],
-        partial_rotary_factor=text["qk_rope_head_dim"] / text["head_dim"],
-        attention_bias=text["attention_bias"],
-        attention_dropout=text["attention_dropout"],
-    )
-    config.architectures = ["DeepseekV41ForCausalLM"]
-    config.v41_compress_ratios = list(text["compress_ratios"][:released_hidden_layers])
-    config.v41_kv_source_layer_ids = list(text["kv_source_layer_ids"])
-    config.v41_index_source_layer_ids = list(text["index_source_layer_ids"])
-    config.v41_candidate_source_layer_id = int(text.get("candidate_source_layer_id", -1))
-    config.v41_candidate_topk_blocks = int(text.get("candidate_topk_blocks", 0))
-    config.v41_candidate_block_size = int(text.get("candidate_block_size", 1))
-    config.v41_indexer_loss_coeff = float(indexer_loss_coeff)
-    if exercise_post_training_indexer:
-        # At 4K with eight-token blocks this retains 1024 candidates for
-        # Top-512. The released 2048-block value would retain every key.
-        config.v41_candidate_topk_blocks = min(config.v41_candidate_topk_blocks, 128)
-    config.v41_engram_layer_ids = list(assets["layer_ids"])
-    config.v41_engram_num_embeddings = list(assets["num_embeddings"])
-    config.v41_engram_bucket_base = int(assets["bucket_base"])
-    config.v41_engram_table_pad_multiple = int(assets.get("table_pad_multiple", 16))
-    config.v41_engram_assets_path = str(assets_path)
-    config.v41_source_model_type = source["model_type"]
-    config.v41_model_mode = "validation_crop"
-    vision = source["vision_config"]
-    released_vision_layers = int(vision["num_hidden_layers"])
-    config.v41_vision_enabled = bool(enable_vision)
-    config.v41_vision_num_hidden_layers = released_vision_layers
-    config.v41_vision_hidden_size = _scaled_dimension(
-        int(vision["hidden_size"]), vision_parameter_divisor, "vision_hidden_size"
-    )
-    config.v41_vision_num_attention_heads = _scaled_dimension(
-        int(vision["num_attention_heads"]),
-        vision_parameter_divisor,
-        "vision_num_attention_heads",
-    )
-    config.v41_vision_intermediate_size = _scaled_dimension(
-        int(vision["intermediate_size"]),
-        vision_parameter_divisor,
-        "vision_intermediate_size",
-    )
-    config.v41_vision_patch_size = int(vision["patch_size"])
-    config.v41_vision_rope_theta = float(vision["rope_theta"])
-    config.v41_vision_downsample_ratio = int(vision["downsample_ratio"])
-    config.v41_vision_max_image_tokens = int(vision["max_image_tokens"])
-    config.v41_vision_min_pixels = int(vision["min_pixels"])
-    config.v41_vision_max_wh_ratio = vision["max_wh_ratio"]
-    config.v41_image_token_id = int(source["image_token_id"])
+    _apply_v41_vision_fields(config, source, enable_vision, vision_parameter_divisor)
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 

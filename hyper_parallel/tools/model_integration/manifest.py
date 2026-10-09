@@ -189,6 +189,95 @@ class ValidationManifest:
                 digest.update(chunk)
         return {"sha256": digest.hexdigest(), "size": path.stat().st_size}
 
+    def _require_matrix_steps(self) -> None:
+        """Require an explicit baseline and a positive step budget."""
+        if not self.matrix.get("baseline"):
+            raise ManifestError("matrix.baseline is required for validate")
+        steps = self.matrix.get("steps")
+        if not isinstance(steps, int) or steps <= 0:
+            raise ManifestError("matrix.steps must be a positive integer")
+
+    def _require_launcher_contract(self) -> None:
+        """Require an existing local Trainer config and a module path."""
+        trainer_config = self.launcher.get("config")
+        trainer_module = self.launcher.get("module")
+        if not isinstance(trainer_config, str) or not trainer_config:
+            raise ManifestError("launcher.config must be a non-empty path")
+        trainer_config_path = self.launcher_config_path
+        if trainer_config_path is None or not trainer_config_path.is_file():
+            raise ManifestError(
+                f"launcher.config does not exist: {trainer_config_path}"
+            )
+        if not isinstance(trainer_module, str) or not trainer_module:
+            raise ManifestError("launcher.module must be a non-empty dotted module")
+
+    def _require_matrix_resources(self) -> None:
+        """Require a positive device count and a bool warm-start flag."""
+        devices = self.matrix.get("devices")
+        if not isinstance(devices, int) or devices <= 0:
+            raise ManifestError("matrix.devices must be a positive integer")
+        shared_initial_checkpoint = self.matrix.get("shared_initial_checkpoint", False)
+        if not isinstance(shared_initial_checkpoint, bool):
+            raise ManifestError("matrix.shared_initial_checkpoint must be a bool")
+
+    def _require_launcher_timeout(self) -> None:
+        """Require any declared launcher timeout to be positive."""
+        timeout = self.launcher.get("timeout_seconds")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            raise ManifestError("launcher.timeout_seconds must be positive")
+
+    def _require_resume_split_step(self) -> None:
+        """Bound the resume split step whenever resume cases are declared."""
+        steps = self.matrix.get("steps")
+        has_resume_case = bool(
+            self.matrix.get("same_topology_resume")
+            or self.matrix.get("cross_topology_resume")
+        )
+        split_step = self.matrix.get("resume_split_step")
+        if has_resume_case and (
+            isinstance(split_step, bool)
+            or not isinstance(split_step, int)
+            or split_step <= 0
+            or split_step >= steps
+        ):
+            raise ManifestError(
+                "resume cases require 0 < matrix.resume_split_step < matrix.steps"
+            )
+        shared_initial_checkpoint = self.matrix.get("shared_initial_checkpoint", False)
+        if has_resume_case and shared_initial_checkpoint and split_step <= 1:
+            raise ManifestError(
+                "resume cases with matrix.shared_initial_checkpoint=true require "
+                "matrix.resume_split_step > 1 because the shared warm-start is global step 1"
+            )
+
+    def _require_integration_handoff(self) -> None:
+        """Require a PASS handoff for the same adapter family when declared."""
+        handoff = self.integration_handoff_path
+        if handoff is not None and not handoff.is_file():
+            raise ManifestError(f"integration_handoff does not exist: {handoff}")
+        if handoff is None:
+            return
+        try:
+            handoff_payload = yaml.safe_load(handoff.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            raise ManifestError(f"could not parse integration_handoff: {exc}") from exc
+        if not isinstance(handoff_payload, Mapping):
+            raise ManifestError("integration_handoff must contain a mapping")
+        if handoff_payload.get("schema_version") != SCHEMA_VERSION:
+            raise ManifestError(
+                f"integration_handoff schema_version must be {SCHEMA_VERSION}"
+            )
+        if handoff_payload.get("status") != "PASS":
+            raise ManifestError("integration_handoff status must be PASS")
+        if handoff_payload.get("family") != self.family:
+            raise ManifestError(
+                "integration_handoff family does not match model adapter"
+            )
+
     def validate_for(self, command: str) -> None:
         """Validate command-specific fields without silently adding defaults."""
         _ = self.model_path
@@ -196,75 +285,14 @@ class ValidationManifest:
         _ = self.integration_handoff_path
         if command == "parity" and not self.reference:
             raise ManifestError(f"reference is required for {command}")
-        if command == "validate":
-            if not self.matrix.get("baseline"):
-                raise ManifestError("matrix.baseline is required for validate")
-            steps = self.matrix.get("steps")
-            if not isinstance(steps, int) or steps <= 0:
-                raise ManifestError("matrix.steps must be a positive integer")
-            trainer_config = self.launcher.get("config")
-            trainer_module = self.launcher.get("module")
-            if not isinstance(trainer_config, str) or not trainer_config:
-                raise ManifestError("launcher.config must be a non-empty path")
-            trainer_config_path = self.launcher_config_path
-            if trainer_config_path is None or not trainer_config_path.is_file():
-                raise ManifestError(
-                    f"launcher.config does not exist: {trainer_config_path}"
-                )
-            if not isinstance(trainer_module, str) or not trainer_module:
-                raise ManifestError("launcher.module must be a non-empty dotted module")
-            devices = self.matrix.get("devices")
-            if not isinstance(devices, int) or devices <= 0:
-                raise ManifestError("matrix.devices must be a positive integer")
-            shared_initial_checkpoint = self.matrix.get("shared_initial_checkpoint", False)
-            if not isinstance(shared_initial_checkpoint, bool):
-                raise ManifestError("matrix.shared_initial_checkpoint must be a bool")
-            timeout = self.launcher.get("timeout_seconds")
-            if timeout is not None and (
-                isinstance(timeout, bool)
-                or not isinstance(timeout, (int, float))
-                or timeout <= 0
-            ):
-                raise ManifestError("launcher.timeout_seconds must be positive")
-            has_resume_case = bool(
-                self.matrix.get("same_topology_resume")
-                or self.matrix.get("cross_topology_resume")
-            )
-            split_step = self.matrix.get("resume_split_step")
-            if has_resume_case and (
-                isinstance(split_step, bool)
-                or not isinstance(split_step, int)
-                or split_step <= 0
-                or split_step >= steps
-            ):
-                raise ManifestError(
-                    "resume cases require 0 < matrix.resume_split_step < matrix.steps"
-                )
-            if has_resume_case and shared_initial_checkpoint and split_step <= 1:
-                raise ManifestError(
-                    "resume cases with matrix.shared_initial_checkpoint=true require "
-                    "matrix.resume_split_step > 1 because the shared warm-start is global step 1"
-                )
-            handoff = self.integration_handoff_path
-            if handoff is not None and not handoff.is_file():
-                raise ManifestError(f"integration_handoff does not exist: {handoff}")
-            if handoff is not None:
-                try:
-                    handoff_payload = yaml.safe_load(handoff.read_text(encoding="utf-8"))
-                except (OSError, yaml.YAMLError) as exc:
-                    raise ManifestError(f"could not parse integration_handoff: {exc}") from exc
-                if not isinstance(handoff_payload, Mapping):
-                    raise ManifestError("integration_handoff must contain a mapping")
-                if handoff_payload.get("schema_version") != SCHEMA_VERSION:
-                    raise ManifestError(
-                        f"integration_handoff schema_version must be {SCHEMA_VERSION}"
-                    )
-                if handoff_payload.get("status") != "PASS":
-                    raise ManifestError("integration_handoff status must be PASS")
-                if handoff_payload.get("family") != self.family:
-                    raise ManifestError(
-                        "integration_handoff family does not match model adapter"
-                    )
+        if command != "validate":
+            return
+        self._require_matrix_steps()
+        self._require_launcher_contract()
+        self._require_matrix_resources()
+        self._require_launcher_timeout()
+        self._require_resume_split_step()
+        self._require_integration_handoff()
 
 
 def load_manifest(path: str | Path, output_dir: str | Path | None = None) -> ValidationManifest:

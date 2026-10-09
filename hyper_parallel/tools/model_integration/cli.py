@@ -495,6 +495,89 @@ def command_parity(args: argparse.Namespace) -> int:
     return 1 if report["status"] == "FAIL" else 2
 
 
+def _phase_train_iters(phase: str, steps: int, split_step: int) -> int:
+    """Map the launch phase to the number of executed training steps."""
+    if phase == "initialize":
+        return _SHARED_INITIAL_CHECKPOINT_STEP
+    if phase == "prepare":
+        return split_step
+    return steps
+
+
+def _shared_checkpoint_overrides(
+        manifest: ValidationManifest,
+        phase: str,
+) -> dict[str, Any]:
+    """Replay every measured case from the same warm-start checkpoint."""
+    if not bool(manifest.matrix.get("shared_initial_checkpoint")):
+        return {}
+    if phase in ("initialize", "restore"):
+        return {}
+    initial_checkpoint_dir = (
+        manifest.output_dir / "cases" / "baseline" / "initial_checkpoint"
+    )
+    # The warm-start step exists to align model/optimizer/RNG state. Every
+    # measured case must replay from the same configured data start; a
+    # stateful Online cursor may also be impossible to restore after TP/CP
+    # changes the DP world size. True resume phases keep the default and
+    # restore the cursor saved at resume_split_step.
+    return {
+        "checkpoint.restore_from": str(
+            initial_checkpoint_dir
+            / f"{STEP_PREFIX}{_SHARED_INITIAL_CHECKPOINT_STEP}"
+        ),
+        "checkpoint.restore_dataloader_state": False,
+    }
+
+
+def _phase_checkpoint_overrides(
+        manifest: ValidationManifest,
+        case: Any,
+        phase: str,
+        evidence_dir: Path,
+        resume_dir: Path,
+        split_step: int,
+) -> dict[str, Any]:
+    """Resolve checkpoint save/restore overrides for one launch phase."""
+    initial_checkpoint_dir = (
+        manifest.output_dir / "cases" / "baseline" / "initial_checkpoint"
+    )
+    if phase == "initialize":
+        return {
+            "checkpoint.save_ckpt": True,
+            "checkpoint.save_steps": 1,
+            "checkpoint.save_epochs": 0,
+            "checkpoint.checkpoint_dir": str(initial_checkpoint_dir),
+        }
+    if phase == "prepare":
+        return {
+            "checkpoint.save_ckpt": True,
+            "checkpoint.save_steps": split_step,
+            "checkpoint.save_epochs": 0,
+            "checkpoint.checkpoint_dir": str(resume_dir),
+        }
+    if phase == "restore":
+        return {
+            "checkpoint.save_ckpt": False,
+            "checkpoint.restore_from": str(resume_dir / f"{STEP_PREFIX}{split_step}"),
+            "checkpoint.checkpoint_dir": str(resume_dir),
+        }
+    checkpoint_enabled = case.name == "baseline" and bool(
+        manifest.matrix.get("same_topology_resume")
+        or manifest.matrix.get("cross_topology_resume")
+    )
+    overrides: dict[str, Any] = {"checkpoint.save_ckpt": checkpoint_enabled}
+    if checkpoint_enabled:
+        overrides.update(
+            {
+                "checkpoint.save_steps": split_step,
+                "checkpoint.save_epochs": 0,
+                "checkpoint.checkpoint_dir": str(evidence_dir / "dcp"),
+            }
+        )
+    return overrides
+
+
 def _trainer_launch_argv(
     manifest: ValidationManifest,
     case: Any,
@@ -512,12 +595,6 @@ def _trainer_launch_argv(
     topology = case.topology if topology is None else topology
     steps = int(manifest.matrix["steps"])
     split_step = int(manifest.matrix.get("resume_split_step", steps))
-    if phase == "initialize":
-        train_iters = _SHARED_INITIAL_CHECKPOINT_STEP
-    elif phase == "prepare":
-        train_iters = split_step
-    else:
-        train_iters = steps
     tokens = [
         "torchrun",
         "--standalone",
@@ -527,7 +604,7 @@ def _trainer_launch_argv(
         str(config),
     ]
     controlled_overrides = {
-        "training.train_iters": train_iters,
+        "training.train_iters": _phase_train_iters(phase, steps, split_step),
         # Split-run preparation stops early but must retain the full-run LR
         # curve so its checkpoint is numerically comparable with the baseline.
         "training.lr_scheduler_iters": steps,
@@ -545,61 +622,17 @@ def _trainer_launch_argv(
     }
     if "validate_placement" in topology:
         controlled_overrides["model.validate_placement"] = topology["validate_placement"]
-    shared_initial_checkpoint = bool(manifest.matrix.get("shared_initial_checkpoint"))
-    checkpoint_enabled = case.name == "baseline" and bool(
-        manifest.matrix.get("same_topology_resume")
-        or manifest.matrix.get("cross_topology_resume")
+    controlled_overrides.update(_shared_checkpoint_overrides(manifest, phase))
+    controlled_overrides.update(
+        _phase_checkpoint_overrides(
+            manifest,
+            case,
+            phase,
+            evidence_dir,
+            resume_dir,
+            split_step,
+        )
     )
-    initial_checkpoint_dir = (
-        manifest.output_dir / "cases" / "baseline" / "initial_checkpoint"
-    )
-    if shared_initial_checkpoint and phase not in ("initialize", "restore"):
-        controlled_overrides["checkpoint.restore_from"] = str(
-            initial_checkpoint_dir
-            / f"{STEP_PREFIX}{_SHARED_INITIAL_CHECKPOINT_STEP}"
-        )
-        # The warm-start step exists to align model/optimizer/RNG state. Every
-        # measured case must replay from the same configured data start; a
-        # stateful Online cursor may also be impossible to restore after TP/CP
-        # changes the DP world size. True resume phases keep the default and
-        # restore the cursor saved at resume_split_step.
-        controlled_overrides["checkpoint.restore_dataloader_state"] = False
-    if phase == "initialize":
-        controlled_overrides.update(
-            {
-                "checkpoint.save_ckpt": True,
-                "checkpoint.save_steps": 1,
-                "checkpoint.save_epochs": 0,
-                "checkpoint.checkpoint_dir": str(initial_checkpoint_dir),
-            }
-        )
-    elif phase == "prepare":
-        controlled_overrides.update(
-            {
-                "checkpoint.save_ckpt": True,
-                "checkpoint.save_steps": split_step,
-                "checkpoint.save_epochs": 0,
-                "checkpoint.checkpoint_dir": str(resume_dir),
-            }
-        )
-    elif phase == "restore":
-        controlled_overrides.update(
-            {
-                "checkpoint.save_ckpt": False,
-                "checkpoint.restore_from": str(resume_dir / f"{STEP_PREFIX}{split_step}"),
-                "checkpoint.checkpoint_dir": str(resume_dir),
-            }
-        )
-    else:
-        controlled_overrides["checkpoint.save_ckpt"] = checkpoint_enabled
-        if checkpoint_enabled:
-            controlled_overrides.update(
-                {
-                    "checkpoint.save_steps": split_step,
-                    "checkpoint.save_epochs": 0,
-                    "checkpoint.checkpoint_dir": str(evidence_dir / "dcp"),
-                }
-            )
     tokens.extend(
         f"--{name}={value}"
         for name, value in controlled_overrides.items()
@@ -1191,6 +1224,102 @@ def _acceptance_entries(manifest: Mapping[str, Any], language: str) -> list[str]
     ]
 
 
+def _baseline_detail_entry(
+        category: str,
+        name: str,
+        topology: str,
+        default_steps: Any,
+        language: str,
+) -> str:
+    """Render the reference-curve entry for the baseline case."""
+    if language == "zh":
+        return (
+            f"[{category}] `{name}`：{topology}；正式步数={default_steps}；作为参考曲线。"
+        )
+    return (
+        f"[{category}] `{name}`: {topology}; measured_steps={default_steps}; reference curve."
+    )
+
+
+def _checkpoint_layout_status(
+        case: Mapping[str, Any],
+        case_comparison: Mapping[str, Any],
+        language: str,
+) -> str:
+    """Render the DCP layout verdict or explain why none was recorded."""
+    checkpoint = case_comparison.get("checkpoint_layout")
+    if isinstance(checkpoint, Mapping):
+        return checkpoint.get("status", "n/a")
+    if case.get("kind") != "resume":
+        return (
+            "not applicable (non-resume case)"
+            if language == "en"
+            else "不适用（非断点续训用例）"
+        )
+    return "not recorded" if language == "en" else "未记录"
+
+
+def _case_detail_entry(
+        case: Mapping[str, Any],
+        name: str,
+        category: str,
+        topology: str,
+        comparisons: Mapping[str, Any],
+        acceptance: Any,
+        language: str,
+) -> str:
+    """Render thresholds, scalar gates, probes, and DCP for one case."""
+    case_comparison = comparisons.get(name, {})
+    scalar = _scalar_case_summary(case_comparison)
+    metadata = case.get("metadata", {})
+    profile = metadata.get("acceptance", "unknown")
+    threshold = acceptance.get(profile, {}) if isinstance(acceptance, Mapping) else {}
+    parameter = case_comparison.get("parameter_probes", {})
+    checkpoint_status = _checkpoint_layout_status(case, case_comparison, language)
+    identity_status = "PASS" if scalar["input_identity"] else "FAIL"
+    lr_status = "PASS" if scalar["learning_rate_identity"] else "FAIL"
+    finite_status = "PASS" if scalar["finite"] else "FAIL"
+    if language == "zh":
+        return (
+            f"[{category}] `{name}`：{topology}；阈值档={profile} "
+            f"(loss<={_format_report_number(threshold.get('loss_max_abs'))}, "
+            f"loss_rel<={_format_report_number(threshold.get('loss_max_rel'))}, "
+            f"norm<={_format_report_number(threshold.get('norm_max_abs'))}, "
+            f"norm_rel<={_format_report_number(threshold.get('norm_max_rel'))}, "
+            f"组合={threshold.get('combination', 'all')})；"
+            f"对比步数={scalar['steps']}；max_loss_abs={_format_report_number(scalar['max_loss'])}；"
+            f"max_loss_rel={_format_report_number(scalar['max_loss_rel'])}；"
+            f"max_norm_abs={_format_report_number(scalar['max_norm'])}；"
+            f"max_norm_rel={_format_report_number(scalar['max_norm_rel'])}；"
+            f"max_post_clip_norm_abs={_format_report_number(scalar['max_post_clip_norm'])}；"
+            f"max_post_clip_norm_rel={_format_report_number(scalar['max_post_clip_norm_rel'])}；"
+            f"输入身份={identity_status}；LR 身份={lr_status}；有限性={finite_status}；"
+            f"参数探针={parameter.get('status', 'n/a')} "
+            f"(optimizer 数值={parameter.get('optimizer_state_numeric_comparison', 'n/a')}, "
+            f"跳过状态数={parameter.get('skipped_optimizer_states', 0)})；"
+            f"checkpoint layout={checkpoint_status}；总状态={case_comparison.get('status', 'n/a')}。"
+        )
+    return (
+        f"[{category}] `{name}`: {topology}; tolerance_profile={profile} "
+        f"(loss<={_format_report_number(threshold.get('loss_max_abs'))}, "
+        f"loss_rel<={_format_report_number(threshold.get('loss_max_rel'))}, "
+        f"norm<={_format_report_number(threshold.get('norm_max_abs'))}, "
+        f"norm_rel<={_format_report_number(threshold.get('norm_max_rel'))}, "
+        f"combination={threshold.get('combination', 'all')}); "
+        f"compared_steps={scalar['steps']}; max_loss_abs={_format_report_number(scalar['max_loss'])}; "
+        f"max_loss_rel={_format_report_number(scalar['max_loss_rel'])}; "
+        f"max_norm_abs={_format_report_number(scalar['max_norm'])}; "
+        f"max_norm_rel={_format_report_number(scalar['max_norm_rel'])}; "
+        f"max_post_clip_norm_abs={_format_report_number(scalar['max_post_clip_norm'])}; "
+        f"max_post_clip_norm_rel={_format_report_number(scalar['max_post_clip_norm_rel'])}; "
+        f"input_identity={identity_status}; LR_identity={lr_status}; finite={finite_status}; "
+        f"parameter_probes={parameter.get('status', 'n/a')} "
+        f"(optimizer_numeric={parameter.get('optimizer_state_numeric_comparison', 'n/a')}, "
+        f"skipped_states={parameter.get('skipped_optimizer_states', 0)}); "
+        f"checkpoint_layout={checkpoint_status}; overall={case_comparison.get('status', 'n/a')}."
+    )
+
+
 def _precision_detail_entries(
     resolved_cases: Iterable[Mapping[str, Any]],
     comparison: Optional[Mapping[str, Any]],
@@ -1226,76 +1355,21 @@ def _precision_detail_entries(
         category = category_names[language][_case_category(case)]
         topology = _format_topology(case.get("topology", {}))
         if name == "baseline":
-            if language == "zh":
-                entries.append(
-                    f"[{category}] `{name}`：{topology}；正式步数={default_steps}；作为参考曲线。"
-                )
-            else:
-                entries.append(
-                    f"[{category}] `{name}`: {topology}; measured_steps={default_steps}; reference curve."
-                )
+            entries.append(
+                _baseline_detail_entry(category, name, topology, default_steps, language)
+            )
             continue
-
-        case_comparison = comparisons.get(name, {})
-        scalar = _scalar_case_summary(case_comparison)
-        metadata = case.get("metadata", {})
-        profile = metadata.get("acceptance", "unknown")
-        threshold = acceptance.get(profile, {}) if isinstance(acceptance, Mapping) else {}
-        parameter = case_comparison.get("parameter_probes", {})
-        checkpoint = case_comparison.get("checkpoint_layout")
-        if isinstance(checkpoint, Mapping):
-            checkpoint_status = checkpoint.get("status", "n/a")
-        elif case.get("kind") != "resume":
-            checkpoint_status = (
-                "not applicable (non-resume case)"
-                if language == "en"
-                else "不适用（非断点续训用例）"
+        entries.append(
+            _case_detail_entry(
+                case,
+                name,
+                category,
+                topology,
+                comparisons,
+                acceptance,
+                language,
             )
-        else:
-            checkpoint_status = "not recorded" if language == "en" else "未记录"
-        identity_status = "PASS" if scalar["input_identity"] else "FAIL"
-        lr_status = "PASS" if scalar["learning_rate_identity"] else "FAIL"
-        finite_status = "PASS" if scalar["finite"] else "FAIL"
-        if language == "zh":
-            entries.append(
-                f"[{category}] `{name}`：{topology}；阈值档={profile} "
-                f"(loss<={_format_report_number(threshold.get('loss_max_abs'))}, "
-                f"loss_rel<={_format_report_number(threshold.get('loss_max_rel'))}, "
-                f"norm<={_format_report_number(threshold.get('norm_max_abs'))}, "
-                f"norm_rel<={_format_report_number(threshold.get('norm_max_rel'))}, "
-                f"组合={threshold.get('combination', 'all')})；"
-                f"对比步数={scalar['steps']}；max_loss_abs={_format_report_number(scalar['max_loss'])}；"
-                f"max_loss_rel={_format_report_number(scalar['max_loss_rel'])}；"
-                f"max_norm_abs={_format_report_number(scalar['max_norm'])}；"
-                f"max_norm_rel={_format_report_number(scalar['max_norm_rel'])}；"
-                f"max_post_clip_norm_abs={_format_report_number(scalar['max_post_clip_norm'])}；"
-                f"max_post_clip_norm_rel={_format_report_number(scalar['max_post_clip_norm_rel'])}；"
-                f"输入身份={identity_status}；LR 身份={lr_status}；有限性={finite_status}；"
-                f"参数探针={parameter.get('status', 'n/a')} "
-                f"(optimizer 数值={parameter.get('optimizer_state_numeric_comparison', 'n/a')}, "
-                f"跳过状态数={parameter.get('skipped_optimizer_states', 0)})；"
-                f"checkpoint layout={checkpoint_status}；总状态={case_comparison.get('status', 'n/a')}。"
-            )
-        else:
-            entries.append(
-                f"[{category}] `{name}`: {topology}; tolerance_profile={profile} "
-                f"(loss<={_format_report_number(threshold.get('loss_max_abs'))}, "
-                f"loss_rel<={_format_report_number(threshold.get('loss_max_rel'))}, "
-                f"norm<={_format_report_number(threshold.get('norm_max_abs'))}, "
-                f"norm_rel<={_format_report_number(threshold.get('norm_max_rel'))}, "
-                f"combination={threshold.get('combination', 'all')}); "
-                f"compared_steps={scalar['steps']}; max_loss_abs={_format_report_number(scalar['max_loss'])}; "
-                f"max_loss_rel={_format_report_number(scalar['max_loss_rel'])}; "
-                f"max_norm_abs={_format_report_number(scalar['max_norm'])}; "
-                f"max_norm_rel={_format_report_number(scalar['max_norm_rel'])}; "
-                f"max_post_clip_norm_abs={_format_report_number(scalar['max_post_clip_norm'])}; "
-                f"max_post_clip_norm_rel={_format_report_number(scalar['max_post_clip_norm_rel'])}; "
-                f"input_identity={identity_status}; LR_identity={lr_status}; finite={finite_status}; "
-                f"parameter_probes={parameter.get('status', 'n/a')} "
-                f"(optimizer_numeric={parameter.get('optimizer_state_numeric_comparison', 'n/a')}, "
-                f"skipped_states={parameter.get('skipped_optimizer_states', 0)}); "
-                f"checkpoint_layout={checkpoint_status}; overall={case_comparison.get('status', 'n/a')}."
-            )
+        )
     return entries or (["未执行"] if language == "zh" else ["not executed"])
 
 

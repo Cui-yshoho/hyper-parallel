@@ -22,7 +22,7 @@ from torch import nn
 
 from hyper_parallel.components.quantization.config import LowPrecisionDtypeScheme
 from hyper_parallel.components.quantization.modules import GroupedExperts
-from hyper_parallel.models.deepseek_v3.adapter.replacements import (
+from hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement import (
     replace_grouped_experts,
 )
 from tests.common.mark_utils import arg_mark
@@ -162,7 +162,7 @@ class TestGroupedExpertsFactory(unittest.TestCase):
         )
         strategy = object()
         patch_path = (
-            "hyper_parallel.models.deepseek_v3.adapter.replacements."
+            "hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement."
             "build_low_precision_strategy"
         )
         with mock.patch(patch_path, return_value=strategy) as build:

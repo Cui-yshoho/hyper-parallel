@@ -93,23 +93,12 @@ def _cpu_source(value: torch.Tensor, name: str) -> torch.Tensor:
     return value.detach().to(device="cpu").clone()
 
 
-def register_rebuildable_buffer(
+def _validate_rebuildable_registration(
     module: nn.Module,
     name: str,
-    *,
-    value: torch.Tensor | None = None,
-    factory: Callable[[MaterializationContext], torch.Tensor] | None = None,
-    persistent: bool = False,
-    preserve_layout: bool = True,
+    persistent: bool,
 ) -> None:
-    """Attach a deterministic rebuild recipe to any ``nn.Module`` buffer.
-
-    When ``name`` already identifies a direct non-persistent buffer, omitting
-    both ``value`` and ``factory`` captures its current value. This lets a model
-    adapter support an unmodified native HF module. Otherwise exactly one recipe
-    must be supplied, and a missing buffer is registered without changing the
-    module's class.
-    """
+    """Validate the registration target before any recipe is resolved."""
     if not isinstance(module, nn.Module):
         raise TypeError(f"module must be torch.nn.Module, got {type(module).__name__}")
     if not isinstance(name, str) or not name or "." in name:
@@ -120,7 +109,15 @@ def register_rebuildable_buffer(
             "with nn.Module.register_buffer instead"
         )
 
-    specs = module.__dict__.setdefault("_hp_rebuildable_buffer_specs", {})
+
+def _resolve_rebuildable_recipe(
+    module: nn.Module,
+    name: str,
+    specs: dict,
+    value: torch.Tensor | None,
+    factory: Callable[[MaterializationContext], torch.Tensor] | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
+    """Validate the recipe against an existing buffer and resolve the value."""
     if name in specs:
         raise ValueError(f"Rebuildable buffer {name!r} is already registered")
 
@@ -143,6 +140,31 @@ def register_rebuildable_buffer(
 
     if has_existing and value is not None and factory is not None:
         raise ValueError("Exactly one of value and factory may define a rebuildable buffer")
+    return value, existing, has_existing
+
+
+def register_rebuildable_buffer(
+    module: nn.Module,
+    name: str,
+    *,
+    value: torch.Tensor | None = None,
+    factory: Callable[[MaterializationContext], torch.Tensor] | None = None,
+    persistent: bool = False,
+    preserve_layout: bool = True,
+) -> None:
+    """Attach a deterministic rebuild recipe to any ``nn.Module`` buffer.
+
+    When ``name`` already identifies a direct non-persistent buffer, omitting
+    both ``value`` and ``factory`` captures its current value. This lets a model
+    adapter support an unmodified native HF module. Otherwise exactly one recipe
+    must be supplied, and a missing buffer is registered without changing the
+    module's class.
+    """
+    _validate_rebuildable_registration(module, name, persistent)
+    specs = module.__dict__.setdefault("_hp_rebuildable_buffer_specs", {})
+    value, existing, has_existing = _resolve_rebuildable_recipe(
+        module, name, specs, value, factory
+    )
     initial_value = value if value is not None else _factory_initial_value(factory)
     if not isinstance(initial_value, torch.Tensor):
         raise TypeError(

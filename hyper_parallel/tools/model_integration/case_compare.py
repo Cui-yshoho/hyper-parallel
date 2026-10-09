@@ -93,6 +93,125 @@ def _scalar_metric_delta(
     }
 
 
+def _align_scalar_rows(
+        baseline: list[Mapping[str, Any]],
+        candidate: list[Mapping[str, Any]],
+        allow_candidate_subset: bool,
+) -> tuple[list[Mapping[str, Any]], Optional[dict[str, Any]]]:
+    """Align candidate rows with baseline steps or explain why not."""
+    if allow_candidate_subset:
+        baseline_by_step = {row.get("step"): row for row in baseline}
+        missing_steps = [row.get("step") for row in candidate if row.get("step") not in baseline_by_step]
+        if missing_steps:
+            return baseline, {
+                "status": "FAIL",
+                "reason": f"resume steps are absent from uninterrupted baseline: {missing_steps}",
+            }
+        return [baseline_by_step[row.get("step")] for row in candidate], None
+    if len(baseline) != len(candidate):
+        return baseline, {
+            "status": "FAIL",
+            "reason": f"step count differs: baseline={len(baseline)}, candidate={len(candidate)}",
+        }
+    return baseline, None
+
+
+def _optional_pair_equal(
+        baseline_row: Mapping[str, Any],
+        candidate_row: Mapping[str, Any],
+        field: str,
+) -> bool:
+    """Compare one optional field, treating absent values as unequal."""
+    baseline_value = baseline_row.get(field)
+    candidate_value = candidate_row.get(field)
+    return (
+        baseline_value is not None
+        and candidate_value is not None
+        and baseline_value == candidate_value
+    )
+
+
+def _post_clip_norm_delta(
+        baseline_row: Mapping[str, Any],
+        candidate_row: Mapping[str, Any],
+        tolerance: Mapping[str, Any],
+) -> tuple[Optional[float], Optional[float], bool]:
+    """Compare optional post-clip norms only when both sides recorded them."""
+    baseline_post_norm = baseline_row.get("grad_norm_post_clip")
+    candidate_post_norm = candidate_row.get("grad_norm_post_clip")
+    if baseline_post_norm is None or candidate_post_norm is None:
+        return None, None, baseline_post_norm is None and candidate_post_norm is None
+    comparison = _scalar_metric_delta(
+        float(baseline_post_norm),
+        float(candidate_post_norm),
+        tolerance,
+        "norm",
+    )
+    return comparison["max_abs"], comparison["max_rel"], comparison["status"]
+
+
+def _compare_scalar_row(
+        baseline_row: Mapping[str, Any],
+        candidate_row: Mapping[str, Any],
+        tolerance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare one aligned step row against the declared scalar tolerances."""
+    baseline_loss = float(baseline_row["loss"])
+    candidate_loss = float(candidate_row["loss"])
+    baseline_norm = float(baseline_row["grad_norm_pre_clip"])
+    candidate_norm = float(candidate_row["grad_norm_pre_clip"])
+    loss_delta = _scalar_metric_delta(baseline_loss, candidate_loss, tolerance, "loss")
+    norm_delta = _scalar_metric_delta(baseline_norm, candidate_norm, tolerance, "norm")
+    input_equal = _optional_pair_equal(baseline_row, candidate_row, "global_input_sha256")
+    learning_rate_equal = _optional_pair_equal(baseline_row, candidate_row, "lr")
+    step_equal = _optional_pair_equal(baseline_row, candidate_row, "step")
+    post_norm_delta, post_norm_relative_delta, post_norm_equal = _post_clip_norm_delta(
+        baseline_row,
+        candidate_row,
+        tolerance,
+    )
+    finite = all(
+        math.isfinite(float(value))
+        for value in (
+            baseline_row["loss"],
+            candidate_row["loss"],
+            baseline_row["grad_norm_pre_clip"],
+            candidate_row["grad_norm_pre_clip"],
+        )
+    )
+    numerical_pass = (
+        loss_delta["status"]
+        and norm_delta["status"]
+        and post_norm_equal
+        and learning_rate_equal
+        and step_equal
+    )
+    if not finite:
+        row_status = "FAIL"
+    elif not input_equal:
+        # Different logical inputs make a numerical A/B verdict invalid;
+        # the topology is not proven wrong, but this experiment is blocked.
+        row_status = "BLOCKED"
+    else:
+        row_status = "PASS" if numerical_pass else "FAIL"
+    return {
+        "step": baseline_row.get("step"),
+        "status": row_status,
+        "loss_max_abs": loss_delta["max_abs"],
+        "loss_max_rel": loss_delta["max_rel"],
+        "loss_tolerance_combination": loss_delta["combination"],
+        "norm_max_abs": norm_delta["max_abs"],
+        "norm_max_rel": norm_delta["max_rel"],
+        "norm_tolerance_combination": norm_delta["combination"],
+        "post_clip_norm_max_abs": post_norm_delta,
+        "post_clip_norm_max_rel": post_norm_relative_delta,
+        "input_identity": input_equal,
+        "learning_rate_equal": learning_rate_equal,
+        "step_equal": step_equal,
+        "finite": finite,
+    }
+
+
 def compare_scalar_curves(
     baseline_rows: Iterable[Mapping[str, Any]],
     candidate_rows: Iterable[Mapping[str, Any]],
@@ -108,121 +227,23 @@ def compare_scalar_curves(
             "status": "BLOCKED",
             "reason": "structured scalar evidence is missing or empty",
         }
-    if allow_candidate_subset:
-        baseline_by_step = {row.get("step"): row for row in baseline}
-        missing_steps = [row.get("step") for row in candidate if row.get("step") not in baseline_by_step]
-        if missing_steps:
-            return {
-                "status": "FAIL",
-                "reason": f"resume steps are absent from uninterrupted baseline: {missing_steps}",
-            }
-        baseline = [baseline_by_step[row.get("step")] for row in candidate]
-    elif len(baseline) != len(candidate):
-        return {
-            "status": "FAIL",
-            "reason": f"step count differs: baseline={len(baseline)}, candidate={len(candidate)}",
-        }
+    baseline, alignment_error = _align_scalar_rows(
+        baseline,
+        candidate,
+        allow_candidate_subset,
+    )
+    if alignment_error is not None:
+        return alignment_error
     comparisons = []
     status = "PASS"
     for baseline_row, candidate_row in zip(baseline, candidate):
-        baseline_loss = float(baseline_row["loss"])
-        candidate_loss = float(candidate_row["loss"])
-        baseline_norm = float(baseline_row["grad_norm_pre_clip"])
-        candidate_norm = float(candidate_row["grad_norm_pre_clip"])
-        loss_delta = _scalar_metric_delta(
-            baseline_loss,
-            candidate_loss,
-            tolerance,
-            "loss",
-        )
-        norm_delta = _scalar_metric_delta(
-            baseline_norm,
-            candidate_norm,
-            tolerance,
-            "norm",
-        )
-        baseline_input_hash = baseline_row.get("global_input_sha256")
-        candidate_input_hash = candidate_row.get("global_input_sha256")
-        input_equal = (
-            baseline_input_hash is not None
-            and candidate_input_hash is not None
-            and baseline_input_hash == candidate_input_hash
-        )
-        baseline_lr = baseline_row.get("lr")
-        candidate_lr = candidate_row.get("lr")
-        learning_rate_equal = (
-            baseline_lr is not None
-            and candidate_lr is not None
-            and baseline_lr == candidate_lr
-        )
-        baseline_step = baseline_row.get("step")
-        candidate_step = candidate_row.get("step")
-        step_equal = (
-            baseline_step is not None
-            and candidate_step is not None
-            and baseline_step == candidate_step
-        )
-        baseline_post_norm = baseline_row.get("grad_norm_post_clip")
-        candidate_post_norm = candidate_row.get("grad_norm_post_clip")
-        post_norm_delta = None
-        post_norm_relative_delta = None
-        post_norm_equal = baseline_post_norm is None and candidate_post_norm is None
-        if baseline_post_norm is not None and candidate_post_norm is not None:
-            post_norm_comparison = _scalar_metric_delta(
-                float(baseline_post_norm),
-                float(candidate_post_norm),
-                tolerance,
-                "norm",
-            )
-            post_norm_delta = post_norm_comparison["max_abs"]
-            post_norm_relative_delta = post_norm_comparison["max_rel"]
-            post_norm_equal = post_norm_comparison["status"]
-        finite = all(
-            math.isfinite(float(value))
-            for value in (
-                baseline_row["loss"],
-                candidate_row["loss"],
-                baseline_row["grad_norm_pre_clip"],
-                candidate_row["grad_norm_pre_clip"],
-            )
-        )
-        numerical_pass = (
-            loss_delta["status"]
-            and norm_delta["status"]
-            and post_norm_equal
-            and learning_rate_equal
-            and step_equal
-        )
-        if not finite:
-            row_status = "FAIL"
-        elif not input_equal:
-            # Different logical inputs make a numerical A/B verdict invalid;
-            # the topology is not proven wrong, but this experiment is blocked.
-            row_status = "BLOCKED"
-        else:
-            row_status = "PASS" if numerical_pass else "FAIL"
+        comparison = _compare_scalar_row(baseline_row, candidate_row, tolerance)
+        row_status = comparison["status"]
         if row_status == "FAIL":
             status = "FAIL"
         elif row_status == "BLOCKED" and status == "PASS":
             status = "BLOCKED"
-        comparisons.append(
-            {
-                "step": baseline_row.get("step"),
-                "status": row_status,
-                "loss_max_abs": loss_delta["max_abs"],
-                "loss_max_rel": loss_delta["max_rel"],
-                "loss_tolerance_combination": loss_delta["combination"],
-                "norm_max_abs": norm_delta["max_abs"],
-                "norm_max_rel": norm_delta["max_rel"],
-                "norm_tolerance_combination": norm_delta["combination"],
-                "post_clip_norm_max_abs": post_norm_delta,
-                "post_clip_norm_max_rel": post_norm_relative_delta,
-                "input_identity": input_equal,
-                "learning_rate_equal": learning_rate_equal,
-                "step_equal": step_equal,
-                "finite": finite,
-            }
-        )
+        comparisons.append(comparison)
     return {"status": status, "steps": comparisons}
 
 
@@ -384,6 +405,87 @@ def _numeric_summary_delta(
     return result
 
 
+def _first_rank_rows(
+        rows: Iterable[Mapping[str, Any]],
+) -> dict[tuple[Any, ...], Mapping[str, Any]]:
+    """Index one canonical row per step, stage, and parameter."""
+    indexed = {}
+    for row in rows:
+        key = (row.get("step"), row.get("stage"), row.get("name"))
+        if key not in indexed or int(row.get("rank", 0)) < int(indexed[key].get("rank", 0)):
+            indexed[key] = row
+    return indexed
+
+
+def _zero_optimizer_state(row: Optional[Mapping[str, Any]]) -> bool:
+    """Treat a load-primed zero state as equivalent to an absent lazy state."""
+    states = None if row is None else row.get("optimizer_state")
+    return bool(states) and all(
+        bool(summary.get("finite")) and float(summary.get("l2") or 0.0) == 0.0
+        for summary in states.values()
+    )
+
+
+def _unmatched_probe_keys(
+        baseline: Mapping[tuple[Any, ...], Mapping[str, Any]],
+        candidate: Mapping[tuple[Any, ...], Mapping[str, Any]],
+        allow_candidate_subset: bool,
+) -> set[tuple[Any, ...]]:
+    """Diff the canonical key spaces of both evidence directories."""
+    if allow_candidate_subset:
+        candidate_steps = {key[0] for key in candidate}
+        expected_baseline = {key for key in baseline if key[0] in candidate_steps}
+        return expected_baseline ^ set(candidate)
+    return set(baseline) ^ set(candidate)
+
+
+def _compare_optimizer_state_probes(
+        key: tuple[Any, ...],
+        baseline_row: Mapping[str, Any],
+        candidate_row: Mapping[str, Any],
+        tolerance: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Compare every declared optimizer-state summary for one parameter."""
+    baseline_states = baseline_row.get("optimizer_state", {})
+    candidate_states = candidate_row.get("optimizer_state", {})
+    comparisons = []
+    for state_name in sorted(set(baseline_states) | set(candidate_states)):
+        if state_name not in baseline_states or state_name not in candidate_states:
+            comparisons.append(
+                {"key": (*key, state_name), "status": "FAIL", "reason": "state missing"}
+            )
+            continue
+        comparison = _numeric_summary_delta(
+            baseline_states[state_name],
+            candidate_states[state_name],
+            tolerance,
+        )
+        comparison["key"] = (*key, state_name)
+        comparisons.append(comparison)
+    return comparisons
+
+
+def _compare_parameter_probe_row(
+        key: tuple[Any, ...],
+        baseline_row: Mapping[str, Any],
+        candidate_row: Mapping[str, Any],
+        tolerance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare one parameter lifecycle row including hash and replica gates."""
+    comparison = _numeric_summary_delta(baseline_row, candidate_row, tolerance)
+    comparison["key"] = key
+    if baseline_row.get("comparison") == "exact_hash":
+        comparison["hash_equal"] = baseline_row.get("sha256") == candidate_row.get("sha256")
+        if not comparison["hash_equal"]:
+            comparison["status"] = "FAIL"
+    baseline_replica = baseline_row.get("replica", {}).get("replicas_equal", True)
+    candidate_replica = candidate_row.get("replica", {}).get("replicas_equal", True)
+    comparison["replicas_equal"] = baseline_replica and candidate_replica
+    if not comparison["replicas_equal"]:
+        comparison["status"] = "FAIL"
+    return comparison
+
+
 def compare_parameter_probes(
         baseline_dir: str | Path,
         candidate_dir: str | Path,
@@ -407,39 +509,15 @@ def compare_parameter_probes(
             "status": "BLOCKED",
             "reason": "strict parameter probe evidence is missing",
         }
-
-    def first_rank(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[Any, ...], Mapping[str, Any]]:
-        """Index one canonical row per step, stage, and parameter."""
-        indexed = {}
-        for row in rows:
-            key = (row.get("step"), row.get("stage"), row.get("name"))
-            if key not in indexed or int(row.get("rank", 0)) < int(indexed[key].get("rank", 0)):
-                indexed[key] = row
-        return indexed
-
-    baseline = first_rank(baseline_rows)
-    candidate = first_rank(candidate_rows)
-
-    def zero_optimizer_state(row: Optional[Mapping[str, Any]]) -> bool:
-        """Treat a load-primed zero state as equivalent to an absent lazy state."""
-        states = None if row is None else row.get("optimizer_state")
-        return bool(states) and all(
-            bool(summary.get("finite")) and float(summary.get("l2") or 0.0) == 0.0
-            for summary in states.values()
-        )
-
-    if allow_candidate_subset:
-        candidate_steps = {key[0] for key in candidate}
-        expected_baseline = {key for key in baseline if key[0] in candidate_steps}
-        unmatched = expected_baseline ^ set(candidate)
-    else:
-        unmatched = set(baseline) ^ set(candidate)
+    baseline = _first_rank_rows(baseline_rows)
+    candidate = _first_rank_rows(candidate_rows)
+    unmatched = _unmatched_probe_keys(baseline, candidate, allow_candidate_subset)
     zero_initialized = sorted(
         (
             key
             for key in unmatched
-            if zero_optimizer_state(baseline.get(key))
-            or zero_optimizer_state(candidate.get(key))
+            if _zero_optimizer_state(baseline.get(key))
+            or _zero_optimizer_state(candidate.get(key))
         ),
         key=repr,
     )
@@ -450,38 +528,24 @@ def compare_parameter_probes(
         baseline_row = baseline[key]
         candidate_row = candidate[key]
         if "optimizer_state" in baseline_row or "optimizer_state" in candidate_row:
-            baseline_states = baseline_row.get("optimizer_state", {})
-            candidate_states = candidate_row.get("optimizer_state", {})
-            state_names = set(baseline_states) | set(candidate_states)
             if not compare_optimizer_states:
-                skipped_optimizer_states += len(state_names)
+                skipped_optimizer_states += len(
+                    set(baseline_row.get("optimizer_state", {}))
+                    | set(candidate_row.get("optimizer_state", {}))
+                )
                 continue
-            for state_name in sorted(state_names):
-                if state_name not in baseline_states or state_name not in candidate_states:
-                    comparisons.append(
-                        {"key": (*key, state_name), "status": "FAIL", "reason": "state missing"}
-                    )
-                    continue
-                comparison = _numeric_summary_delta(
-                    baseline_states[state_name],
-                    candidate_states[state_name],
+            comparisons.extend(
+                _compare_optimizer_state_probes(
+                    key,
+                    baseline_row,
+                    candidate_row,
                     tolerance,
                 )
-                comparison["key"] = (*key, state_name)
-                comparisons.append(comparison)
+            )
             continue
-        comparison = _numeric_summary_delta(baseline_row, candidate_row, tolerance)
-        comparison["key"] = key
-        if baseline_row.get("comparison") == "exact_hash":
-            comparison["hash_equal"] = baseline_row.get("sha256") == candidate_row.get("sha256")
-            if not comparison["hash_equal"]:
-                comparison["status"] = "FAIL"
-        baseline_replica = baseline_row.get("replica", {}).get("replicas_equal", True)
-        candidate_replica = candidate_row.get("replica", {}).get("replicas_equal", True)
-        comparison["replicas_equal"] = baseline_replica and candidate_replica
-        if not comparison["replicas_equal"]:
-            comparison["status"] = "FAIL"
-        comparisons.append(comparison)
+        comparisons.append(
+            _compare_parameter_probe_row(key, baseline_row, candidate_row, tolerance)
+        )
     status = "FAIL" if missing or any(row["status"] == "FAIL" for row in comparisons) else "PASS"
     return {
         "status": status,
@@ -539,70 +603,46 @@ def summarize_performance(
     }
 
 
-def compare_checkpoint_layouts(
-        baseline_dir: str | Path,
-        candidate_dir: str | Path,
-        *,
-        same_topology: bool,
-) -> dict[str, Any]:
-    """Compare DCP-bound logical layouts while allowing legal resharding."""
-    baseline_files = sorted(Path(baseline_dir).glob("**/checkpoint/*_rank*.json"))
-    candidate_files = sorted(Path(candidate_dir).glob("**/checkpoint/*_rank*.json"))
-    if not baseline_files or not candidate_files:
-        return {"status": "BLOCKED", "reason": "checkpoint layout evidence is missing"}
+def _group_checkpoint_events(files: list[Path]) -> dict[str, list[Path]]:
+    """Group every rank file by its versioned checkpoint event name."""
+    grouped: dict[str, list[Path]] = {}
+    for path in files:
+        event_name = path.name.rsplit("_rank", 1)[0]
+        grouped.setdefault(event_name, []).append(path)
+    return grouped
 
-    def group_events(files: list[Path]) -> dict[str, list[Path]]:
-        """Group every rank file by its versioned checkpoint event name."""
-        grouped: dict[str, list[Path]] = {}
-        for path in files:
-            event_name = path.name.rsplit("_rank", 1)[0]
-            grouped.setdefault(event_name, []).append(path)
-        return grouped
 
-    def latest_event(events: Mapping[str, list[Path]], preferred: str) -> str:
-        """Choose the newest numbered event, retaining legacy-name support."""
-        matching = [
-            event_name
-            for event_name in events
-            if event_name == preferred or event_name.startswith(f"{preferred}_")
-        ]
-        if not matching:
-            return sorted(events)[-1]
+def _checkpoint_event_order(event_name: str) -> tuple[int, str]:
+    """Sort numbered checkpoint events after legacy unnumbered events."""
+    suffix = event_name.rsplit("_", 1)[-1]
+    return (int(suffix), event_name) if suffix.isdigit() else (-1, event_name)
 
-        def event_order(event_name: str) -> tuple[int, str]:
-            """Sort numbered checkpoint events after legacy unnumbered events."""
-            suffix = event_name.rsplit("_", 1)[-1]
-            return (int(suffix), event_name) if suffix.isdigit() else (-1, event_name)
 
-        return max(matching, key=event_order)
+def _latest_checkpoint_event(events: Mapping[str, list[Path]], preferred: str) -> str:
+    """Choose the newest numbered event, retaining legacy-name support."""
+    matching = [
+        event_name
+        for event_name in events
+        if event_name == preferred or event_name.startswith(f"{preferred}_")
+    ]
+    if not matching:
+        return sorted(events)[-1]
+    return max(matching, key=_checkpoint_event_order)
 
-    def load_rank_layouts(files: list[Path]) -> list[dict[str, Any]]:
-        """Load checkpoint tensor-layout maps for all selected ranks."""
-        return [
-            json.loads(path.read_text(encoding="utf-8")).get("tensor_layouts", {})
-            for path in files
-        ]
 
-    baseline_events = group_events(baseline_files)
-    candidate_events = group_events(candidate_files)
-    candidate_event = latest_event(candidate_events, "after_load")
-    checkpoint_identity = candidate_event.removeprefix("after_load").lstrip("_")
-    baseline_event = (
-        f"before_save_{checkpoint_identity}"
-        if checkpoint_identity
-        else latest_event(baseline_events, "before_save")
-    )
-    if baseline_event not in baseline_events:
-        return {
-            "status": "BLOCKED",
-            "reason": "baseline checkpoint evidence for the restored checkpoint is missing",
-            "baseline_event": baseline_event,
-            "candidate_event": candidate_event,
-        }
-    baseline_ranks = load_rank_layouts(baseline_events[baseline_event])
-    candidate_ranks = load_rank_layouts(candidate_events[candidate_event])
-    baseline = baseline_ranks[0]
-    candidate = candidate_ranks[0]
+def _load_rank_layouts(files: list[Path]) -> list[dict[str, Any]]:
+    """Load checkpoint tensor-layout maps for all selected ranks."""
+    return [
+        json.loads(path.read_text(encoding="utf-8")).get("tensor_layouts", {})
+        for path in files
+    ]
+
+
+def _missing_layout_names(
+        baseline: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    """List one-sided keys, excluding lazily initialized optimizer state."""
     baseline_only = set(baseline) - set(candidate)
     candidate_only = set(candidate) - set(baseline)
     initialized_optimizer_entries = sorted(
@@ -616,13 +656,22 @@ def compare_checkpoint_layouts(
             if name not in initialized_optimizer_entries
         }
     )
+    return missing, initialized_optimizer_entries
+
+
+def _layout_mismatches(
+        baseline: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        same_topology: bool,
+) -> list[dict[str, Any]]:
+    """Diff shared tensor layouts over the topology-appropriate field set."""
+    fields = ["global_shape"]
+    if same_topology:
+        fields.extend(("mesh_dim_names", "mesh_shape", "placements"))
     mismatches = []
     for name in sorted(set(baseline).intersection(candidate)):
         baseline_layout = baseline[name]
         candidate_layout = candidate[name]
-        fields = ["global_shape"]
-        if same_topology:
-            fields.extend(("mesh_dim_names", "mesh_shape", "placements"))
         differences = {
             field: {
                 "baseline": baseline_layout.get(field),
@@ -633,29 +682,42 @@ def compare_checkpoint_layouts(
         }
         if differences:
             mismatches.append({"name": name, "differences": differences})
-    rank_inconsistencies = []
-    for side_name, rank_layouts in (
-        ("baseline", baseline_ranks),
-        ("candidate", candidate_ranks),
-    ):
-        all_names = set().union(*(set(layouts) for layouts in rank_layouts))
-        for name in sorted(all_names):
-            values = [layouts.get(name) for layouts in rank_layouts]
-            global_shapes = {
-                tuple(value.get("global_shape", ()))
-                for value in values
-                if value is not None
-            }
-            if any(value is None for value in values) or len(global_shapes) != 1:
-                rank_inconsistencies.append(
-                    {
-                        "side": side_name,
-                        "name": name,
-                        "reason": "rank-local payloads disagree on key presence or global shape",
-                    }
-                )
-    if same_topology and len(baseline_ranks) != len(candidate_ranks):
-        rank_inconsistencies.append(
+    return mismatches
+
+
+def _rank_consistency_inconsistencies(
+        side_name: str,
+        rank_layouts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flag keys whose rank-local payloads disagree on presence or shape."""
+    inconsistencies = []
+    all_names = set().union(*(set(layouts) for layouts in rank_layouts))
+    for name in sorted(all_names):
+        values = [layouts.get(name) for layouts in rank_layouts]
+        global_shapes = {
+            tuple(value.get("global_shape", ()))
+            for value in values
+            if value is not None
+        }
+        if any(value is None for value in values) or len(global_shapes) != 1:
+            inconsistencies.append(
+                {
+                    "side": side_name,
+                    "name": name,
+                    "reason": "rank-local payloads disagree on key presence or global shape",
+                }
+            )
+    return inconsistencies
+
+
+def _same_topology_rank_inconsistencies(
+        baseline_ranks: list[dict[str, Any]],
+        candidate_ranks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Require equal rank counts and stable local shard shapes."""
+    inconsistencies = []
+    if len(baseline_ranks) != len(candidate_ranks):
+        inconsistencies.append(
             {
                 "side": "comparison",
                 "reason": "same-topology checkpoint evidence has different rank counts",
@@ -663,22 +725,70 @@ def compare_checkpoint_layouts(
                 "candidate_ranks": len(candidate_ranks),
             }
         )
-    if same_topology and len(baseline_ranks) == len(candidate_ranks):
-        for rank, (baseline_layouts, candidate_layouts) in enumerate(
-                zip(baseline_ranks, candidate_ranks)
-        ):
-            for name in sorted(set(baseline_layouts).intersection(candidate_layouts)):
-                if baseline_layouts[name].get("local_shape") != candidate_layouts[name].get(
-                        "local_shape"
-                ):
-                    rank_inconsistencies.append(
-                        {
-                            "side": "comparison",
-                            "rank": rank,
-                            "name": name,
-                            "reason": "same-topology local shard shape changed",
-                        }
-                    )
+        return inconsistencies
+    for rank, (baseline_layouts, candidate_layouts) in enumerate(
+            zip(baseline_ranks, candidate_ranks)
+    ):
+        for name in sorted(set(baseline_layouts).intersection(candidate_layouts)):
+            if baseline_layouts[name].get("local_shape") != candidate_layouts[name].get(
+                    "local_shape"
+            ):
+                inconsistencies.append(
+                    {
+                        "side": "comparison",
+                        "rank": rank,
+                        "name": name,
+                        "reason": "same-topology local shard shape changed",
+                    }
+                )
+    return inconsistencies
+
+
+def compare_checkpoint_layouts(
+        baseline_dir: str | Path,
+        candidate_dir: str | Path,
+        *,
+        same_topology: bool,
+) -> dict[str, Any]:
+    """Compare DCP-bound logical layouts while allowing legal resharding."""
+    baseline_files = sorted(Path(baseline_dir).glob("**/checkpoint/*_rank*.json"))
+    candidate_files = sorted(Path(candidate_dir).glob("**/checkpoint/*_rank*.json"))
+    if not baseline_files or not candidate_files:
+        return {"status": "BLOCKED", "reason": "checkpoint layout evidence is missing"}
+    baseline_events = _group_checkpoint_events(baseline_files)
+    candidate_events = _group_checkpoint_events(candidate_files)
+    candidate_event = _latest_checkpoint_event(candidate_events, "after_load")
+    checkpoint_identity = candidate_event.removeprefix("after_load").lstrip("_")
+    baseline_event = (
+        f"before_save_{checkpoint_identity}"
+        if checkpoint_identity
+        else _latest_checkpoint_event(baseline_events, "before_save")
+    )
+    if baseline_event not in baseline_events:
+        return {
+            "status": "BLOCKED",
+            "reason": "baseline checkpoint evidence for the restored checkpoint is missing",
+            "baseline_event": baseline_event,
+            "candidate_event": candidate_event,
+        }
+    baseline_ranks = _load_rank_layouts(baseline_events[baseline_event])
+    candidate_ranks = _load_rank_layouts(candidate_events[candidate_event])
+    baseline = baseline_ranks[0]
+    candidate = candidate_ranks[0]
+    missing, initialized_optimizer_entries = _missing_layout_names(baseline, candidate)
+    mismatches = _layout_mismatches(baseline, candidate, same_topology)
+    rank_inconsistencies = []
+    for side_name, rank_layouts in (
+        ("baseline", baseline_ranks),
+        ("candidate", candidate_ranks),
+    ):
+        rank_inconsistencies.extend(
+            _rank_consistency_inconsistencies(side_name, rank_layouts)
+        )
+    if same_topology:
+        rank_inconsistencies.extend(
+            _same_topology_rank_inconsistencies(baseline_ranks, candidate_ranks)
+        )
     return {
         "status": "FAIL" if missing or mismatches or rank_inconsistencies else "PASS",
         "missing": missing,

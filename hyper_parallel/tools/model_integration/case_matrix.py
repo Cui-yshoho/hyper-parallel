@@ -143,21 +143,16 @@ def _acceptance_class(
     return "same_topology"
 
 
-def generate_validation_cases(
-    matrix: Mapping[str, Any],
-    recompute_policy: Optional[RecomputePolicy] = None,
-    topology_constraints: Iterable[TopologyConstraint] = (),
-) -> tuple[ValidationCase, ...]:
-    """Generate a minimum single-axis-plus-combined validation matrix."""
-    baseline = dict(matrix.get("baseline") or {})
-    if not baseline:
-        raise ValueError("matrix.baseline is required")
-    baseline = _validate_topology(baseline, "matrix.baseline")
-    cases = [ValidationCase("baseline", baseline, compare_to="baseline")]
-    seen = {json.dumps(baseline, sort_keys=True)}
+def _axis_cases(
+        matrix: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+        seen: set[str],
+) -> list[ValidationCase]:
+    """Generate one case per declared single-axis deviation."""
     axes = matrix.get("axes") or {}
     if not isinstance(axes, Mapping):
         raise ValueError("matrix.axes must be a mapping")
+    cases = []
     for axis, values in axes.items():
         if axis not in _TOPOLOGY_DEFAULTS:
             supported = ", ".join(_TOPOLOGY_DEFAULTS)
@@ -177,6 +172,16 @@ def generate_validation_cases(
             cases.append(
                 ValidationCase(_case_name(topology, f"axis-{axis}"), topology)
             )
+    return cases
+
+
+def _combined_cases(
+        matrix: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+        seen: set[str],
+) -> list[ValidationCase]:
+    """Generate one case per declared multi-axis combination."""
+    cases = []
     for index, combined in enumerate(matrix.get("combined") or ()):
         if not isinstance(combined, Mapping):
             raise ValueError("matrix.combined entries must be mappings")
@@ -187,59 +192,92 @@ def generate_validation_cases(
             continue
         seen.add(key)
         cases.append(ValidationCase(_case_name(topology, f"combined-{index}"), topology))
+    return cases
 
-    if recompute_policy is not None:
-        requested_selections = matrix.get(
-            "recompute_selections",
-            ({"layer_count": 0},),
+
+def _recompute_cases(
+        matrix: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+        seen: set[str],
+) -> list[ValidationCase]:
+    """Generate one case per requested recompute layer selection."""
+    requested_selections = matrix.get(
+        "recompute_selections",
+        ({"layer_count": 0},),
+    )
+    if not isinstance(requested_selections, (list, tuple)) or not requested_selections:
+        raise ValueError("matrix.recompute_selections must be a non-empty list")
+    cases = []
+    for index, requested_selection in enumerate(requested_selections):
+        selection = _validate_recompute_selection(
+            requested_selection,
+            f"matrix.recompute_selections[{index}]",
         )
-        if not isinstance(requested_selections, (list, tuple)) or not requested_selections:
-            raise ValueError("matrix.recompute_selections must be a non-empty list")
-        for index, requested_selection in enumerate(requested_selections):
-            selection = _validate_recompute_selection(
-                requested_selection,
-                f"matrix.recompute_selections[{index}]",
+        topology = dict(baseline)
+        topology.update(
+            _validate_topology(
+                matrix.get("recompute_topology") or {},
+                "matrix.recompute_topology",
             )
-            topology = dict(baseline)
-            topology.update(
-                _validate_topology(
-                    matrix.get("recompute_topology") or {},
-                    "matrix.recompute_topology",
-                )
-            )
-            topology["recompute"] = selection
-            key = json.dumps(topology, sort_keys=True)
-            if key in seen:
-                continue
-            seen.add(key)
-            cases.append(
-                ValidationCase(_case_name(topology, "recompute"), topology)
-            )
+        )
+        topology["recompute"] = selection
+        key = json.dumps(topology, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        cases.append(
+            ValidationCase(_case_name(topology, "recompute"), topology)
+        )
+    return cases
 
-    if int(baseline.get("ep", 1)) > 1 and not any(
+
+def _ep1_fallback_case(
+        cases: list[ValidationCase],
+        baseline: Mapping[str, Any],
+) -> Optional[ValidationCase]:
+    """Retain a single-device-EP reference when every case parallelizes experts."""
+    if int(baseline.get("ep", 1)) <= 1 or any(
         int(case.topology.get("ep", 1)) == 1 for case in cases
     ):
-        topology = dict(baseline)
-        topology["ep"] = 1
-        cases.insert(1, ValidationCase(_case_name(topology, "axis-ep"), topology))
+        return None
+    topology = dict(baseline)
+    topology["ep"] = 1
+    return ValidationCase(_case_name(topology, "axis-ep"), topology)
 
+
+def _production_validate_cases(
+        matrix: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+) -> list[ValidationCase]:
+    """Generate the production/validate placement pair when declared."""
     production_validate = matrix.get("production_validate_pair")
-    if production_validate:
-        production_validate = _validate_topology(
-            production_validate,
-            "matrix.production_validate_pair",
-        )
-        for mode in ("production", "validate"):
-            topology = dict(baseline)
-            topology.update(production_validate)
-            topology["validate_placement"] = mode == "validate"
-            cases.append(
-                ValidationCase(
-                    _case_name(topology, mode),
-                    topology,
-                    kind="production_validate",
-                )
+    if not production_validate:
+        return []
+    production_validate = _validate_topology(
+        production_validate,
+        "matrix.production_validate_pair",
+    )
+    cases = []
+    for mode in ("production", "validate"):
+        topology = dict(baseline)
+        topology.update(production_validate)
+        topology["validate_placement"] = mode == "validate"
+        cases.append(
+            ValidationCase(
+                _case_name(topology, mode),
+                topology,
+                kind="production_validate",
             )
+        )
+    return cases
+
+
+def _resume_cases(
+        matrix: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+) -> list[ValidationCase]:
+    """Generate the declared same/cross-topology resume cases."""
+    cases = []
     if matrix.get("same_topology_resume"):
         cases.append(
             ValidationCase(
@@ -276,7 +314,15 @@ def generate_validation_cases(
                 },
             )
         )
+    return cases
 
+
+def _finalize_cases(
+        cases: list[ValidationCase],
+        baseline: Mapping[str, Any],
+        topology_constraints: Iterable[TopologyConstraint],
+) -> tuple[ValidationCase, ...]:
+    """Apply topology constraints and classify each case acceptance profile."""
     resolved_cases = []
     for case in cases:
         for constraint in topology_constraints:
@@ -289,6 +335,30 @@ def generate_validation_cases(
         metadata["acceptance"] = _acceptance_class(baseline, case.topology)
         resolved_cases.append(dataclasses.replace(case, metadata=metadata))
     return tuple(resolved_cases)
+
+
+def generate_validation_cases(
+    matrix: Mapping[str, Any],
+    recompute_policy: Optional[RecomputePolicy] = None,
+    topology_constraints: Iterable[TopologyConstraint] = (),
+) -> tuple[ValidationCase, ...]:
+    """Generate a minimum single-axis-plus-combined validation matrix."""
+    baseline = dict(matrix.get("baseline") or {})
+    if not baseline:
+        raise ValueError("matrix.baseline is required")
+    baseline = _validate_topology(baseline, "matrix.baseline")
+    cases = [ValidationCase("baseline", baseline, compare_to="baseline")]
+    seen = {json.dumps(baseline, sort_keys=True)}
+    cases.extend(_axis_cases(matrix, baseline, seen))
+    cases.extend(_combined_cases(matrix, baseline, seen))
+    if recompute_policy is not None:
+        cases.extend(_recompute_cases(matrix, baseline, seen))
+    ep1_case = _ep1_fallback_case(cases, baseline)
+    if ep1_case is not None:
+        cases.insert(1, ep1_case)
+    cases.extend(_production_validate_cases(matrix, baseline))
+    cases.extend(_resume_cases(matrix, baseline))
+    return _finalize_cases(cases, baseline, topology_constraints)
 
 
 __all__ = [

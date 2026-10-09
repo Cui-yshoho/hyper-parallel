@@ -136,25 +136,48 @@ def _gather_shard_summaries(
     return shards, rank_summaries
 
 
-def _tensor_summary(name: str, tensor: Any) -> Optional[dict[str, Any]]:
-    """Build one global summary while allowing rank-local lazy state absence."""
-    local_summary = None if tensor is None else _local_tensor_summary(tensor)
-    shards, rank_summaries = _gather_shard_summaries(local_summary)
-    if not shards:
-        return None
-    shards.sort(key=lambda item: item["shard"])
+def _replica_digest_groups(
+        rank_summaries: list[Optional[dict[str, Any]]],
+) -> dict[tuple[Any, ...], set[str]]:
+    """Group per-rank payload digests by their logical shard identity."""
     replica_groups: dict[tuple[Any, ...], set[str]] = {}
     for rank_summary in rank_summaries:
         if rank_summary is None:
             continue
         shard = tuple(tuple(item) for item in rank_summary["shard"])
         replica_groups.setdefault(shard, set()).add(rank_summary["sha256"])
-    canonical_digest = hashlib.sha256(
+    return replica_groups
+
+
+def _canonical_shard_digest(shards: list[dict[str, Any]]) -> str:
+    """Hash the ordered shard digests into one canonical tensor identity."""
+    return hashlib.sha256(
         json.dumps(
             [(summary["shard"], summary["sha256"]) for summary in shards],
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _flattened_shard_values(tensor: Any, shards: list[dict[str, Any]]) -> Optional[list[Any]]:
+    """Reconstruct full values only from flattened-order small shard sets."""
+    if not (
+        _local_shards_follow_flattened_order(tensor)
+        and sum(shard["numel"] for shard in shards) <= _SMALL_TENSOR_NUMEL
+        and all(shard["values"] is not None for shard in shards)
+    ):
+        return None
+    return [value for shard in shards for value in shard["values"]]
+
+
+def _global_shard_summary(
+        name: str,
+        tensor: Any,
+        shards: list[dict[str, Any]],
+        rank_summaries: list[Optional[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Aggregate sorted shard summaries into one canonical global record."""
+    replica_groups = _replica_digest_groups(rank_summaries)
     minima = [summary["min"] for summary in shards if summary["min"] is not None]
     maxima = [summary["max"] for summary in shards if summary["max"] is not None]
     reference = shards[0]
@@ -163,7 +186,7 @@ def _tensor_summary(name: str, tensor: Any) -> Optional[dict[str, Any]]:
         "global_shape": reference["global_shape"],
         "canonical_shape": reference["global_shape"],
         "dtype": reference["dtype"],
-        "sha256": canonical_digest,
+        "sha256": _canonical_shard_digest(shards),
         "finite": all(shard["finite"] for shard in shards),
         "sum": sum(shard["sum"] for shard in shards),
         "l2": math.sqrt(sum(shard["squared_l2"] for shard in shards)),
@@ -178,13 +201,20 @@ def _tensor_summary(name: str, tensor: Any) -> Optional[dict[str, Any]]:
             rank for rank, rank_summary in enumerate(rank_summaries) if rank_summary is None
         ],
     }
-    if (
-        _local_shards_follow_flattened_order(tensor)
-        and sum(shard["numel"] for shard in shards) <= _SMALL_TENSOR_NUMEL
-        and all(shard["values"] is not None for shard in shards)
-    ):
-        summary["values"] = [value for shard in shards for value in shard["values"]]
+    values = _flattened_shard_values(tensor, shards)
+    if values is not None:
+        summary["values"] = values
     return summary
+
+
+def _tensor_summary(name: str, tensor: Any) -> Optional[dict[str, Any]]:
+    """Build one global summary while allowing rank-local lazy state absence."""
+    local_summary = None if tensor is None else _local_tensor_summary(tensor)
+    shards, rank_summaries = _gather_shard_summaries(local_summary)
+    if not shards:
+        return None
+    shards.sort(key=lambda item: item["shard"])
+    return _global_shard_summary(name, tensor, shards, rank_summaries)
 
 
 def _global_tensor_state_names(local_names: Iterable[str]) -> tuple[str, ...]:
@@ -281,8 +311,9 @@ class InputIdentityRecorder:
         hasher.update(byte_view.numpy().tobytes())
         return hasher.hexdigest()
 
-    @classmethod
-    def _canonical_global_hash(cls, rank_payloads: list[dict[str, Any]]) -> str:
+    @staticmethod
+    def _require_input_payloads(rank_payloads: list[dict[str, Any]]) -> None:
+        """Reject collectives polluted by non-input rank payloads."""
         malformed_ranks = [
             rank
             for rank, payload in enumerate(rank_payloads)
@@ -296,6 +327,12 @@ class InputIdentityRecorder:
                 f"{malformed_ranks}; parameter probes must execute a rank-consistent "
                 "collective sequence"
             )
+
+    @staticmethod
+    def _group_input_entries(
+            rank_payloads: list[dict[str, Any]],
+    ) -> dict[tuple[Any, ...], list[tuple[int, torch.Tensor, bool]]]:
+        """Group entry shards by logical field across tp0/pp0 ranks."""
         selected = [
             payload
             for payload in rank_payloads
@@ -319,21 +356,37 @@ class InputIdentityRecorder:
                         bool(entry.get("cp_replicated", False)),
                     )
                 )
+        return grouped
+
+    @staticmethod
+    def _merge_entry_shards(
+            shards: list[tuple[int, torch.Tensor, bool]],
+    ) -> torch.Tensor:
+        """Rebuild one logical field tensor from ordered CP shards."""
+        ordered_shards = sorted(shards, key=lambda item: item[0])
+        ordered = [tensor for _, tensor, _ in ordered_shards]
+        tensor = ordered[0]
+        cp_replicated = all(replicated for _, _, replicated in ordered_shards)
+        if cp_replicated and any(
+                not torch.equal(tensor, replica) for replica in ordered[1:]
+        ):
+            cp_replicated = False
+        if len(ordered) > 1 and tensor.ndim > 0 and not cp_replicated:
+            try:
+                tensor = torch.cat(ordered, dim=-1)
+            except RuntimeError:
+                tensor = torch.cat([value.reshape(-1) for value in ordered])
+        return tensor
+
+    @classmethod
+    def _entry_component_hashes(
+            cls,
+            grouped: dict[tuple[Any, ...], list[tuple[int, torch.Tensor, bool]]],
+    ) -> list[str]:
+        """Hash every logical field occurrence independently of rank order."""
         component_hashes = []
         for key, shards in grouped.items():
-            ordered_shards = sorted(shards, key=lambda item: item[0])
-            ordered = [tensor for _, tensor, _ in ordered_shards]
-            tensor = ordered[0]
-            cp_replicated = all(replicated for _, _, replicated in ordered_shards)
-            if cp_replicated and any(
-                    not torch.equal(tensor, replica) for replica in ordered[1:]
-            ):
-                cp_replicated = False
-            if len(ordered) > 1 and tensor.ndim > 0 and not cp_replicated:
-                try:
-                    tensor = torch.cat(ordered, dim=-1)
-                except RuntimeError:
-                    tensor = torch.cat([value.reshape(-1) for value in ordered])
+            tensor = cls._merge_entry_shards(shards)
             field_identity = f"{key[2]}:{key[3]}:{key[4]}"
             if tensor.ndim > 0:
                 values = tensor.reshape(tensor.shape[0], -1)
@@ -342,6 +395,13 @@ class InputIdentityRecorder:
                 )
             else:
                 component_hashes.append(f"{field_identity}:{cls._hash_tensor(tensor)}")
+        return component_hashes
+
+    @classmethod
+    def _canonical_global_hash(cls, rank_payloads: list[dict[str, Any]]) -> str:
+        cls._require_input_payloads(rank_payloads)
+        grouped = cls._group_input_entries(rank_payloads)
+        component_hashes = cls._entry_component_hashes(grouped)
         hasher = hashlib.sha256()
         for component_hash in sorted(component_hashes):
             hasher.update(component_hash.encode())

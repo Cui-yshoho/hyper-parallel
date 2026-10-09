@@ -636,6 +636,57 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             merged = merged + image_grad_anchor.to(merged.dtype) * 0.0
         return merged
 
+    def _collect_image_records(
+            self,
+            token_types: torch.LongTensor | None,
+            pixel_values: torch.Tensor | None,
+            image_patch_offsets: torch.LongTensor | None,
+            image_vit_grid_hw: torch.LongTensor | None,
+            image_llm_grid_hw: torch.LongTensor | None,
+            image_batch_indices: torch.LongTensor | None,
+            image_token_starts: torch.LongTensor | None,
+    ) -> list[tuple[int, int, int, int, torch.Tensor]]:
+        """Validate the V4.1 image metadata bundle and encode image features."""
+        image_inputs = (
+            pixel_values,
+            image_patch_offsets,
+            image_vit_grid_hw,
+            image_llm_grid_hw,
+            image_batch_indices,
+            image_token_starts,
+        )
+        if not any(value is not None for value in image_inputs):
+            return []
+        if token_types is None:
+            raise ValueError("token_types are required with V4.1 image inputs")
+        if any(value is None for value in image_inputs):
+            raise ValueError("all V4.1 image metadata fields are required with pixel_values")
+        return self._encode_image_features(
+            pixel_values, image_patch_offsets, image_vit_grid_hw, image_llm_grid_hw,
+            image_batch_indices, image_token_starts,
+        )
+
+    @staticmethod
+    def _build_segment_start_mask(
+            packed_sequence: Any | None,
+            input_ids: torch.LongTensor,
+    ) -> torch.Tensor | None:
+        """Derive the packed-sequence segment-start mask for the local shard."""
+        if packed_sequence is None:
+            return None
+        if not isinstance(packed_sequence, SharedPackedSequence):
+            raise TypeError(
+                "packed_seq_params must be SharedCompressedPackedSequence, "
+                f"got {type(packed_sequence).__name__}"
+            )
+        segment_start_positions = packed_sequence.local_segment_starts(input_ids.device)
+        local_positions = torch.arange(
+            packed_sequence.local_query_start,
+            packed_sequence.local_query_start + packed_sequence.local_query_length,
+            device=input_ids.device,
+        ).unsqueeze(0)
+        return (local_positions == segment_start_positions).expand_as(input_ids)
+
     def forward(
             self,
             input_ids: torch.LongTensor | None = None,
@@ -676,16 +727,14 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         Returns:
             Decoder hidden state and optional cache metadata.
         """
-        # The conditions below enforce one ordered forward contract across text,
-        # vision, Engram, shared-attention, mHC, and gradient-checkpointing paths.
-        #lizard forgives(cyclomatic_complexity)
         if use_cache or past_key_values is not None:
             raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids are required while Engram is enabled")
-        image_inputs = (
+        image_records = self._collect_image_records(
+            token_types,
             pixel_values,
             image_patch_offsets,
             image_vit_grid_hw,
@@ -693,17 +742,6 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_batch_indices,
             image_token_starts,
         )
-        if any(value is not None for value in image_inputs):
-            if token_types is None:
-                raise ValueError("token_types are required with V4.1 image inputs")
-            if any(value is None for value in image_inputs):
-                raise ValueError("all V4.1 image metadata fields are required with pixel_values")
-            image_records = self._encode_image_features(
-                pixel_values, image_patch_offsets, image_vit_grid_hw, image_llm_grid_hw,
-                image_batch_indices, image_token_starts,
-            )
-        else:
-            image_records = []
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if image_records:
@@ -720,21 +758,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
-        segment_start_mask = None
-        packed_sequence = kwargs.get("packed_seq_params")
-        if packed_sequence is not None:
-            if not isinstance(packed_sequence, SharedPackedSequence):
-                raise TypeError(
-                    "packed_seq_params must be SharedCompressedPackedSequence, "
-                    f"got {type(packed_sequence).__name__}"
-                )
-            segment_start_positions = packed_sequence.local_segment_starts(input_ids.device)
-            local_positions = torch.arange(
-                packed_sequence.local_query_start,
-                packed_sequence.local_query_start + packed_sequence.local_query_length,
-                device=input_ids.device,
-            ).unsqueeze(0)
-            segment_start_mask = (local_positions == segment_start_positions).expand_as(input_ids)
+        segment_start_mask = self._build_segment_start_mask(kwargs.get("packed_seq_params"), input_ids)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0

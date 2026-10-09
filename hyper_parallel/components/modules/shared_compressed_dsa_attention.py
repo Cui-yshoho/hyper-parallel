@@ -795,6 +795,29 @@ class SharedCompressedDSAIndexer(nn.Module):
         self.query_chunk_size = int(getattr(module, "query_chunk_size", 256))
         self.train(module.training)
 
+    def _project_index_key(
+            self,
+            latent: torch.Tensor | None,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            index_key: torch.Tensor | None,
+            cp_context: SharedCompressedAttentionCPContext | None,
+    ) -> tuple[torch.Tensor, "SequenceGatherHandle | None"]:
+        """Project or adopt the index key and launch its CP gather."""
+        if self.owns_key:
+            if latent is None:
+                raise RuntimeError("a Full Indexer requires the compressor latent")
+            key = self.k_norm(self.wk(latent.detach()))
+            compressed_length = key.shape[1]
+            key_cos = cos[:, :compressed_length * self.compress_ratio:self.compress_ratio]
+            key_sin = sin[:, :compressed_length * self.compress_ratio:self.compress_ratio]
+            key = _apply_v41_rope(key.unsqueeze(1), key_cos, key_sin).squeeze(1)
+            key_handle = cp_context.launch(key, 1) if cp_context is not None else None
+            return key, key_handle
+        if index_key is None:
+            raise RuntimeError("a Reindex layer requires index K from the preceding Full layer")
+        return index_key, None
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -813,20 +836,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         batch_size, sequence_length, _ = hidden_states.shape
         cos, sin = compress_position_embeddings
 
-        key_handle = None
-        if self.owns_key:
-            if latent is None:
-                raise RuntimeError("a Full Indexer requires the compressor latent")
-            key = self.k_norm(self.wk(latent.detach()))
-            compressed_length = key.shape[1]
-            key_cos = cos[:, :compressed_length * self.compress_ratio:self.compress_ratio]
-            key_sin = sin[:, :compressed_length * self.compress_ratio:self.compress_ratio]
-            key = _apply_v41_rope(key.unsqueeze(1), key_cos, key_sin).squeeze(1)
-            key_handle = cp_context.launch(key, 1) if cp_context is not None else None
-        else:
-            if index_key is None:
-                raise RuntimeError("a Reindex layer requires index K from the preceding Full layer")
-            key = index_key
+        key, key_handle = self._project_index_key(latent, cos, sin, index_key, cp_context)
 
         query = self.q_b_proj(query_residual.detach())
         if query.shape[-1] % self.head_dim:
@@ -1175,16 +1185,21 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         query = query.transpose(1, 2)
         return query_residual, _apply_v41_rope(query, cos, sin)
 
-    def forward(
-            self,
+    @staticmethod
+    def _validate_forward_inputs(
             hidden_states: torch.Tensor,
-            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
-            position_ids: torch.Tensor,
             attention_mask: torch.Tensor | None,
-            past_key_values: Any | None = None,
-            **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Publish or consume compressed KV and execute indexed K=V attention."""
+            past_key_values: Any | None,
+            kwargs: dict[str, Any],
+    ) -> tuple[
+        "SharedCompressedAttentionState",
+        "SharedCompressedPackedSequence | None",
+        "SharedCompressedAttentionCPContext | None",
+        "SharedCompressedAttentionTPContext | None",
+        int,
+        int,
+    ]:
+        """Pop and validate the shared-attention keyword arguments."""
         if past_key_values is not None:
             raise NotImplementedError("shared compressed DSA training does not support KV cache")
         shared_state = kwargs.pop("shared_attention_state", None)
@@ -1194,7 +1209,6 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             raise NotImplementedError(
                 "shared compressed DSA consumes compact packed_seq_params instead of a dense mask"
             )
-
         batch_size, sequence_length, _ = hidden_states.shape
         packed_sequence = kwargs.pop("packed_seq_params", None)
         if packed_sequence is not None and not isinstance(
@@ -1216,16 +1230,18 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 "shared_attention_tp_context must be SharedCompressedAttentionTPContext, "
                 f"got {type(tp_context).__name__}"
             )
-        query_offset = 0
-        global_sequence_length = sequence_length
-        if cp_context is not None:
-            query_offset, global_sequence_length = self._validate_cp_inputs(
-                cp_context,
-                position_ids,
-                sequence_length,
-                self.compress_ratio,
-                self.is_kv_source,
-            )
+        return shared_state, packed_sequence, cp_context, tp_context, batch_size, sequence_length
+
+    def _resolve_packed_geometry(
+            self,
+            packed_sequence: "SharedCompressedPackedSequence | None",
+            batch_size: int,
+            sequence_length: int,
+            query_offset: int,
+            global_sequence_length: int,
+            device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Validate packed geometry and derive segment/minimum-key indices."""
         segment_starts = None
         minimum_key_indices = None
         if packed_sequence is not None:
@@ -1247,94 +1263,125 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                     f"attention={(query_offset, sequence_length, global_sequence_length)}"
                 )
             packed_sequence.validate_compression_alignment(self.compress_ratio)
-            segment_starts = packed_sequence.local_segment_starts(hidden_states.device)
+            segment_starts = packed_sequence.local_segment_starts(device)
             if self.compress_ratio:
                 minimum_key_indices = segment_starts // self.compress_ratio
+        return segment_starts, minimum_key_indices
 
-        rope_type = "compress" if self.compress_ratio else "main"
-        cos, sin = position_embeddings[rope_type]
-        key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
-        query_residual, query = self._project_query(hidden_states, cos, sin)
-
-        compressed_handle = None
+    def _compute_compressed_kv(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
+            shared_state: "SharedCompressedAttentionState",
+            cp_context: "SharedCompressedAttentionCPContext | None",
+    ) -> tuple[torch.Tensor | None, "SequenceGatherHandle | None"]:
+        """Compress local hidden states and publish or launch the compressed KV."""
         latent = None
+        compressed_handle = None
         if self.is_kv_source:
             latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
             if cp_context is None:
                 shared_state.publish_compressed_kv(self.layer_idx, compressed)
             else:
                 compressed_handle = cp_context.launch(compressed, 1)
+        return latent, compressed_handle
 
-        indexer_output = None
-        if self.is_index_source:
-            index_key = (
-                None
-                if self.indexer.owns_key
-                else shared_state.require_index_key(self.kv_source_layer_idx, self.layer_idx)
+    def _run_indexer(
+            self,
+            hidden_states: torch.Tensor,
+            query_residual: torch.Tensor,
+            latent: torch.Tensor | None,
+            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
+            shared_state: "SharedCompressedAttentionState",
+            cp_context: "SharedCompressedAttentionCPContext | None",
+            tp_context: "SharedCompressedAttentionTPContext | None",
+            query_offset: int,
+            minimum_key_indices: torch.Tensor | None,
+    ) -> Any | None:
+        """Run the indexer on index-source layers and publish its outputs."""
+        if not self.is_index_source:
+            return None
+        index_key = (
+            None
+            if self.indexer.owns_key
+            else shared_state.require_index_key(self.kv_source_layer_idx, self.layer_idx)
+        )
+        candidate_blocks = (
+            shared_state.require_candidate_blocks(
+                self.candidate_source_layer_idx,
+                self.layer_idx,
             )
-            candidate_blocks = (
-                shared_state.require_candidate_blocks(
-                    self.candidate_source_layer_idx,
-                    self.layer_idx,
-                )
-                if self.indexer.uses_candidates else None
+            if self.indexer.uses_candidates else None
+        )
+        indexer_output = self.indexer(
+            hidden_states,
+            query_residual,
+            latent,
+            position_embeddings["compress"],
+            index_key=index_key,
+            candidate_blocks=candidate_blocks,
+            cp_context=cp_context,
+            tp_context=tp_context,
+            query_offset=query_offset,
+            minimum_key_indices=minimum_key_indices,
+        )
+        if self.indexer.owns_key:
+            shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
+        shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
+        if indexer_output.candidate_blocks is not None:
+            shared_state.publish_candidate_blocks(
+                self.layer_idx,
+                indexer_output.candidate_blocks,
             )
-            indexer_output = self.indexer(
-                hidden_states,
-                query_residual,
-                latent,
-                position_embeddings["compress"],
-                index_key=index_key,
-                candidate_blocks=candidate_blocks,
-                cp_context=cp_context,
-                tp_context=tp_context,
-                query_offset=query_offset,
-                minimum_key_indices=minimum_key_indices,
-            )
-            if self.indexer.owns_key:
-                shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
-            shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
-            if indexer_output.candidate_blocks is not None:
-                shared_state.publish_candidate_blocks(
-                    self.layer_idx,
-                    indexer_output.candidate_blocks,
-                )
+        return indexer_output
 
-        if raw_kv_handle is not None:
-            key_value = raw_kv_handle.wait()
-        if compressed_handle is not None:
-            shared_state.publish_compressed_kv(self.layer_idx, compressed_handle.wait())
-        if key_value is None:
-            raise RuntimeError("raw KV all-gather did not produce a tensor")
-
+    def _build_sparse_indices(
+            self,
+            shared_state: "SharedCompressedAttentionState",
+            key_value: torch.Tensor,
+            batch_size: int,
+            sequence_length: int,
+            device: torch.device,
+            query_offset: int,
+            global_sequence_length: int,
+            segment_starts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Assemble the sliding-window plus compressed sparse index sets."""
         window = build_sliding_window_indices(
             batch_size,
             sequence_length,
             self.sliding_window,
-            hidden_states.device,
+            device,
             query_offset=query_offset,
             key_length=global_sequence_length,
         )
         if segment_starts is not None:
             window.masked_fill_(window < segment_starts.unsqueeze(-1), -1)
         compressed_kv = None
-        if self.compress_ratio:
-            compressed_kv = shared_state.require_compressed_kv(
-                self.kv_source_layer_idx,
-                self.layer_idx,
-            )
-            topk_indices = shared_state.require_topk_indices(
-                self.index_source_layer_idx,
-                self.layer_idx,
-            )
-            combined_key_value = torch.cat((key_value, compressed_kv.unsqueeze(1)), dim=2)
-            compressed_indices = topk_indices.long() + global_sequence_length
-            compressed_indices.masked_fill_(topk_indices < 0, -1)
-            sparse_indices = torch.cat((window, compressed_indices), dim=-1)
-        else:
-            combined_key_value = key_value
-            sparse_indices = window
+        if not self.compress_ratio:
+            return key_value, window, None
+        compressed_kv = shared_state.require_compressed_kv(
+            self.kv_source_layer_idx,
+            self.layer_idx,
+        )
+        topk_indices = shared_state.require_topk_indices(
+            self.index_source_layer_idx,
+            self.layer_idx,
+        )
+        combined_key_value = torch.cat((key_value, compressed_kv.unsqueeze(1)), dim=2)
+        compressed_indices = topk_indices.long() + global_sequence_length
+        compressed_indices.masked_fill_(topk_indices < 0, -1)
+        sparse_indices = torch.cat((window, compressed_indices), dim=-1)
+        return combined_key_value, sparse_indices, compressed_kv
 
+    def _apply_indexer_loss(
+            self,
+            indexer_output: Any | None,
+            query: torch.Tensor,
+            compressed_kv: torch.Tensor | None,
+            tp_context: "SharedCompressedAttentionTPContext | None",
+    ) -> torch.Tensor:
+        """Auto-scale the query by the indexer KL loss when configured."""
         if (
                 indexer_output is not None
                 and self.training
@@ -1355,9 +1402,18 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 tp_context=tp_context,
             )
             query = aux_loss_auto_scale(query, indexer_loss)
+        return query
 
-        if self.use_optimized_sparse_attention and hidden_states.device.type == "npu":
-            attention_output = npu_sparse_attention_with_scalar_sink(
+    def _run_sparse_attention(
+            self,
+            query: torch.Tensor,
+            combined_key_value: torch.Tensor,
+            sparse_indices: torch.Tensor,
+            device: torch.device,
+    ) -> torch.Tensor:
+        """Dispatch to the enhanced NPU kernel or the reference implementation."""
+        if self.use_optimized_sparse_attention and device.type == "npu":
+            return npu_sparse_attention_with_scalar_sink(
                 query,
                 combined_key_value,
                 sparse_indices,
@@ -1365,14 +1421,23 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 self.rope_head_dim,
                 self.scaling,
             )
-        else:
-            attention_output = _reference_sparse_attention(
-                query,
-                combined_key_value,
-                sparse_indices,
-                self.sinks,
-                self.scaling,
-            )
+        return _reference_sparse_attention(
+            query,
+            combined_key_value,
+            sparse_indices,
+            self.sinks,
+            self.scaling,
+        )
+
+    def _project_output(
+            self,
+            attention_output: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            batch_size: int,
+            sequence_length: int,
+    ) -> torch.Tensor:
+        """Undo RoPE and apply the grouped low-rank output projection."""
         attention_output = _apply_v41_rope(attention_output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = attention_output.reshape(batch_size, sequence_length, self.num_groups, -1)
         hidden_per_group = grouped.shape[-1]
@@ -1383,7 +1448,87 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         flattened = grouped.reshape(-1, self.num_groups, hidden_per_group).transpose(0, 1)
         projected = torch.bmm(flattened, projection).transpose(0, 1)
         projected = projected.reshape(batch_size, sequence_length, -1)
-        return self.o_b_proj(projected), None
+        return self.o_b_proj(projected)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            past_key_values: Any | None = None,
+            **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Publish or consume compressed KV and execute indexed K=V attention."""
+        (
+            shared_state,
+            packed_sequence,
+            cp_context,
+            tp_context,
+            batch_size,
+            sequence_length,
+        ) = self._validate_forward_inputs(hidden_states, attention_mask, past_key_values, kwargs)
+        query_offset = 0
+        global_sequence_length = sequence_length
+        if cp_context is not None:
+            query_offset, global_sequence_length = self._validate_cp_inputs(
+                cp_context,
+                position_ids,
+                sequence_length,
+                self.compress_ratio,
+                self.is_kv_source,
+            )
+        segment_starts, minimum_key_indices = self._resolve_packed_geometry(
+            packed_sequence,
+            batch_size,
+            sequence_length,
+            query_offset,
+            global_sequence_length,
+            hidden_states.device,
+        )
+
+        rope_type = "compress" if self.compress_ratio else "main"
+        cos, sin = position_embeddings[rope_type]
+        key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
+        query_residual, query = self._project_query(hidden_states, cos, sin)
+        latent, compressed_handle = self._compute_compressed_kv(
+            hidden_states, position_embeddings, shared_state, cp_context
+        )
+        indexer_output = self._run_indexer(
+            hidden_states,
+            query_residual,
+            latent,
+            position_embeddings,
+            shared_state,
+            cp_context,
+            tp_context,
+            query_offset,
+            minimum_key_indices,
+        )
+
+        if raw_kv_handle is not None:
+            key_value = raw_kv_handle.wait()
+        if compressed_handle is not None:
+            shared_state.publish_compressed_kv(self.layer_idx, compressed_handle.wait())
+        if key_value is None:
+            raise RuntimeError("raw KV all-gather did not produce a tensor")
+
+        combined_key_value, sparse_indices, compressed_kv = self._build_sparse_indices(
+            shared_state,
+            key_value,
+            batch_size,
+            sequence_length,
+            hidden_states.device,
+            query_offset,
+            global_sequence_length,
+            segment_starts,
+        )
+        query = self._apply_indexer_loss(indexer_output, query, compressed_kv, tp_context)
+        attention_output = self._run_sparse_attention(
+            query, combined_key_value, sparse_indices, hidden_states.device
+        )
+        output = self._project_output(attention_output, cos, sin, batch_size, sequence_length)
+        return output, None
 
 
 @module_replacement

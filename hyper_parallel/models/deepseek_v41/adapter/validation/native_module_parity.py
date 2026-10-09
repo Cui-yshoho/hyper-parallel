@@ -625,19 +625,16 @@ def _reset_native_attention_state(native_model: Any) -> None:
     native_model.shared_attn.candidates = None
 
 
-def _run_attention_topology(
+def _build_attention_layers(
         native_model: Any,
-        target_device: torch.device,
-        dtype: torch.dtype,
-        tolerance: Tolerance,
-        name: str,
         ratios: tuple[int, ...],
         kv_sources: tuple[int, ...],
         index_sources: tuple[int, ...],
         candidate_source: int,
-) -> list[dict[str, Any]]:
-    """Compare one Full/Reuse/Reindex or ratio-one attention topology."""
-    cases: list[dict[str, Any]] = []
+        target_device: torch.device,
+        dtype: torch.dtype,
+) -> tuple[list[Any], list[DeepseekV41Attention]]:
+    """Construct and weight-match the native and HyperParallel attention stacks."""
     native_args = _native_attention_args(
         native_model, ratios, kv_sources, index_sources, candidate_source
     )
@@ -660,6 +657,104 @@ def _run_attention_topology(
         _fill_parameters(native, 301 + layer_index)
         _copy_attention_weights(native, hp)
         _cast_parameters(hp, target_device, dtype, ("sinks",))
+    return native_layers, hp_layers
+
+
+def _attention_tolerances(
+        dtype: torch.dtype,
+        target_device: torch.device,
+        tolerance: Tolerance,
+) -> tuple[Tolerance, Tolerance]:
+    """Select output and gradient tolerances for the dtype/device combination."""
+    if dtype == torch.bfloat16:
+        return Tolerance(8.0e-2, 8.0e-2), Tolerance(1.25, 1.0e-1)
+    if target_device.type == "npu":
+        # Ascend FP32 attention backward uses a different accumulation order
+        # from the independent CPU oracle while retaining sub-1e-6 relative L2.
+        return tolerance, Tolerance(1.25e-4, 2.0e-4)
+    return tolerance, tolerance
+
+
+def _compare_layer_shared_state(
+        cases: list[dict[str, Any]],
+        native_model: Any,
+        hp_state: SharedCompressedAttentionState,
+        hp: DeepseekV41Attention,
+        name: str,
+        ratios: tuple[int, ...],
+        layer_index: int,
+        kv_sources: tuple[int, ...],
+        index_sources: tuple[int, ...],
+        candidate_source: int,
+        tolerance: Tolerance,
+) -> None:
+    """Compare the cross-layer state published by one attention layer."""
+    if layer_index in kv_sources:
+        compressed_length = 8 // ratios[layer_index]
+        native_compressed = native_model.shared_attn.compress_kv[:2, :compressed_length]
+        _compare(
+            cases,
+            f"attention.{name}.layer{layer_index}.compressed_kv",
+            native_compressed,
+            hp_state.compressed_kv_by_source[layer_index],
+            tolerance,
+            0.0,
+        )
+        native_key = native_model.shared_attn.index_k[:2, :compressed_length]
+        _compare(
+            cases,
+            f"attention.{name}.layer{layer_index}.index_key",
+            native_key,
+            hp_state.index_key_by_source[layer_index],
+            tolerance,
+            0.0,
+        )
+    if layer_index in index_sources:
+        native_indices = native_model.shared_attn.topk_idxs
+        native_indices = torch.where(native_indices >= 0, native_indices - 8, native_indices)
+        _compare(
+            cases,
+            f"attention.{name}.layer{layer_index}.topk_indices",
+            native_indices,
+            hp_state.topk_indices_by_source[layer_index],
+            tolerance,
+            0.0,
+        )
+    if layer_index == candidate_source:
+        compact = hp_state.candidate_blocks_by_source[layer_index]
+        candidate_mask = _candidate_mask(compact, hp.indexer.candidate_block_size, 8 // ratios[layer_index])
+        _compare(
+            cases,
+            f"attention.{name}.layer{layer_index}.candidate_mask",
+            native_model.shared_attn.candidates,
+            candidate_mask,
+            tolerance,
+            0.0,
+        )
+
+
+def _run_attention_topology(
+        native_model: Any,
+        target_device: torch.device,
+        dtype: torch.dtype,
+        tolerance: Tolerance,
+        name: str,
+        ratios: tuple[int, ...],
+        kv_sources: tuple[int, ...],
+        index_sources: tuple[int, ...],
+        candidate_source: int,
+) -> list[dict[str, Any]]:
+    """Compare one Full/Reuse/Reindex or ratio-one attention topology."""
+    cases: list[dict[str, Any]] = []
+    native_layers, hp_layers = _build_attention_layers(
+        native_model,
+        ratios,
+        kv_sources,
+        index_sources,
+        candidate_source,
+        target_device,
+        dtype,
+    )
 
     generator = torch.Generator(device="cpu").manual_seed(310 + len(ratios))
     sources = [
@@ -672,15 +767,7 @@ def _run_attention_topology(
         for source in sources
     ]
     position_ids = torch.arange(8).unsqueeze(0).expand(2, -1)
-    output_tolerance = tolerance
-    gradient_tolerance = tolerance
-    if dtype == torch.bfloat16:
-        output_tolerance = Tolerance(8.0e-2, 8.0e-2)
-        gradient_tolerance = Tolerance(1.25, 1.0e-1)
-    elif target_device.type == "npu":
-        # Ascend FP32 attention backward uses a different accumulation order
-        # from the independent CPU oracle while retaining sub-1e-6 relative L2.
-        gradient_tolerance = Tolerance(1.25e-4, 2.0e-4)
+    output_tolerance, gradient_tolerance = _attention_tolerances(dtype, target_device, tolerance)
     _reset_native_attention_state(native_model)
     hp_state = SharedCompressedAttentionState()
     native_outputs = []
@@ -708,49 +795,19 @@ def _run_attention_topology(
             output_tolerance,
             elapsed_ms,
         )
-
-        if layer_index in kv_sources:
-            compressed_length = 8 // ratios[layer_index]
-            native_compressed = native_model.shared_attn.compress_kv[:2, :compressed_length]
-            _compare(
-                cases,
-                f"attention.{name}.layer{layer_index}.compressed_kv",
-                native_compressed,
-                hp_state.compressed_kv_by_source[layer_index],
-                tolerance,
-                0.0,
-            )
-            native_key = native_model.shared_attn.index_k[:2, :compressed_length]
-            _compare(
-                cases,
-                f"attention.{name}.layer{layer_index}.index_key",
-                native_key,
-                hp_state.index_key_by_source[layer_index],
-                tolerance,
-                0.0,
-            )
-        if layer_index in index_sources:
-            native_indices = native_model.shared_attn.topk_idxs
-            native_indices = torch.where(native_indices >= 0, native_indices - 8, native_indices)
-            _compare(
-                cases,
-                f"attention.{name}.layer{layer_index}.topk_indices",
-                native_indices,
-                hp_state.topk_indices_by_source[layer_index],
-                tolerance,
-                0.0,
-            )
-        if layer_index == candidate_source:
-            compact = hp_state.candidate_blocks_by_source[layer_index]
-            candidate_mask = _candidate_mask(compact, hp.indexer.candidate_block_size, 8 // ratios[layer_index])
-            _compare(
-                cases,
-                f"attention.{name}.layer{layer_index}.candidate_mask",
-                native_model.shared_attn.candidates,
-                candidate_mask,
-                tolerance,
-                0.0,
-            )
+        _compare_layer_shared_state(
+            cases,
+            native_model,
+            hp_state,
+            hp,
+            name,
+            ratios,
+            layer_index,
+            kv_sources,
+            index_sources,
+            candidate_source,
+            tolerance,
+        )
 
     torch.stack([output.float().sum() for output in native_outputs]).sum().backward()
     torch.stack([output.float().sum() for output in hp_outputs]).sum().backward()
