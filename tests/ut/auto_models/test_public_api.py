@@ -287,6 +287,7 @@ class TestOptimizerContracts(unittest.TestCase):
                 "Float16OptimizerWithFloat16Params",
                 "MixedPrecisionOptimizer",
                 "Muon",
+                "Sinkhorn",
                 "MultiLRScheduler",
                 "get_adamw_param_groups",
                 "get_parameter_names",
