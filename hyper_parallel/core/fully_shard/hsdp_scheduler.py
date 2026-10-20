@@ -15,6 +15,7 @@
 """HSDP scheduler"""
 import functools
 import inspect
+from collections import deque
 from typing import Any, Callable, List, Mapping, Optional, ParamSpec, Tuple, TypeVar, Union
 
 import torch
@@ -68,6 +69,21 @@ class ParamGroupCommCtx:
         self.comm_handle = None
 
 
+class PerParamCommCtx:
+    """Track non-fused gradient communication slots for one module tree.
+
+    Both queues advance in lockstep, including units with no gradients.
+    The root backward hook drains all remaining slots before applying grads.
+    """
+
+    def __init__(self) -> None:
+        """Initialize paired FIFO slots and pending all-reduce work."""
+        self.reduce_interval: int = 1
+        self.pre_reduce_scatter_params = deque()
+        self.pre_all_reduce_groups = deque()
+        self.all_reduce_work_groups = []
+
+
 class HSDPSchedulerContext:
     """Share scheduler and backward-pipeline state within one HSDP module tree."""
 
@@ -84,12 +100,8 @@ class HSDPSchedulerContext:
         self.all_hsdp_schedulers = []
         # Parameter FQNs are initialized once after all schedulers share this context.
         self._param_fqn_initialized = False
-        # Backward pipeline queues shared only by schedulers in this module tree.
-        self.pre_reduce_scatter_params = []
-        self.pre_all_reduce_params = []
-        self.pre_direct_all_reduce_grads = []
-        self.pre_all_reduce_groups = []
-        self.pending_all_reduce_groups = []
+        # Backward pipelines are shared only by schedulers in this module tree.
+        self.per_param_comm_ctx = PerParamCommCtx()
         self.param_group_comm_ctx = ParamGroupCommCtx()
 
 
@@ -219,11 +231,9 @@ class HSDPSchedulerV2:
     def reset_iter_state(self) -> None:
         """Reset scheduler bookkeeping after a completed iteration."""
         self.scheduler_ctx.root_bp_state = False
-        self.scheduler_ctx.pre_reduce_scatter_params.clear()
-        self.scheduler_ctx.pre_all_reduce_params.clear()
-        self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
-        self.scheduler_ctx.pre_all_reduce_groups.clear()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.clear()
         self.scheduler_ctx.param_group_comm_ctx.pre_param_group = None
         self.scheduler_ctx.param_group_comm_ctx.all_reduce_param_group = None
         self.scheduler_ctx.param_group_comm_ctx.comm_handle = None
@@ -597,11 +607,13 @@ class HSDPSchedulerV2:
             comm_ctx.all_reduce_param_group = None
 
     def _finalize_per_param_reductions(self) -> None:
-        """Drain the module-tree-local comm_fusion=False RS/AR queues."""
-        # A fused root may own non-fused children, so always drain the tree queues.
-        last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
-        self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
-        self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
+        """Drain every residual non-fused RS unit before applying gradients."""
+        while self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params:
+            reduce_scatter_params = self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.popleft()
+            all_reduce_groups = self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.popleft()
+            self.hsdp_state._wait_prev_reduce_scatter(all_reduce_groups)
+            self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce(reduce_scatter_params)
+            self.hsdp_state._issue_prev_fused_all_reduce(all_reduce_groups)
         self.hsdp_state.wait_and_split_all_reduce_work_groups()
 
     def launch_tp_replicate_reduce_and_apply(self) -> None:

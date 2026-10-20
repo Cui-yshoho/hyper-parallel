@@ -54,11 +54,17 @@ fully_shard(
 |------|------|
 | `model.set_modules_to_forward_prefetch(modules)` | 设置正向预取的模块列表 |
 | `model.set_modules_to_backward_prefetch(modules)` | 设置反向预取的模块列表 |
+| `model.set_reduce_comm_interval(interval)` | 在首次前向前设置梯度 ReduceScatter 的等待间隔，默认 1；间隔按非融合 FSDP 单元计数，不改变规约次数 |
 | `model.set_requires_gradient_sync(flag)` | 控制本次反向是否做梯度同步，用于梯度累积 |
 | `model.set_gradient_scaling_factor(factor)` | 设置梯度缩放因子 |
 | `model.set_reduce_op_type("avg" / "sum")` | 设置梯度归约算子类型，默认 `avg` |
 | `model.set_reshard_after_forward(flag)` | 运行期切换正向后是否 reshard |
 | `model.unshard()` / `model.reshard()` | 手动还原 / 重新切分参数 |
+
+`model.set_reduce_comm_interval(2)` 允许 ReduceScatter 与后续两个单元的反向计算重叠，再等待其结果。
+反向结束时 root hook 仍会等待所有未完成的规约并写回梯度；HSDP 的副本 AllReduce 在对应 ReduceScatter 完成后下发。
+更大的间隔会保留更多梯度通信 buffer，需要结合显存和通信时序验证。配置作用于 root 的整个模块树，必须在首次前向前设置。
+开启 `comm_fusion=True` 时，间隔固定为 1；请求大于 1 的值会产生警告并回退到 1。
 
 ---
 
