@@ -42,14 +42,13 @@ plan_overrides:
         allgather_group_size: 2
 ```
 
-`match` 匹配模型 `named_modules()` 给出的模块完整路径（FQN），采用大小写敏感的 glob，
-不是模块类型判断，也不是正则表达式。方法规则的末段 `forward` 是字面方法名，
-前面的宿主模块路径按 glob 匹配。`*` 可以跨越路径中的点，因此 `"*.self_attn.forward"` 会匹配
-`model.layers.0.self_attn.forward` 和 `model.layers.12.self_attn.forward`，但不匹配根级的 `self_attn.forward`；
-后者应写 `match: "self_attn.forward"`。模型同时包含 KDA 和其他注意力、且都使用 `self_attn` 名称时，
-应为实际 KDA 路径配置精确匹配或更窄的 glob，不能用该通配符自动识别 KDA。
-`when: cp` 表示仅在 CP 大于1时启用；`kind: method` 替换匹配模块自身的 forward，
-并默认使用 `region_dispatch: false`，让 wrapper 执行其本地张量路径。
+`replace.kind: method` 替换方法；`match` 写模块完整路径（FQN）加字面方法后缀 `.forward`。
+例如 `"*.self_attn.forward"` 匹配 `model.layers.0.self_attn.forward`；根级模块使用
+`"self_attn.forward"`。模块部分使用大小写敏感的 glob，`*` 可以跨越路径中的点，不能据此识别模块类型。
+模型同时包含 KDA 和其他注意力、且都使用 `self_attn` 名称时，应只匹配实际 KDA 层。
+`when: cp` 表示仅在 CP 大于1时启用；`region_dispatch: false` 让包含通信和自定义算子的
+替换方法执行本地张量路径。wrapper 及其参数写在 `replace.implementation` 下。
+该示例采用当前 Trainer 的方法替换接口，见 [YAML 配置说明](trainer/yaml_config.md)。
 
 上例在 CP8 下形成 U2、状态 CP4、组内 AG2 和两个组 owner 的 P2P 链。
 CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 CP 方式，完整方案还需结合
@@ -84,13 +83,13 @@ CP8 的常用组合：
 ## 输入与 mesh 约束
 
 - 当前融合 AG 路径面向 Ascend 上的 BF16 训练，key/value head 维度为 128，使用 lower-bounded gate。
-- 各 CP rank 的本地序列长度相同，Triton 路径要求完整的 64-token chunk。
+- 各 CP rank 的本地序列长度相同；融合算子使用 64-token chunk，定长序列与 TND 文档片段的末尾均可不足一个 chunk。
 - 使用一维 CP mesh，rank 自然递增且与序列顺序一致。可以传入根 mesh 的 CP 子 mesh，例如 DP×CP；
   不要求 CP 等于 WORLD，也不要求子组的全局 rank 连续。
 - 混合方式需要保留 CP 子 mesh 与根 mesh 的关联，以便一致地创建子组；不支持任意置换 rank，
   用于拆分的最终根 mesh 必须覆盖 WORLD；仅保留一个局部 root 仍不足以安全创建所有兄弟组。
 - ShortConv 在原始 CP 序列邻居之间交换 halo，之后才执行 Ulysses，保证卷积边界不随 head 重排而改变。
-- 当前入口不支持 packed/变长序列、推理缓存或同时启用 TP 和 CP。CP 不负责参数梯度归约，
+- 连续等长分片下的 packed/TND 输入见 [TND 上下文并行](linear_attention_tnd_cp.md)。不支持推理缓存或同时启用 TP 和 CP。CP 不负责参数梯度归约，
   训练仍需使用框架相应的数据并行与梯度管理配置。
 
 ## 显存与选择建议
