@@ -158,14 +158,15 @@ optimizer:
   _target_: torch.optim.AdamW
   lr: 1.0e-3
 plan_overrides:
-  - match: "*.linear_attn"
+  - match: "*.linear_attn.forward"
     when: cp
     region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
-      backend: triton
-      chunk_size: 64
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
+        backend: triton
+        chunk_size: 64
 """
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "qwen3_5_gdn_cp.yaml"
@@ -175,8 +176,8 @@ plan_overrides:
         entry = config.plan_overrides[0]
         self.assertEqual(entries_to_plan_overrides([entry], cp_size=1), {})
         active = entries_to_plan_overrides([entry], cp_size=4)
-        self.assertIs(active["*.linear_attn"].inner_wrapper, entry.inner_wrapper)
-        self.assertEqual(entry.inner_wrapper.backend, "triton")
+        self.assertIs(active["*.linear_attn"].inner_wrapper, entry.replace.implementation)
+        self.assertEqual(entry.replace.implementation.backend, "triton")
 
     def test_cp4_plan_derives_gdn_execution_boundary(self):
         """Planner derives the GDN boundary and preserves its CP injection."""

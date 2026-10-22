@@ -90,11 +90,13 @@ Enable the three adapters together through the V4.1 replacement:
 ```yaml
 plan_overrides:
   - match: "model.layers.*.self_attn"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
-    replace_module:
-      _target_: >-
-        hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-      use_fused_ops: true
+    replace:
+      kind: module
+      source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
+      implementation:
+        _target_: >-
+          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+        use_fused_ops: true
 ```
 
 `false` (default) uses the Torch reference implementation without this extension.

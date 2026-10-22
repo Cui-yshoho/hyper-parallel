@@ -265,6 +265,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "StressDetectConfig",
                 "OpStressDetectConfig",
                 "ModelStressDetectConfig",
+                "ReplaceAction",
                 "Target",
                 "TrainerConfig",
                 "TrainingConfig",

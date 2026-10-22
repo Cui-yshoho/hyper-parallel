@@ -204,15 +204,16 @@ optimizer:
   _target_: torch.optim.AdamW
   lr: 1.0e-3
 plan_overrides:
-  - match: "*.self_attn"
+  - match: "*.self_attn.forward"
     when: cp
     region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
-      backend: triton
-      state_cp_method: grouped_allgather_p2p
-      allgather_group_size: 2
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        backend: triton
+        state_cp_method: grouped_allgather_p2p
+        allgather_group_size: 2
 """
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "kda_cp.yaml"
@@ -222,16 +223,16 @@ plan_overrides:
         self.assertEqual(len(config.plan_overrides), 1)
         entry = config.plan_overrides[0]
         self.assertEqual(entry.when, "cp")
-        self.assertEqual(entry.inner_target, "self")
+        self.assertEqual(entry.to_override()[1].inner_target, "self")
         self.assertFalse(entry.region_dispatch)
-        self.assertEqual(entry.inner_wrapper.backend, "triton")
-        self.assertEqual(entry.inner_wrapper.state_cp_method, "grouped_allgather_p2p")
-        self.assertEqual(entry.inner_wrapper.allgather_group_size, 2)
-        self.assertFalse(hasattr(entry.inner_wrapper, "chunk_size"))
+        self.assertEqual(entry.replace.implementation.backend, "triton")
+        self.assertEqual(entry.replace.implementation.state_cp_method, "grouped_allgather_p2p")
+        self.assertEqual(entry.replace.implementation.allgather_group_size, 2)
+        self.assertFalse(hasattr(entry.replace.implementation, "chunk_size"))
         self.assertEqual(entries_to_plan_overrides([entry], cp_size=1), {})
         active = entries_to_plan_overrides([entry], cp_size=4)
         self.assertEqual(set(active), {"*.self_attn"})
-        self.assertIs(active["*.self_attn"].inner_wrapper, entry.inner_wrapper)
+        self.assertIs(active["*.self_attn"].inner_wrapper, entry.replace.implementation)
 
 
 class TestKimiK3CpWrapperContracts(unittest.TestCase):
