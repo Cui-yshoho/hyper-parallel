@@ -47,10 +47,11 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     get_model_conversion_mapping,
 )
 from hyper_parallel.core.distributed_checkpoint.api import load
-from hyper_parallel.core.distributed_checkpoint.hf_storage import HuggingFaceStorageReader
+from hyper_parallel.components.checkpoint.hf_storage import HuggingFaceStorageReader
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, TensorStorageMetadata
-from hyper_parallel.core.distributed_checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
+from hyper_parallel.components.checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
 from hyper_parallel.core.distributed_checkpoint.utils import all_gather_object, str_to_dtype
+from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.components.checkpoint.load_groups import (
     LoadGroup,
     LoadReport,
@@ -704,7 +705,9 @@ def load_hf_checkpoint(
         LoadReport: What was loaded, what is missing and what the checkpoint holds beyond the model.
     """
     location = resolve_checkpoint_location(pretrained_path)
-    reader = _SingleFileReader(location) if location.is_file() else HuggingFaceStorageReader(location)
+    reader = build_quantized_hf_reader(location)
+    if reader is None:
+        reader = _SingleFileReader(location) if location.is_file() else HuggingFaceStorageReader(location)
     if planner is None:
         planner = HFLoadPlanner(model, weights_mapping=weights_mapping, strict=strict)
     state_dict = planner.state_dict_for_load()

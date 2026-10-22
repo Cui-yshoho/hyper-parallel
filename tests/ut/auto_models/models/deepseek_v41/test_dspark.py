@@ -538,6 +538,50 @@ if __name__ == "__main__":
 class TestHFLayerCropConfig(unittest.TestCase):
     """Exercise the real config helpers after upstream crop API changes."""
 
+    def test_released_engram_assets_preserve_table_shapes(self) -> None:
+        """Feature: HF prefix crop with Engram.
+
+        Description: Retain an Engram layer with released-size Host hashing assets.
+        Expectation: Keep the original table shape and reject scaled assets.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source = json.loads(_write_released_config(directory).read_text(encoding="utf-8"))
+            text = source["text_config"]
+            text.update(engram_num_embeddings=[100000, 101000], engram_vocab_size=4096)
+            assets = {
+                "source_model_type": source["model_type"], "num_hidden_layers": text["num_hidden_layers"],
+                "layer_ids": text["engram_layer_ids"], "num_embeddings": text["engram_num_embeddings"],
+                "head_dim": text["engram_head_dim"], "bucket_base": text["engram_vocab_size"],
+                "table_pad_multiple": 1,
+            }
+            path = Path(directory) / "released_engram.json"
+            path.write_text(json.dumps(assets), encoding="utf-8")
+            destination = Path(directory) / "crop"
+            config = build_layer_cropped_config(
+                source, destination, text_layers=2, vision_layers=2,
+                engram_assets_path=str(path), engram_storage_backend="host",
+            )
+            self.assertEqual(config.v41_engram_layer_ids, [1], "The crop must retain the first Engram layer")
+            self.assertEqual(config.v41_engram_num_embeddings, [text["engram_num_embeddings"][0]],
+                             "HF loading must not resize the retained table")
+            self.assertEqual(config.engram_storage_backend, "host", "Host storage must reach the model config")
+            for field, value in (("head_dim", 1), ("bucket_base", 2), ("padded_num_embeddings", [1, 2])):
+                with self.subTest(field=field):
+                    path.write_text(json.dumps(dict(assets, **{field: value})), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "Released Engram assets"):
+                        build_layer_cropped_config(source, destination, text_layers=2, engram_assets_path=str(path))
+
+    def test_retained_engram_requires_released_assets(self) -> None:
+        """Feature: HF prefix crop with Engram.
+
+        Description: Request two decoder layers without released hashing metadata.
+        Expectation: Fail before constructing or reading a differently sized table.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source = json.loads(_write_released_config(directory).read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(ValueError, "released hashing assets"):
+                build_layer_cropped_config(source, Path(directory) / "crop", text_layers=2)
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_vision_depth_and_original_dimensions(self) -> None:

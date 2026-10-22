@@ -1,12 +1,16 @@
 # Validated eight-rank baseline; other training settings follow train_deepseek_v41_vlm_online.yaml.
-# Runtime layer crop: original widths, selected weights read directly from a full local BF16 HF directory.
-# Engram-specific overrides are omitted because the selected layer prefix has no Engram.
+# Runtime layer crop: original widths, selected weights read directly from local HF weights.
+# BF16/FP32 loads directly; native FP8/FP4 is decoded to BF16 during DCP reads, without an offline copy.
+# Retain original layer-1 Engram dimensions; the launcher generates its released hashing assets.
+# Host table plus SparseAdam moments require approximately 1.1 TiB of CPU memory across eight ranks.
 # Run with run_deepseek_v41_vlm_online_load_hf.sh; baseline saves checkpoints, without resume.
 model:
   _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_hf_layer_cropped_deepseek_v41
   pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash-BF16
-  text_layers: 1
+  text_layers: 2
   vision_layers: 2
+  engram_assets_path: /path/to/generated/engram_assets.json
+  engram_storage_backend: host
   load_base_model: true
   torch_dtype: bfloat16
   validate_placement: false
@@ -62,6 +66,21 @@ plan_overrides:
   module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
   replace_module:
     _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+- match: model.layers.*.engram
+  module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
+  replace_module:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
+- match: model.layers.*.engram
+  params:
+    q_weight: {tp: replicate}
+    k_weight: {tp: replicate}
+    embed.weight: {ep: 'shard(0)'}
+    wkv.weight: {tp: replicate}
+- match: model.layers.*.engram
+  when: ep
+  region_dispatch: false
+  local_compute_fn:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
 - match: '*.self_attn'
   tp_divide_attrs:
   - num_groups
@@ -209,6 +228,11 @@ dataloader:
 optimizer:
   _target_: hyper_parallel.components.optim.Muon
   fp32_main_params: true
+  swap:
+    enabled: true
+    swap_times: 16
+    min_numel: 1024
+    packed_swap: false
   no_decay_params:
   - bias
   - norm
@@ -239,7 +263,7 @@ checkpoint:
   checkpoint_dir: runs/deepseek_v41/vlm_load_hf/checkpoints
   save_steps: 10
   save_epochs: 1
-  is_async: true
+  is_async: false
   save_optimizer: true
   save_train_state: true
   save_extra_state_per_rank: true
