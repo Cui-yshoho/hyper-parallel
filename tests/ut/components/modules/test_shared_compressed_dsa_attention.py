@@ -25,6 +25,8 @@ from hyper_parallel.components.functional import sparse_flash_mla as attention_o
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
+from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
 
 
@@ -304,3 +306,114 @@ class TestNaturalDocumentCompression(unittest.TestCase):
         output.sum().backward()
         self.assertIsNotNone(key.grad)
         torch.testing.assert_close(key.grad, torch.zeros_like(key), rtol=0, atol=0)
+
+
+    def test_bsnd_natural_document_start_and_bank_offsets(self):
+        """Canonical K ID two belongs to raw document six, despite compact prefix routing."""
+        query = torch.zeros(1, 8, 2, 512, dtype=torch.bfloat16)
+        raw = torch.arange(3, 8, dtype=torch.bfloat16).view(1, 1, 5, 1).expand(1, 1, 5, 512).contiguous()
+        main = torch.arange(1, 3, dtype=torch.bfloat16).view(1, 2, 1).expand(1, 2, 512).contiguous()
+        indices = torch.full((1, 2, 1), 2, dtype=torch.int32)
+        with patch.object(attention_ops._SparseFlashMla, "apply") as native:  # pylint: disable=protected-access
+            attention_ops._bsnd_sparse_flash_mla(  # pylint: disable=protected-access
+                query, raw, main, indices, torch.zeros(8), 1., 2, 128, 6,
+                (0, 2, 2, 3, 0), raw_key_offset=3, main_key_offset=1, raw_document_starts=((0, 6),),
+            )
+        native_raw, native_main, selected = native.call_args.args[1:4]
+        torch.testing.assert_close(native_raw[:, :, 0], raw[:, 0, 3:5], rtol=0, atol=0)
+        torch.testing.assert_close(native_main[:, :, 0], main[:, 1:2], rtol=0, atol=0)
+        torch.testing.assert_close(selected, torch.zeros_like(selected), rtol=0, atol=0)
+        self.assertEqual(native_raw.stride(), (1024, 512, 512, 1))
+        self.assertEqual(native_main.stride(), (512, 512, 512, 1))
+
+    def test_tnd_natural_document_ranges_use_raw_coordinates(self):
+        """Packed native segments combine document-local raw ranges with compact K prefixes."""
+        query = torch.zeros(1, 8, 4, 512, dtype=torch.bfloat16)
+        raw = torch.arange(3, 8, dtype=torch.bfloat16).view(1, 1, 5, 1).expand(1, 1, 5, 512).contiguous()
+        main = torch.arange(1, 3, dtype=torch.bfloat16).view(1, 2, 1).expand(1, 2, 512).contiguous()
+        indices = torch.tensor([[[1], [1], [-1], [2]]], dtype=torch.int32)
+        with patch.object(attention_ops._SparseFlashMlaTND, "apply",  # pylint: disable=protected-access
+                          side_effect=lambda *args: args[0]) as native:
+            output = attention_ops.sparse_flash_mla(
+                query, raw, main, indices, torch.zeros(8), 1., 2, 128, 4,
+                ((0, 2, 1, 2, 1), (2, 4, 2, 3, 0)), raw_key_offset=3, main_key_offset=1,
+                raw_document_starts=((0, 3), (2, 6)),
+            )
+        native_raw, native_main = native.call_args.args[1:3]
+        torch.testing.assert_close(native_raw[:, 0], raw[0, 0], rtol=0, atol=0)
+        torch.testing.assert_close(native_main[:, 0], main[0], rtol=0, atol=0)
+        torch.testing.assert_close(output, query.transpose(1, 2), rtol=0, atol=0)
+
+    def test_fused_topk_width_uses_global_compact_key_count(self):
+        """Logical K is three for documents 3/3/2, even when this rank stores only two keys."""
+        source = _source(True)
+        source.compress_ratio = 2
+        module = attention.SharedCompressedDSAAttention(source, use_fused_ops=True)
+        query = torch.ones(1, 1, 4, 512)
+        bank = torch.ones(1, 2, 512)
+        indices = torch.full((1, 4, 3), -1, dtype=torch.int32)
+        with patch.object(attention, "supports_fused_attention_inputs", return_value=True):
+            with patch.object(attention, "sparse_flash_mla", return_value=query.transpose(1, 2)) as native:
+                output = module._run_sparse_attention(  # pylint: disable=protected-access
+                    query, query, bank, indices, 4, 8, None, ((0, 2, 1, 2, 1), (2, 4, 2, 3, 0)),
+                    raw_key_offset=3, main_key_offset=1, raw_document_starts=((0, 3), (2, 6)), global_key_length=3,
+                )
+        native.assert_called_once()
+        torch.testing.assert_close(output, query.transpose(1, 2), rtol=0, atol=0)
+
+
+class TestSharedCompressedCPPlans(unittest.TestCase):
+    """Check CPU-only configuration and document routing without operator packages."""
+
+    def test_balance_options(self):
+        """Greedy defaults to 2048; irrelevant or invalid options are rejected."""
+        self.assertEqual(attention.SharedCompressedDSAAttention(
+            _source(), indexer_load_balance="greedy").indexer_balance_block_size, 2048)
+        cases = (
+            ({"indexer_balance_block_size": 2048}, "requires indexer_load_balance"),
+            ({"indexer_load_balance": "zigzag", "indexer_balance_block_size": 2048}, "requires indexer"),
+            ({"indexer_load_balance": "hybrid"}, "explicit positive"),
+            ({"main_kv_comm": "invalid"}, "main_kv_comm"),
+        )
+        for options, message in cases:
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
+                attention.SharedCompressedDSAAttention(_source(), **options)
+
+    def test_task_coverage_and_row_budget(self):
+        """All real rows appear once, including leading zigzag remainders."""
+        lengths, size = (10, 182, 64), 8
+        ratio = 2
+        for mode in ("zigzag", "greedy", "hybrid"):
+            block = 8 if mode != "zigzag" else None
+            threshold = 128 if mode == "hybrid" else None
+            plan = indexer_task_plan(lengths, size, ratio, mode, block, threshold)
+            rows = [(task.document, row) for tasks in plan for task in tasks
+                    for row in range(task.start, task.end)]
+            self.assertEqual(sorted(rows), [(doc, row) for doc, length in enumerate(lengths)
+                                            for row in range(length)])
+            for rank, tasks in enumerate(plan):
+                route = indexer_route(lengths, size, rank, ratio, mode, block, threshold)
+                count = sum(task.length for task in tasks)
+                self.assertEqual(route.query_count, count)
+                self.assertLessEqual(count, 32 if mode == "zigzag" else 64)
+            routes = [indexer_route(lengths, size, rank, ratio, mode, block, threshold)
+                      for rank in range(size)]
+            for owner in range(size):
+                for worker in range(size):
+                    self.assertEqual(routes[owner].input_splits[worker], routes[worker].output_splits[owner])
+
+    def test_document_bank_routes(self):
+        """Halo and main-prefix routes match independently derived document bounds."""
+        boundaries, local, size = (0, 10, 192, 256), 32, 8
+        for ratio in (0, 1, 2):
+            routes = [sliding_window_route(boundaries, local, size, rank, 8) if ratio == 0
+                      else document_prefix_route(boundaries, local, size, rank, ratio) for rank in range(size)]
+            for rank, route in enumerate(routes):
+                document_start = max(start for start in boundaries if start <= rank * local)
+                expected_start = max(document_start, rank * local - 7) if ratio == 0 else document_start // ratio
+                self.assertEqual(route.global_start, expected_start)
+                self.assertEqual(route.global_end, (rank+1) * local // max(1, ratio))
+                for peer in range(size):
+                    self.assertEqual(route.input_splits[peer], routes[peer].output_splits[rank])
+        natural = document_prefix_route((0, 11, 256), local, size, 0, 2)
+        self.assertEqual((natural.global_start, natural.global_end), (0, 15))
