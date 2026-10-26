@@ -59,10 +59,8 @@ UnpermuteOutputs unpermute_grad_npu(const at::Tensor &tokens, const at::Tensor &
   auto contiguous_grad = grad.contiguous();
   const c10::optional<at::IntArrayRef> restore_shape = c10::nullopt;
   bool padded_mode = false;
-  static const hyper_parallel::multicore::CachedOpApi api(
-      "aclnnMoeTokenUnpermuteGrad", "aclnnMoeTokenUnpermuteGradGetWorkspaceSize");
-  hyper_parallel::multicore::execute_cached_op(
-      api, tokens, contiguous_grad, indices, probs, padded_mode, restore_shape, grad_tokens, grad_probs);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnMoeTokenUnpermuteGrad, tokens, contiguous_grad, indices, probs, padded_mode,
+                         restore_shape, grad_tokens, grad_probs);
   return {grad_tokens, grad_probs};
 }
 

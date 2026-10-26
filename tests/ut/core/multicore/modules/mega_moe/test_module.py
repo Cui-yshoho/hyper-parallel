@@ -25,8 +25,11 @@ import torch
 
 from hyper_parallel.core.multicore import _automatic, _collective
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
 
 
@@ -75,18 +78,24 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(build.call_count, 5)
 
     def test_resource_manifest_rejects_rank_configuration_mismatch(self) -> None:
-        """Static and dynamic ranks enter the same check before symmetric allocation."""
+        """Expert weight layout participates in the manifest before symmetric allocation."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
 
         def gather(output: list, value: Any, **kwargs: Any) -> None:
-            """Simulate a peer using another resource mode or capacity."""
+            """Simulate a peer whose only configuration difference is weight layout."""
             self.assertIs(kwargs["group"], resources.spec.ep_group)
-            output[:] = [value, ("different",)]
+            peer_specification = list(value[2][0])
+            self.assertEqual(peer_specification[-2], "EOI")
+            peer_specification[-2] = "EIO"
+            peer_manifest = (value[0], value[1], (tuple(peer_specification),))
+            output[:] = [value, peer_manifest]
 
         with patch.object(mega_moe_module.dist, "all_gather_object", side_effect=gather):
             with self.assertRaisesRegex(ValueError, "configurations differ"):
-                resources._validate_distributed_configuration(({"local_num_tokens": 128},))
+                resources._validate_distributed_configuration(
+                    ({"local_num_tokens": 128, "expert_weight_layout": "EOI"},)
+                )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -102,8 +111,70 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.addCleanup(experts.close)
         self.assertEqual((experts.dispatch_mode, experts.initial_capacity_factor, experts.capacity_growth_factor),
                          ("push", 1.25, 1.25))
-        mock_create_parameters.assert_called_once_with(2, 16, 8)
+        mock_create_parameters.assert_called_once_with(2, 16, 8, "EIO")
         self.assertIsNone(experts.swiglu_limit)
+
+    def test_eoi_layout_is_validated_and_propagated_to_native_graphs(self) -> None:
+        """Use Torch linear storage directly and transpose only native GMM interpretation."""
+        experts = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=12,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            ep_size=2,
+            expert_weight_layout="EOI",
+        ).to(dtype=torch.bfloat16)
+        self.addCleanup(experts.close)
+        self.assertEqual(tuple(experts.gate_up_weight.shape), (2, 16, 12))
+        self.assertEqual(tuple(experts.down_weight.shape), (2, 12, 8))
+        self.assertEqual(
+            experts._resource_group.specification["expert_weight_layout"],
+            "EOI",
+        )
+
+        topology = TaskSplitValue(tp=1, ep=2, all_expert_num=4, top_k=2, seq_size=128)
+        forward = build_forward_graph(
+            topology,
+            hidden_size=12,
+            intermediate_size=8,
+            expert_weight_layout="EOI",
+        )
+        backward = build_backward_graph(
+            topology,
+            hidden_size=12,
+            intermediate_size=8,
+            expert_weight_layout="EOI",
+        )
+        self.assertTrue(forward.get_op("up_proj").inputs[1].transpose)
+        self.assertTrue(forward.get_op("down_proj").inputs[1].transpose)
+        self.assertFalse(backward.get_op("act_grad").inputs[1].transpose)
+        self.assertFalse(backward.get_op("gate_grad").inputs[1].transpose)
+
+        hidden_states = SimpleNamespace(dtype=torch.bfloat16, is_npu=True, device=torch.device("cpu"))
+        noncontiguous_gate_up = torch.empty(2, 12, 16, dtype=torch.bfloat16).transpose(1, 2)
+        noncontiguous_down = torch.empty(2, 8, 12, dtype=torch.bfloat16).transpose(1, 2)
+        with self.assertRaisesRegex(ValueError, "EOI expert weights must be contiguous"):
+            experts._validate_tensors(hidden_states, (noncontiguous_gate_up, noncontiguous_down))
+
+    def test_eio_is_the_default_native_graph_layout(self) -> None:
+        """Keep the historical EIO operand shapes and transpose interpretation by default."""
+        topology = TaskSplitValue(tp=1, ep=2, all_expert_num=4, top_k=2, seq_size=128)
+        forward = build_forward_graph(topology, hidden_size=12, intermediate_size=8)
+        backward = build_backward_graph(topology, hidden_size=12, intermediate_size=8)
+
+        self.assertFalse(forward.get_op("up_proj").inputs[1].transpose)
+        self.assertFalse(forward.get_op("down_proj").inputs[1].transpose)
+        self.assertTrue(backward.get_op("act_grad").inputs[1].transpose)
+        self.assertTrue(backward.get_op("gate_grad").inputs[1].transpose)
+
+        for builder in (build_forward_graph, build_backward_graph):
+            with self.subTest(builder=builder.__name__):
+                with self.assertRaisesRegex(
+                    ValueError, "expert_weight_layout must be 'EIO' or 'EOI', got 'invalid'",
+                    msg=f"Expected invalid layout rejection from {builder.__name__}",
+                ):
+                    builder(topology, expert_weight_layout="invalid")
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_rejects_invalid_static_values_before_allocation(
@@ -117,6 +188,9 @@ class TestMegaMoeExperts(unittest.TestCase):
             ({"num_experts": 35}, "divisible"),
             ({"dispatch_mode": "invalid"}, "dispatch_mode"),
             ({"capacity_growth_factor": 0.999}, "capacity_growth_factor"),
+            ({"expert_weight_layout": "input_output"}, "must be 'EIO'"),
+            ({"expert_weight_layout": "output_input"}, "must be 'EIO'"),
+            ({"expert_weight_layout": "invalid"}, "must be 'EIO'"),
             ({"initial_capacity_factor": float("nan")}, "initial_capacity_factor"),
             ({"capacity_growth_factor": float("inf")}, "capacity_growth_factor"),
             ({"initial_capacity_factor": True}, "initial_capacity_factor"),
@@ -133,6 +207,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     num_experts=overrides.get("num_experts", 4),
                     dispatch_mode=overrides.get("dispatch_mode", "push"),
                     capacity_growth_factor=overrides.get("capacity_growth_factor"),
+                    expert_weight_layout=overrides.get("expert_weight_layout", "EIO"),
                     top_k=2,
                     initial_capacity_factor=overrides.get("initial_capacity_factor"),
                     ep_size=2,

@@ -154,7 +154,16 @@ def _allocate_backward_intermediates(
     reusable_dispatch: Any | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight2 = torch.zeros_like(weight2)
+    if spec.expert_weight_layout == "EOI":
+        grad_weight1 = weight1.new_zeros(
+            (spec.local_experts, spec.hidden_size, spec.intermediate_size * 2)
+        )
+        grad_weight2 = weight2.new_zeros(
+            (spec.local_experts, spec.intermediate_size, spec.hidden_size)
+        )
+    else:
+        grad_weight1 = torch.zeros_like(weight1)
+        grad_weight2 = torch.zeros_like(weight2)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -171,8 +180,21 @@ def _allocate_backward_intermediates(
         device=grad_output.device,
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
-    grad_weight1 = torch.zeros_like(weight1)
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
+
+
+def _restore_weight_gradient_layout(spec: Any, gradient: torch.Tensor) -> torch.Tensor:
+    """Return native weight gradients in the caller-selected physical layout."""
+    if spec.expert_weight_layout == "EOI":
+        return gradient.transpose(-2, -1)
+    return gradient
+
+
+def _native_weight_operand(weight: torch.Tensor, plan: MegaMoePlan) -> torch.Tensor:
+    """Prepare one expert operand without copying native EOI storage."""
+    if plan.spec.expert_weight_layout == "EOI":
+        return weight
+    return weight.contiguous()
 
 
 def _saved_backward_state(saved_tensors: tuple[Any, ...]) -> _SavedBackwardState:
@@ -599,11 +621,17 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None, None, None,
             ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            grad_weight1 = _restore_weight_gradient_layout(
+                plan.spec, execution.intermediates.grad_weight1
+            )
+            grad_weight2 = _restore_weight_gradient_layout(
+                plan.spec, execution.intermediates.grad_weight2
+            )
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
+                grad_weight1,
+                grad_weight2,
                 None,
                 None,
                 None,
@@ -627,8 +655,8 @@ def execute_mega_moe(
 
     Args:
         routed_tokens: Expert-major token rows.
-        weight1: Local gate and up-projection weights; noncontiguous layouts are copied.
-        weight2: Local down-projection weights; noncontiguous layouts are copied.
+        weight1: Local gate and up-projection weights in the plan-selected layout.
+        weight2: Local down-projection weights in the plan-selected layout.
         route: Route offsets, sizes and group metadata.
         plan: Shape-specific forward and backward descriptors.
         workspace: Reusable directional execution buffers.
@@ -636,9 +664,18 @@ def execute_mega_moe(
     Returns:
         Expert-major output rows with independent storage.
     """
-    # Record layout copies outside Function.forward so gradients reach the caller's original weights.
+    # Historical input-output views are materialized outside Function.forward so
+    # gradients reach the caller's original weights. Output-input storage is native.
     return _MegaMoeFunction.apply(
-        routed_tokens, weight1.contiguous(), weight2.contiguous(), route, plan, workspace, None, None, False,
+        routed_tokens,
+        _native_weight_operand(weight1, plan),
+        _native_weight_operand(weight2, plan),
+        route,
+        plan,
+        workspace,
+        None,
+        None,
+        False,
     )
 
 
@@ -659,8 +696,8 @@ def execute_mega_moe_with_permutation(
     Args:
         hidden_states: Original flattened token rows.
         topk_ids: Expert IDs used to prepare the routed rows.
-        weight1: Local gate and up-projection weights; noncontiguous layouts are copied.
-        weight2: Local down-projection weights; noncontiguous layouts are copied.
+        weight1: Local gate and up-projection weights in the plan-selected layout.
+        weight2: Local down-projection weights in the plan-selected layout.
         route: Rows and metadata prepared without recording autograd operations.
         plan: Shape-specific native descriptors.
         workspace: Reusable communication buffers.
@@ -674,8 +711,8 @@ def execute_mega_moe_with_permutation(
     """
     return _MegaMoeFunction.apply(
         hidden_states,
-        weight1.contiguous(),
-        weight2.contiguous(),
+        _native_weight_operand(weight1, plan),
+        _native_weight_operand(weight2, plan),
         route.metadata,
         plan,
         workspace,

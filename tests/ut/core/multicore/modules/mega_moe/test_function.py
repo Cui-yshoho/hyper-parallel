@@ -76,6 +76,40 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertEqual(tuple(placeholder.shape), (1, 4))
         self.assertNotEqual(placeholder.data_ptr(), 0)
 
+    def test_eoi_weight_operands_and_gradients_are_zero_copy_views(self) -> None:
+        """Native EOI operands retain storage and gradients restore caller orientation."""
+        spec = SimpleNamespace(
+            expert_weight_layout="EOI",
+            local_experts=2,
+            hidden_size=4,
+            intermediate_size=3,
+        )
+        plan = SimpleNamespace(spec=spec)
+        gate_up = torch.empty(2, 6, 4)
+        down = torch.empty(2, 4, 3)
+        self.assertIs(function_module._native_weight_operand(gate_up, plan), gate_up)
+        self.assertIs(function_module._native_weight_operand(down, plan), down)
+
+        gradients = function_module._allocate_backward_intermediates(
+            spec,
+            8,
+            torch.empty(8, 4),
+            gate_up,
+            down,
+        )
+        restored_gate_up = function_module._restore_weight_gradient_layout(
+            spec, gradients.grad_weight1
+        )
+        restored_down = function_module._restore_weight_gradient_layout(
+            spec, gradients.grad_weight2
+        )
+        self.assertEqual(tuple(restored_gate_up.shape), tuple(gate_up.shape))
+        self.assertEqual(tuple(restored_down.shape), tuple(down.shape))
+        self.assertEqual(
+            restored_gate_up.data_ptr(), gradients.grad_weight1.data_ptr()
+        )
+        self.assertEqual(restored_down.data_ptr(), gradients.grad_weight2.data_ptr())
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_backward_unpacks_saved_tensors_once(self) -> None:
@@ -150,7 +184,8 @@ class TestMegaMoeFunction(unittest.TestCase):
                                 vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
-                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2, dispatch_mode="push")
+                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
+                               dispatch_mode="push", expert_weight_layout="EIO")
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):

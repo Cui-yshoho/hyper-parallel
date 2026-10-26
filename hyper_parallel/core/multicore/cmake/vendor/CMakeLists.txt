@@ -49,3 +49,15 @@ npu_op_package(${package_name}
 
 add_subdirectory(op_host)
 add_subdirectory(op_kernel)
+
+# Conda compiler drivers may inject the active environment into every linked
+# library's RPATH.  CANN's packaging targets install outside CMAKE_INSTALL_PREFIX,
+# so target-level install-RPATH properties cannot remove it.  Sanitize the
+# staged vendor payload after those generated install rules have run.
+install(CODE "
+    file(GLOB_RECURSE hp_vendor_shared_libraries
+        \"${HP_VENDOR_STAGE_ROOT}/packages/vendors/hyper_parallel_multicore_nn/*.so\")
+    foreach(hp_vendor_library IN LISTS hp_vendor_shared_libraries)
+        file(RPATH_REMOVE FILE \"\${hp_vendor_library}\")
+    endforeach()
+")

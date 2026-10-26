@@ -15,107 +15,63 @@
 #ifndef HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 #define HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
 
+#include <mutex>
+
 #include "op_plugin/include/npu_cpp_extension.h"
 
 namespace hyper_parallel::multicore {
 
-// Construct one static instance per operator; never cache by argument signature alone.
-struct CachedOpApi {
-  using InitMemory = int (*)(void *, bool);
-  using MemoryCallback = void (*)(void *, bool);
-  using CacheCallback = void (*)();
-
-  CachedOpApi(const char *api_name, const char *workspace_name) : name(api_name) {
-    GetApiFunc(name, workspace_name, execute, workspace);
+/**
+ * Resolve one ACLNN operator's execution and workspace symbols exactly once.
+ *
+ * Each instance belongs to one HYPER_EXEC_NPU_CMD_EXT call site and one task
+ * queue branch. The caller-owned symbol slots and the resolved symbols must
+ * remain valid for the process lifetime. Concurrent first use is serialized;
+ * if GetApiFunc throws, a later call retries the resolution.
+ */
+class CachedOpApiResolver final {
+ public:
+  /**
+   * Populate one call site's symbol slots on its first invocation.
+   *
+   * @param api_name Null-terminated ACLNN execution symbol name.
+   * @param workspace_api_name Null-terminated workspace-query symbol name.
+   * @param execute Process-lifetime slot receiving the execution symbol.
+   * @param workspace Process-lifetime slot receiving the workspace symbol.
+   */
+  void operator()(const char *api_name, const char *workspace_api_name, void *&execute, void *&workspace) {
+    std::call_once(resolve_once_, [&]() { ::GetApiFunc(api_name, workspace_api_name, execute, workspace); });
   }
 
-  void init_context() const {
-    if (init_memory != nullptr) {
-      init_memory(nullptr, false);
-    }
-  }
-
-  void release_context() const {
-    if (release_memory != nullptr) {
-      release_memory(nullptr, false);
-    }
-  }
-
-  void uninit_context() const {
-    if (uninit_memory != nullptr) {
-      uninit_memory(nullptr, false);
-    }
-    if (uninit_cache != nullptr) {
-      uninit_cache();
-    }
-  }
-
-  const char *name;
-  void *execute = nullptr;
-  void *workspace = nullptr;
-  InitMemory init_memory = reinterpret_cast<InitMemory>(GetOpApiFuncAddr("InitHugeMemThreadLocal"));
-  MemoryCallback release_memory = reinterpret_cast<MemoryCallback>(GetOpApiFuncAddr("ReleaseHugeMem"));
-  MemoryCallback uninit_memory = reinterpret_cast<MemoryCallback>(GetOpApiFuncAddr("UnInitHugeMemThreadLocal"));
-  CacheCallback uninit_cache = reinterpret_cast<CacheCallback>(GetOpApiFuncAddr("UnInitPTACacheThreadLocal"));
+ private:
+  std::once_flag resolve_once_;
 };
 
-template <typename... Args>
-void execute_cached_op(const CachedOpApi &api, Args &...args) {
-  // Cache only process-lifetime symbols, using the same resolver as the extension bridge.
-  // Workspace, executor, converted parameters and contexts remain invocation/thread-local.
-  static const auto task_queue_enable = OpApiGetTaskQueueEnable();
-  auto stream = GetAclStream();
-  if (task_queue_enable == 2) {
-    auto copied_params = CopyTypesV2(args...);
-    auto cache_params = GetCacheParams();
-    auto acl_call = [api, copied_params, stream, cache_params]() -> int {
-      InitExecSubTheadCtx(stream);
-      int status = 0;
-      if (hit_cache_v2_ext(stream, api.name, api.execute, copied_params, &status, cache_params)) {
-        return status;
-      }
-      SetExecConfigV2(cache_params);
-      api.init_context();
-      uint64_t workspace_size = 0;
-      aclOpExecutor *executor = nullptr;
-      auto converted_params = ConvertTypesV2(copied_params, &workspace_size, &executor);
-      auto workspace_func = ConvertToOpApiFunc(converted_params, api.workspace);
-      auto workspace_status = call(workspace_func, converted_params);
-      TORCH_CHECK(workspace_status == 0, api.name, " workspace query failed: ", workspace_status);
-      status = ExecuteApiFuncV2(api.execute, stream, workspace_size, executor);
-      ReleaseConvertTypes(converted_params);
-      api.release_context();
-      api.uninit_context();
-      return status;
-    };
-    RunAclCall(api.name, acl_call);
-    return;
-  }
-  if (hit_cache_ext(stream, api.name, api.execute, args...)) {
-    return;
-  }
-  SetExecConfig();
-  api.init_context();
-  uint64_t workspace_size = 0;
-  aclOpExecutor *executor = nullptr;
-  auto *workspace_size_addr = &workspace_size;
-  auto **executor_addr = &executor;
-  auto converted_params = ConvertTypes(args..., workspace_size_addr, executor_addr);
-  auto workspace_func = ConvertToOpApiFunc(converted_params, api.workspace);
-  auto workspace_status = call(workspace_func, converted_params);
-  TORCH_CHECK(workspace_status == 0, api.name, " workspace query failed: ", workspace_status);
-  void *workspace_addr = GetWorkSpaceAddr(workspace_size);
-  auto acl_call = [api, converted_params, workspace_addr, workspace_size, stream, executor]() -> int {
-    InitExecSubTheadCtx(stream);
-    auto status = ExecuteApiFunc(api.execute, stream, workspace_addr, workspace_size, executor);
-    ReleaseConvertTypes(converted_params);
-    api.release_context();
-    return status;
-  };
-  RunAclCall(api.name, acl_call);
-  api.uninit_context();
-}
-
 }  // namespace hyper_parallel::multicore
+
+/**
+ * Execute an ACLNN operator through the native torch_npu extension bridge.
+ *
+ * The execution and workspace symbols are cached once per macro call site and
+ * independently for the V1 and V2 task queue paths. Argument conversion,
+ * workspace ownership, stream submission, cache lookup, and completion
+ * semantics remain those of EXEC_NPU_CMD_V1_EXT and EXEC_NPU_CMD_V2_EXT.
+ *
+ * @param aclnn_api Compile-time ACLNN execution symbol token.
+ * @param ... Arguments forwarded unchanged to the native extension bridge.
+ */
+#define HYPER_EXEC_NPU_CMD_EXT(aclnn_api, ...)                                       \
+  do {                                                                               \
+    const auto hyper_task_queue_enable = OpApiGetTaskQueueEnable();                  \
+    if (hyper_task_queue_enable == 2) {                                              \
+      static ::hyper_parallel::multicore::CachedOpApiResolver hyper_v2_api_resolver; \
+      auto &GetApiFunc = hyper_v2_api_resolver;                                      \
+      EXEC_NPU_CMD_V2_EXT(aclnn_api, __VA_ARGS__);                                   \
+    } else {                                                                         \
+      static ::hyper_parallel::multicore::CachedOpApiResolver hyper_v1_api_resolver; \
+      auto &GetApiFunc = hyper_v1_api_resolver;                                      \
+      EXEC_NPU_CMD_V1_EXT(aclnn_api, __VA_ARGS__);                                   \
+    }                                                                                \
+  } while (false)
 
 #endif  // HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_

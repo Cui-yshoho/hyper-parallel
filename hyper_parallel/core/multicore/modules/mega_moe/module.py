@@ -23,7 +23,7 @@ import struct
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,10 @@ from .spec import (
     _COMMUNICATION_SPLIT, _align_capacity, _resolve_capacity_factors, bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace
+
+
+ExpertWeightLayout = Literal["EIO", "EOI"]
+_EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -93,13 +97,20 @@ def _create_mega_moe_parameters(
     local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    expert_weight_layout: ExpertWeightLayout,
 ) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
     """Create independently initialized local expert parameters."""
+    if expert_weight_layout == "EOI":
+        gate_up_shape = (local_experts, intermediate_size * 2, hidden_size)
+        down_shape = (local_experts, hidden_size, intermediate_size)
+    else:
+        gate_up_shape = (local_experts, hidden_size, intermediate_size * 2)
+        down_shape = (local_experts, intermediate_size, hidden_size)
     gate_up_weight = torch.nn.Parameter(
-        torch.empty((local_experts, hidden_size, intermediate_size * 2))
+        torch.empty(gate_up_shape)
     )
     down_weight = torch.nn.Parameter(
-        torch.empty((local_experts, intermediate_size, hidden_size))
+        torch.empty(down_shape)
     )
     for expert_index in range(local_experts):
         torch.nn.init.xavier_uniform_(gate_up_weight[expert_index])
@@ -168,6 +179,7 @@ class _MegaMoeExecutionResources:
             "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
+            self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
         )
@@ -182,7 +194,7 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "ep_size")
+                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v1", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -246,6 +258,7 @@ class MegaMoeExperts(MulticoreModule):
         ep_size: int = 1,
         ep_group: Any | None = None,
         create_parameters: bool = True,
+        expert_weight_layout: ExpertWeightLayout = "EIO",
         dispatch_mode: str = "push",
         initial_capacity_factor: float | None = None,
         capacity_growth_factor: float | None = None,
@@ -278,6 +291,10 @@ class MegaMoeExperts(MulticoreModule):
                 preserves the legacy unclamped path.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
+            expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
+                ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
+                ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
+                must use dense contiguous storage for zero-copy execution.
             ep_group: Torch expert-parallel process group, possibly a subgroup of
                 WORLD. Expert ownership follows group-local rank order. Disjoint
                 PP/DP groups bootstrap independently; one process can have only
@@ -294,6 +311,7 @@ class MegaMoeExperts(MulticoreModule):
             "swiglu_limit": swiglu_limit,
             "ep_size": ep_size,
             "ep_group": ep_group,
+            "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
@@ -309,24 +327,41 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self._initialize_module_state(
+            specification,
+            local_num_tokens=local_num_tokens,
+            max_local_num_tokens=max_local_num_tokens,
+            create_parameters=create_parameters,
+        )
+
+    def _initialize_module_state(
+        self,
+        specification: Mapping[str, Any],
+        *,
+        local_num_tokens: int | None,
+        max_local_num_tokens: int | None,
+        create_parameters: bool,
+    ) -> None:
+        """Bind normalized configuration and initialize expert parameters."""
         self.local_num_tokens = local_num_tokens
         self.max_local_num_tokens = max_local_num_tokens
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_experts = num_experts
-        self.top_k = top_k
+        self.hidden_size = specification["hidden_size"]
+        self.intermediate_size = specification["intermediate_size"]
+        self.num_experts = specification["num_experts"]
+        self.top_k = specification["top_k"]
+        self.expert_weight_layout = specification["expert_weight_layout"]
         self.initial_capacity_factor = specification["initial_capacity_factor"]
         self.capacity_growth_factor = specification["capacity_growth_factor"]
-        self.dispatch_mode = dispatch_mode
-        self.dispatch_split = dispatch_split
-        self.combine_split = combine_split
+        self.dispatch_mode = specification["dispatch_mode"]
+        self.dispatch_split = specification["dispatch_split"]
+        self.combine_split = specification["combine_split"]
         self.swiglu_limit = specification["swiglu_limit"]
-        self.ep_size = ep_size
-        self.local_experts = num_experts // ep_size
-        self._ep_group = ep_group
+        self.ep_size = specification["ep_size"]
+        self.local_experts = self.num_experts // self.ep_size
+        self._ep_group = specification["ep_group"]
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
-                self.local_experts, hidden_size, intermediate_size,
+                self.local_experts, self.hidden_size, self.intermediate_size, self.expert_weight_layout,
             )
         else:
             self.register_parameter("gate_up_weight", None)
@@ -335,6 +370,13 @@ class MegaMoeExperts(MulticoreModule):
     @classmethod
     def _resolve_specification(cls, specification: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize configuration before registering an execution owner."""
+        expert_weight_layout = specification["expert_weight_layout"]
+        if expert_weight_layout not in _EXPERT_WEIGHT_LAYOUTS:
+            raise ValueError(
+                "expert_weight_layout must be 'EIO' ([experts, in_features, out_features]) "
+                "or 'EOI' ([experts, out_features, in_features]), "
+                f"got {expert_weight_layout!r}."
+            )
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             specification["dispatch_mode"],
             specification["initial_capacity_factor"],
@@ -412,16 +454,12 @@ class MegaMoeExperts(MulticoreModule):
         weight1, weight2 = expert_weights
         if weight1 is None or weight2 is None:
             raise ValueError("Parameterless MegaMoe requires explicit expert_weights")
-        expected_weight1 = (
-            self.local_experts,
-            self.hidden_size,
-            self.intermediate_size * 2,
-        )
-        expected_weight2 = (
-            self.local_experts,
-            self.intermediate_size,
-            self.hidden_size,
-        )
+        if self.expert_weight_layout == "EOI":
+            expected_weight1 = (self.local_experts, self.intermediate_size * 2, self.hidden_size)
+            expected_weight2 = (self.local_experts, self.hidden_size, self.intermediate_size)
+        else:
+            expected_weight1 = (self.local_experts, self.hidden_size, self.intermediate_size * 2)
+            expected_weight2 = (self.local_experts, self.intermediate_size, self.hidden_size)
         if tuple(weight1.shape) != expected_weight1:
             raise ValueError(
                 f"gate_up_weight must have shape {expected_weight1}, got {tuple(weight1.shape)}."
@@ -439,6 +477,10 @@ class MegaMoeExperts(MulticoreModule):
             )
         if weight1.dtype != hidden_states.dtype or weight2.dtype != hidden_states.dtype:
             raise TypeError("expert weights and hidden states must all use BF16.")
+        if self.expert_weight_layout == "EOI" and (
+            not weight1.is_contiguous() or not weight2.is_contiguous()
+        ):
+            raise ValueError("EOI expert weights must be contiguous for zero-copy execution.")
 
     def _validate_forward_inputs(
         self,
@@ -495,13 +537,17 @@ class MegaMoeExperts(MulticoreModule):
             hidden_states: Tensor ending in ``hidden_size``.
             topk_ids: Global expert IDs shaped ``[local_num_tokens, top_k]``.
             topk_weights: Router weights with the same shape as ``topk_ids``.
-            expert_weights: Current unsharded weights owned by an outer module; noncontiguous
-                layouts are copied with autograd tracking, never cached by this executor.
+            expert_weights: Current unsharded weights owned by an outer module.
+                Noncontiguous EIO weights are copied with autograd tracking, never cached
+                by this executor. EOI weights must be contiguous for zero-copy execution.
             tokens_per_expert: Optional trusted exact global-expert histogram.
                 Supplying Router-produced counts skips histogram recomputation.
 
         Returns:
             Tensor matching the shape and dtype of ``hidden_states``.
+
+        Raises:
+            ValueError: EOI expert weights are noncontiguous.
 
         Note:
             ``tokens_per_expert`` must describe the current ``topk_ids`` exactly.
