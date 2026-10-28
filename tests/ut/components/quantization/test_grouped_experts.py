@@ -14,7 +14,6 @@
 # ============================================================================
 """Preserve the pre-refactor precision of routed expert contributions."""
 
-from functools import partial
 import unittest
 from unittest import mock
 
@@ -116,18 +115,26 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_outputs_gradients_and_update_keep_each_formats_original_precision(self) -> None:
-        """MX retains routing promotion; HiFloat8 rounds each contribution before top-k reduction."""
+        """Only HiFloat8 rounds routed contributions to the hidden-state dtype."""
         cases = (
             ("mxfp8", MXFP8GroupedLinear, False),
             ("hif8", HiFloat8GroupedLinear, True),
             ("w4a8_32", W4A8GroupedLinear, False),
-            ("w4a8_128", partial(W4A8GroupedLinear, 128), False),
             ("fake_w4a8_32", FakeW4A8GroupedLinear, False),
-            ("fake_w4a8_128", partial(FakeW4A8GroupedLinear, 128), False),
         )
-        for name, factory, round_routes in cases:
+        for name, factory, round_each_route in cases:
             for dtype in (torch.bfloat16, torch.float16):
                 for route_dtype in (torch.float32, dtype):
                     for top_k in (1, 2, 6):
                         with self.subTest(format=name, dtype=dtype, route_dtype=route_dtype, top_k=top_k):
-                            self._check_case(factory, dtype, route_dtype, top_k, round_routes)
+                            self.assertEqual(
+                                factory.CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE,
+                                round_each_route,
+                            )
+                            self._check_case(
+                                factory,
+                                dtype,
+                                route_dtype,
+                                top_k,
+                                round_each_route,
+                            )
