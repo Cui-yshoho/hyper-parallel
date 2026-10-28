@@ -87,6 +87,7 @@ def prepare_deepseek_v41_assets(
         bucket_base: int = 4096,
         parameter_divisor: int = 4,
         table_pad_multiple: int = 16,
+        released: bool = False,
 ) -> None:
     """Create local-only assets for the depth-preserving parameter crop.
 
@@ -97,6 +98,7 @@ def prepare_deepseek_v41_assets(
         parameter_divisor: Divisor for the Engram embedding dimension. It must
             match the text parameter divisor used by the model builder.
         table_pad_multiple: Stable row-count multiple for EP resharding.
+        released: Preserve official table rows and width for pretrained HF loading.
 
     Raises:
         ValueError: If the source assets are not DeepSeek-V4.1 or the requested
@@ -112,6 +114,10 @@ def prepare_deepseek_v41_assets(
         raise ValueError("parameter_divisor must be positive")
 
     text_config = source_config["text_config"]
+    if released:
+        bucket_base = int(text_config["engram_vocab_size"])
+        parameter_divisor = 1
+        table_pad_multiple = 1
     released_hidden_layers = int(text_config["num_hidden_layers"])
     released_head_dim = int(text_config["engram_head_dim"])
     if released_head_dim % parameter_divisor:
@@ -126,6 +132,8 @@ def prepare_deepseek_v41_assets(
         max_ngram_size=text_config["engram_max_ngram_size"],
         num_heads=text_config["engram_n_heads"],
     )
+    if released and table_sizes != text_config["engram_num_embeddings"]:
+        raise ValueError("Reconstructed Engram hash buckets do not match the released checkpoint table rows")
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_dir),
         local_files_only=True,
@@ -179,11 +187,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bucket-base", type=int, default=4096)
     parser.add_argument("--parameter-divisor", type=int, default=4)
     parser.add_argument("--table-pad-multiple", type=int, default=16)
+    parser.add_argument("--released", action="store_true", help="Use official table dimensions for HF weight loading")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Prepare the requested local assets."""
+    """Prepare the requested local assets.
+
+    Args:
+        argv: Optional command-line arguments; defaults to process arguments.
+    """
     args = _parse_args(argv)
     prepare_deepseek_v41_assets(
         Path(args.model_dir).expanduser().resolve(),
@@ -191,6 +204,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         bucket_base=args.bucket_base,
         parameter_divisor=args.parameter_divisor,
         table_pad_multiple=args.table_pad_multiple,
+        released=args.released,
     )
 
 

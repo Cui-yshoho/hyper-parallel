@@ -31,6 +31,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models._transformers import HyperAutoModelForCausalLM, HyperAutoModelForImageTextToText
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.components.checkpoint.quantized_hf_storage import validate_quantization_config
 
 
 def _scaled_dimension(value: int, divisor: int, field_name: str) -> int:
@@ -612,20 +613,43 @@ def _run_validation_model_builder(
     )
 
 
+def _released_engram_assets(source: dict[str, Any], assets_path: str) -> dict[str, Any]:
+    """Reject scaled hashing assets when loading released Engram table weights."""
+    assets = json.loads(Path(assets_path).expanduser().read_text(encoding="utf-8"))
+    text = source["text_config"]
+    expected = {
+        "source_model_type": source["model_type"],
+        "num_hidden_layers": text["num_hidden_layers"],
+        "layer_ids": text["engram_layer_ids"],
+        "num_embeddings": text["engram_num_embeddings"],
+        "head_dim": text["engram_head_dim"],
+        "bucket_base": text["engram_vocab_size"],
+    }
+    for name, value in expected.items():
+        if assets.get(name) != value:
+            raise ValueError(f"Released Engram assets mismatch for {name}: expected {value}, got {assets.get(name)}")
+    if assets.get("padded_num_embeddings", assets["num_embeddings"]) != assets["num_embeddings"]:
+        raise ValueError("Released Engram assets must preserve checkpoint table row counts")
+    return assets
+
+
 def build_layer_cropped_config(
         source: dict[str, Any], destination: Path, *, text_layers: int = 1, vision_layers: int = 2,
+        engram_assets_path: str | None = None, engram_storage_backend: str = "device",
 ) -> Any:
     """Translate a released config, retaining a dependency-closed layer prefix.
 
     All parameter dimensions, expert counts, routing top-k, and modality widths
-    retain their released values. Prefixes containing Engram require released
-    hashing assets and are deliberately rejected by this initial smoke builder.
+    retain their released values. Prefixes containing Engram require matching
+    released hashing assets, rather than the scaled assets of a random-init crop.
 
     Args:
         source: Official composite DeepSeek-V4.1 configuration.
-        destination: Directory for the translated config and empty Engram assets.
+        destination: Directory for the translated config and its Engram assets.
         text_layers: Number of original decoder prefix layers to retain.
         vision_layers: Number of original vision prefix layers; zero disables vision.
+        engram_assets_path: Released-size hashing assets required by retained Engram layers.
+        engram_storage_backend: Keep Engram tables on the device or their EP owners' hosts.
 
     Returns:
         Translated configuration accepted by the production model class.
@@ -640,12 +664,14 @@ def build_layer_cropped_config(
     if not 0 <= vision_layers <= vision["num_hidden_layers"]:
         raise ValueError("vision_layers must select a prefix of the released vision tower")
     retained_engram = [layer for layer in text["engram_layer_ids"] if layer < text_layers]
-    if retained_engram:
+    if retained_engram and engram_assets_path is None:
         raise ValueError(f"Retained Engram layers require released hashing assets: {retained_engram}")
     destination.mkdir(parents=True, exist_ok=True)
     assets = {"source_model_type": source["model_type"], "num_hidden_layers": text_layers,
               "layer_ids": [], "num_embeddings": [], "head_dim": text["engram_head_dim"],
               "bucket_base": text["engram_vocab_size"], "table_pad_multiple": 1}
+    if retained_engram:
+        assets = _released_engram_assets(source, engram_assets_path)
     assets_path = (destination / "engram_assets.json").resolve()
     assets_path.write_text(json.dumps(assets, indent=2), encoding="utf-8")
     # Share the model-owned translation while selecting divisor one; independent
@@ -660,6 +686,7 @@ def build_layer_cropped_config(
         config.v41_candidate_topk_blocks = 0
     config.v41_dspark_depth = 0
     config.v41_dspark_target_layer_ids = []
+    _apply_engram_host_fields(config, engram_storage_backend, 1000000, 1000000, None)
     _apply_v41_vision_fields(
         config, source, enable_vision=vision_layers > 0,
         vision_num_hidden_layers=vision_layers if vision_layers > 0 else None, vision_parameter_divisor=1,
@@ -705,30 +732,58 @@ def select_layer_crop_parameters(
     return selected
 
 
+def _write_hf_crop_index(source: Path, view: Path, selected: dict[str, str], quantization: Any) -> None:
+    """Link selected source shards and record their physical tensor byte sizes."""
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in selected.items():
+        by_shard.setdefault(shard, []).append(name)
+    total_size = 0
+    for number, (shard, shard_names) in enumerate(by_shard.items()):
+        path = (source / shard).resolve()
+        with safe_open(str(path), framework="pt", device="cpu") as reader:
+            for name in shard_names:
+                tensor_slice = reader.get_slice(name)
+                dtype = tensor_slice.get_dtype()
+                if not quantization and dtype not in ("BF16", "F32"):
+                    raise ValueError(f"Expected BF16/FP32 source parameter: {name}")
+                bytes_per_element = {"BF16": 2, "F32": 4}.get(dtype, 1)
+                total_size += math.prod(tensor_slice.get_shape()) * bytes_per_element
+        link = view / f"source-{number:05d}.safetensors"
+        link.symlink_to(path)
+        for name in shard_names:
+            selected[name] = link.name
+    (view / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": total_size}, "weight_map": selected}), encoding="utf-8")
+
+
 def build_hf_layer_cropped_deepseek_v41(
         pretrained_model_name_or_path: str, *, text_layers: int = 1, vision_layers: int = 2,
+        engram_assets_path: str | None = None, engram_storage_backend: str = "device",
         **kwargs: Any,
 ) -> Any:
-    """Build a prefix crop at runtime and load its weights from a local BF16 HF directory.
+    """Build a prefix crop and load local floating-point or native quantized HF weights.
 
     Args:
-        pretrained_model_name_or_path: Full BF16 weights with the official composite config.
+        pretrained_model_name_or_path: HF weights with the official composite config.
         text_layers: Number of decoder prefix layers to retain, without resizing parameters.
         vision_layers: Number of visual prefix layers to retain.
+        engram_assets_path: Released-size hashing assets for a prefix containing Engram.
+        engram_storage_backend: Storage backend of retained Engram tables.
         **kwargs: Forwarded HyperAutoModel build and parallelization options.
 
     Returns:
         Parallelized model loaded through the HF checkpointer.
 
     Raises:
-        ValueError: The input is quantized or incompatible with this prefix crop.
+        ValueError: The input format or requested prefix crop is unsupported.
     """
     source = Path(pretrained_model_name_or_path).expanduser().resolve()
     official = json.loads((source / "config.json").read_text(encoding="utf-8"))
     if official.get("model_type") != "deepseek_v41" or "text_config" not in official:
         raise ValueError("Expected full HF weights with the official composite DeepSeek-V4.1 config")
-    if official.get("quantization_config"):
-        raise ValueError("Convert the input weights to BF16 before runtime layer cropping")
+    quantization = official.get("quantization_config")
+    if quantization:
+        validate_quantization_config(quantization)
     index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
     names = select_layer_crop_parameters(list(index["weight_map"]),
                                          text_layers=text_layers, vision_layers=vision_layers)
@@ -737,27 +792,22 @@ def build_hf_layer_cropped_deepseek_v41(
     # Each rank owns a tiny temporary view; weight files remain in the original directory.
     with tempfile.TemporaryDirectory(prefix="deepseek_v41_hf_crop_") as temporary:
         view = Path(temporary)
-        build_layer_cropped_config(official, view, text_layers=text_layers, vision_layers=vision_layers)
+        config = build_layer_cropped_config(
+            official, view, text_layers=text_layers, vision_layers=vision_layers,
+            engram_assets_path=engram_assets_path, engram_storage_backend=engram_storage_backend,
+        )
+        if quantization:
+            config.quantization_config = quantization
+            config.save_pretrained(view)
         selected = {name: index["weight_map"][name] for name in names}
-        by_shard: dict[str, list[str]] = {}
-        for name, shard in selected.items():
-            by_shard.setdefault(shard, []).append(name)
-        total_size = 0
-        for number, (shard, shard_names) in enumerate(by_shard.items()):
-            path = (source / shard).resolve()
-            with safe_open(str(path), framework="pt", device="cpu") as reader:
-                for name in shard_names:
-                    tensor_slice = reader.get_slice(name)
-                    dtype = tensor_slice.get_dtype()
-                    if dtype not in ("BF16", "F32"):
-                        raise ValueError(f"Expected BF16/FP32 source parameter: {name}")
-                    total_size += math.prod(tensor_slice.get_shape()) * (2 if dtype == "BF16" else 4)
-            link = view / f"source-{number:05d}.safetensors"
-            link.symlink_to(path)
-            for name in shard_names:
-                selected[name] = link.name
-        (view / "model.safetensors.index.json").write_text(
-            json.dumps({"metadata": {"total_size": total_size}, "weight_map": selected}), encoding="utf-8")
+        if quantization:
+            for name in names:
+                if name.endswith("weight"):
+                    for suffix in ("scale", "weight_scale_inv"):
+                        scale_name = name[:-6] + suffix
+                        if scale_name in index["weight_map"]:
+                            selected[scale_name] = index["weight_map"][scale_name]
+        _write_hf_crop_index(source, view, selected, quantization)
         kwargs.setdefault("attn_implementation", "eager")
         return HyperAutoModelForImageTextToText.from_pretrained(str(view), **kwargs)
 

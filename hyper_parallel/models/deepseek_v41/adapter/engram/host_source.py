@@ -36,6 +36,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
     resolve_checkpoint_index,
 )
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.models.external_state import ExternalLoadContext
 
 
@@ -149,9 +150,11 @@ def materialize_owner_rows(model: nn.Module, tables: Mapping[str, HostEngramTabl
     source_by_target = {}
     manifest_root = None
     manifest = {}
+    quantized_reader = None
     if context.load_base_model and tables:
         index = resolve_checkpoint_index(context.pretrained_path)
         manifest_root, manifest = _row_manifest(index)
+        quantized_reader = build_quantized_hf_reader(manifest_root)
         targets = frozenset(f"{fqn}.weight" for fqn in tables)
         source_by_target = _host_source_keys(
             model, index, manifest, context.weights_mapping, targets,
@@ -164,12 +167,21 @@ def materialize_owner_rows(model: nn.Module, tables: Mapping[str, HostEngramTabl
             source_key = source_by_target[target]
             if source_key in manifest:
                 rows = _read_manifest_rows(manifest_root, source_key, manifest[source_key], table)
+            elif quantized_reader is not None:
+                metadata = quantized_reader.load_metadata().state_dict_metadata[source_key]
+                if metadata.size != (table.physical_rows, table.width):
+                    raise ValueError(f"Host Engram source shape mismatch: {target}")
+                rows = quantized_reader.read_region(
+                    source_key, (table.global_row_start, 0), (table.rows_per_owner, table.width),
+                ).float()
             else:
                 with safe_open(str(index.files_by_key[source_key]), framework="pt", device="cpu") as source:
                     tensor_slice = source.get_slice(source_key)
                     if tuple(tensor_slice.get_shape()) != (table.physical_rows, table.width):
                         raise ValueError(f"Host Engram source shape mismatch: {target}")
-                    rows = tensor_slice[table.global_row_start:table.global_row_start + table.rows_per_owner]
+                    if tensor_slice.get_dtype() not in ("BF16", "F32"):
+                        raise ValueError(f"Host Engram source requires BF16/FP32 weights: {target}")
+                    rows = tensor_slice[table.global_row_start:table.global_row_start + table.rows_per_owner].float()
             source_keys.add(source_key)
         if rows.dtype != torch.float32 or tuple(rows.shape) != tuple(table.weight.shape):
             raise ValueError(f"Host Engram source dtype or local shape mismatch: {target}")
