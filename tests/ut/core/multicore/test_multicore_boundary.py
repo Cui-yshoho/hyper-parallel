@@ -16,9 +16,13 @@
 """Verify component exports and absence of framework dispatch."""
 
 import ast
+import os
+import re
+import subprocess
 import sys
-from pathlib import Path
+import tempfile
 import unittest
+from pathlib import Path
 
 import hyper_parallel
 from hyper_parallel.core import multicore
@@ -27,6 +31,74 @@ from tests.common.mark_utils import arg_mark
 
 class TestMulticoreBoundary(unittest.TestCase):
     """Check the component contract without initializing a native runtime."""
+
+    @staticmethod
+    def _run_cmake_project(
+        cmake_lists: str,
+        files: dict[str, str],
+        *,
+        build: bool = True,
+        executable_files: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        """Configure and optionally build a temporary CMake project."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source_root = Path(temporary_directory) / "source"
+            build_root = Path(temporary_directory) / "build"
+            source_root.mkdir()
+            (source_root / "CMakeLists.txt").write_text(cmake_lists, encoding="utf-8")
+            for relative_path, content in files.items():
+                path = source_root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            for relative_path in executable_files:
+                (source_root / relative_path).chmod(0o755)
+
+            configure_result = subprocess.run(
+                ["cmake", "-S", str(source_root), "-B", str(build_root)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "TORCH_INSTALL_PREFIX": str(source_root / "polluted")},
+            )
+            if configure_result.returncode != 0 or not build:
+                return configure_result
+
+            build_result = subprocess.run(
+                ["cmake", "--build", str(build_root), "--parallel", "2"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            return subprocess.CompletedProcess(
+                args=(configure_result.args, build_result.args),
+                returncode=build_result.returncode,
+                stdout=configure_result.stdout + build_result.stdout,
+                stderr=configure_result.stderr + build_result.stderr,
+            )
+
+    @staticmethod
+    def _fake_torch_stack(properties: str) -> dict[str, str]:
+        """Provide only the package metadata consumed by the build helper."""
+        return {
+            "python": (
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                "os.execve(sys.executable, [sys.executable, '-S', *sys.argv[1:]], os.environ)\n"
+            ),
+            "packages/torch/__init__.py": "def compiled_with_cxx11_abi(): return True\n",
+            "packages/torch_npu/__init__.py": "",
+            "packages/torch/share/cmake/Caffe2/Caffe2Config.cmake": (
+                "add_library(torch INTERFACE IMPORTED)\n"
+            ),
+            "packages/torch/share/cmake/Torch/TorchConfig.cmake": (
+                "if(DEFINED ENV{TORCH_INSTALL_PREFIX})\n"
+                '    message(FATAL_ERROR "TORCH_INSTALL_PREFIX was not cleared")\n'
+                "endif()\n"
+                "include(CMakeFindDependencyMacro)\n"
+                "find_dependency(Caffe2)\n"
+                f"{properties}\n"
+            ),
+        }
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -79,6 +151,126 @@ class TestMulticoreBoundary(unittest.TestCase):
                 for module in modules:
                     with self.subTest(path=path, module=module):
                         self.assertFalse(module.startswith("hyper_parallel.platform"))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_mega_kernels_share_cached_op_api_bridge(self):
+        """Feature: Shared ACLNN bridge.
+        Description: Inspect the native delegation and existing operator call sites.
+        Expectation: Operators use one wrapper backed by the native V1/V2 macros.
+        """
+        csrc = Path(multicore.__file__).parent / "torch" / "csrc"
+        header = (csrc / "cached_op_api.h").read_text(encoding="utf-8")
+        for macro in ("EXEC_NPU_CMD_V1_EXT", "EXEC_NPU_CMD_V2_EXT"):
+            self.assertIn(macro, header, msg=f"Expected native delegation={macro}, present={macro in header}")
+        callers = (
+            "mega_gate.cpp", "mega_mhc.cpp", "mega_moe.cpp", "mega_moe_grad.cpp",
+            "mega_moe_unpermute.cpp", "moe_token_permute_grad.cpp", "moe_token_permute_out.cpp",
+        )
+        for name in callers:
+            with self.subTest(caller=name):
+                source = (csrc / name).read_text(encoding="utf-8")
+                self.assertIn(
+                    "HYPER_EXEC_NPU_CMD_EXT", source,
+                    msg=f"{name}: expected shared wrapper, present={'HYPER_EXEC_NPU_CMD_EXT' in source}",
+                )
+                direct = re.search(r"(?<!HYPER_)EXEC_NPU_CMD_(?:V1_|V2_)?EXT\s*\(", source)
+                self.assertIsNone(direct, msg=f"{name}: expected no direct native calls, actual={direct!r}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_torch_build_contract_follows_active_stack(self):
+        """Feature: Torch native build compatibility.
+        Description: Compile legacy/interface contracts and reject unusable metadata.
+        Expectation: Roots, ABI, minimum standard and environment restoration match the active stack.
+        """
+        cmake_module = (Path(multicore.__file__).parent / "cmake" / "torch_compat.cmake").as_posix()
+        prefix = f'''cmake_minimum_required(VERSION 3.18)
+project(torch_contract_test LANGUAGES CXX)
+set(ENV{{PYTHONPATH}} "${{CMAKE_CURRENT_SOURCE_DIR}}/packages")
+include("{cmake_module}")
+hp_detect_torch_build_contract("${{CMAKE_CURRENT_SOURCE_DIR}}/python" STACK)
+if(NOT "$ENV{{TORCH_INSTALL_PREFIX}}" STREQUAL "${{CMAKE_CURRENT_SOURCE_DIR}}/polluted")
+    message(FATAL_ERROR "TORCH_INSTALL_PREFIX was not restored")
+endif()
+'''
+        successes = (
+            ("set_property(TARGET torch PROPERTY CXX_STANDARD 17)", 17, 201703),
+            ("set_property(TARGET torch PROPERTY CXX_STANDARD 20)", 20, 201709),
+            ("target_compile_features(torch INTERFACE cxx_std_17 cxx_std_20)", 20, 201709),
+        )
+        for properties, standard, minimum in successes:
+            with self.subTest(properties=properties):
+                cmake_lists = prefix
+                for field, expected in (
+                    ("CXX_STANDARD", standard), ("CXX11_ABI", 1),
+                    ("PACKAGE_ROOT", "${CMAKE_CURRENT_SOURCE_DIR}/packages/torch"),
+                    ("NPU_PACKAGE_ROOT", "${CMAKE_CURRENT_SOURCE_DIR}/packages/torch_npu"),
+                ):
+                    cmake_lists += f'''
+if(NOT STACK_{field} STREQUAL "{expected}")
+    message(FATAL_ERROR "{field}: expected={expected}, actual=${{STACK_{field}}}")
+endif()
+'''
+                cmake_lists += '''
+add_library(probe STATIC probe.cpp)
+hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
+'''
+                files = self._fake_torch_stack(properties)
+                files["probe.cpp"] = f'static_assert(__cplusplus >= {minimum}L, "C++ standard too low");\n'
+                result = self._run_cmake_project(cmake_lists, files, executable_files=("python",))
+                self.assertEqual(
+                    result.returncode, 0,
+                    msg=f"Expected successful build, actual={result.returncode}: {result.stdout}{result.stderr}",
+                )
+
+        failures = (
+            ("set_property(TARGET torch PROPERTY CXX_STANDARD 14)", "", "requires at least C++17"),
+            ('target_compile_options(torch INTERFACE "-std=c++20")', "", "recognized C++ standard"),
+            ("", "", "recognized C++ standard"),
+            ("", "Torch", "missing a CMake config"),
+            ("", "Caffe2", "missing a CMake config"),
+        )
+        for properties, missing_package, diagnostic in failures:
+            with self.subTest(properties=properties, missing_package=missing_package):
+                files = self._fake_torch_stack(properties)
+                if missing_package:
+                    del files[f"packages/torch/share/cmake/{missing_package}/{missing_package}Config.cmake"]
+                result = self._run_cmake_project(prefix, files, build=False, executable_files=("python",))
+                output = result.stdout + result.stderr
+                self.assertNotEqual(
+                    result.returncode, 0, msg=f"Expected configuration failure, actual={result.returncode}: {output}",
+                )
+                self.assertIn(diagnostic, output, msg=f"Expected diagnostic={diagnostic!r}, actual={output!r}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_torch_native_targets_use_shared_build_contract(self):
+        """Feature: Torch native build compatibility.
+        Description: Inspect adapter and SHMEM CMake integration boundaries.
+        Expectation: Torch targets share the probe, host code stays C++17, no Torch version probing.
+        """
+        root = Path(multicore.__file__).parent
+        sources = {name: (root / name).read_text(encoding="utf-8") for name in (
+            "cmake/torch_compat.cmake", "torch/CMakeLists.txt", "shmem/ccsrc/CMakeLists.txt",
+        )}
+        for name, target_count in (("torch/CMakeLists.txt", 2), ("shmem/ccsrc/CMakeLists.txt", 1)):
+            for call, expected in (("hp_detect_torch_build_contract(", 1),
+                                   ("hp_apply_torch_cxx_standard(", target_count)):
+                actual = sources[name].count(call)
+                self.assertEqual(actual, expected, msg=f"{name}: {call} expected={expected}, actual={actual}")
+        host_standard = "set(CMAKE_CXX_STANDARD 17)"
+        shmem = sources["shmem/ccsrc/CMakeLists.txt"]
+        self.assertIn(host_standard, shmem, msg=f"Expected {host_standard}, present={host_standard in shmem}")
+        adapter = sources["torch/CMakeLists.txt"]
+        definitions = re.findall(r"CURRENT_VERSION=([^\s)]+)", adapter)
+        self.assertEqual(
+            definitions, ["VERSION_NEWEST", "VERSION_NEWEST"],
+            msg=f"Expected two VERSION_NEWEST definitions, actual={definitions}",
+        )
+        for forbidden in ("torch.__version__", "torch.__config__.show()"):
+            present = [name for name, source in sources.items() if forbidden in source]
+            self.assertEqual(present, [], msg=f"Expected no {forbidden} consumer, actual={present}")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

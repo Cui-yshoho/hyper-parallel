@@ -57,9 +57,7 @@ BwdReturn mega_moe_grad_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    static const hyper_parallel::multicore::CachedOpApi api(
-        "aclnnHyperMegaMoeGrad", "aclnnHyperMegaMoeGradGetWorkspaceSize");
-    hyper_parallel::multicore::execute_cached_op(api,
+    HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeGrad,
         dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw, w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
         combine_target_off, combine_src_off, combine_size,

@@ -52,9 +52,7 @@ FwdReturn mega_moe_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    static const hyper_parallel::multicore::CachedOpApi api(
-        "aclnnHyperMegaMoe", "aclnnHyperMegaMoeGetWorkspaceSize");
-    hyper_parallel::multicore::execute_cached_op(api,
+    HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoe,
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,

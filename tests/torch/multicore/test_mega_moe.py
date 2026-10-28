@@ -60,7 +60,7 @@ def _prepare_torch_multicore_test_environment() -> None:
         )
 
 
-def _run_precision_worker(monkeypatch) -> None:
+def _run_precision_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run the two-rank precision worker with an isolated SHMEM endpoint."""
     _prepare_torch_multicore_test_environment()
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(64 * 1024 * 1024))
@@ -79,7 +79,7 @@ def _run_precision_worker(monkeypatch) -> None:
     essential_mark="essential",
 )
 def test_mega_moe_level0_precision(monkeypatch) -> None:
-    """Compare output, dX, route dW, W1 dW, and W2 dW with common MoE."""
+    """Compare EIO/EOI output, input/route/expert gradients and SGD with common MoE."""
     _run_precision_worker(monkeypatch)
 
 

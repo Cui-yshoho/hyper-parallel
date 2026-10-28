@@ -76,11 +76,13 @@ def multicore_adapter_is_available(adapter_name: str = "hyper_parallel_mega_moe_
 
 
 def multicore_activation_scripts() -> list[Path]:
-    """Return wheel and source-build activation candidates in priority order."""
+    """Return source-build and wheel activation candidates in priority order.
+
+    System-test workers import the checkout through an explicit ``PYTHONPATH``.
+    Prefer its matching native payload when it exists so a separately installed
+    wheel cannot activate a different vendor tree for the source Python code.
+    """
     scripts = []
-    installed_script = shutil.which(HP_ACTIVATION_SCRIPT)
-    if installed_script:
-        scripts.append(Path(installed_script))
     source_script = (
         PROJECT_ROOT
         / "build"
@@ -94,7 +96,16 @@ def multicore_activation_scripts() -> list[Path]:
     )
     if source_script.is_file() and source_script not in scripts:
         scripts.append(source_script)
+    installed_script = shutil.which(HP_ACTIVATION_SCRIPT)
+    if installed_script and Path(installed_script) not in scripts:
+        scripts.append(Path(installed_script))
     return scripts
+
+
+def _activation_vendor_root(activation_script: Path) -> Path | None:
+    """Return the directly owned vendor root for a payload activation script."""
+    vendor_root = activation_script.parent / "vendors" / "hyper_parallel_multicore_nn"
+    return vendor_root.resolve() if vendor_root.is_dir() else None
 
 
 def prepare_multicore_test_environment() -> None:
@@ -108,10 +119,15 @@ def prepare_multicore_test_environment() -> None:
             f"Run before pytest: source {DEFAULT_CANN_SET_ENV}"
         )
 
-    if multicore_test_environment_is_active():
-        return
-
     activation_scripts = multicore_activation_scripts()
+    active_vendor_roots = _active_multicore_vendor_roots()
+    preferred_vendor_root = (
+        _activation_vendor_root(activation_scripts[0]) if activation_scripts else None
+    )
+    if active_vendor_roots and (
+        preferred_vendor_root is None or preferred_vendor_root in active_vendor_roots
+    ):
+        return
     if not activation_scripts:
         raise RuntimeError(
             f"[HP-NATIVE-ACTIVATION-SCRIPT-NOT-FOUND] {HP_ACTIVATION_SCRIPT} is absent from PATH and the "

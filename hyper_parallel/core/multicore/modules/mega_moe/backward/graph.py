@@ -29,9 +29,12 @@ _TILING_POS_W2_GRAD     = 23
 _TILING_POS_SWIGLU_GRAD = 24
 
 
-def _build_bwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
+def _build_bwd_tensor_specs(
+    tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
+):
     """Create all TensorSpec objects for the backward graph."""
     sre = tsv.single_rank_expert_num
+    weight_is_eoi = expert_weight_layout == "EOI"
     target = TensorSpec(
         "target", [tsv.per_rank_seq, hidden_size],
         param_position=0, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
@@ -55,8 +58,11 @@ def _build_bwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
         "w2_grad_y", [sre, intermediate_size, hidden_size],
         param_position=6, dtype_size=dtype_size, tensor_type=1)
     act_grad_weight = TensorSpec(
-        "act_grad_weight", [sre, intermediate_size, hidden_size],
-        param_position=7, dtype_size=dtype_size, tensor_type=1, transpose=True)
+        "act_grad_weight",
+        ([sre, hidden_size, intermediate_size]
+         if weight_is_eoi else [sre, intermediate_size, hidden_size]),
+        param_position=7, dtype_size=dtype_size, tensor_type=1,
+        transpose=not weight_is_eoi)
     act_grad_y = TensorSpec(
         "act_grad_y", [tsv.per_rank_seq, intermediate_size],
         param_position=8, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
@@ -67,8 +73,11 @@ def _build_bwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
         "swiglu_out", [tsv.per_rank_seq, intermediate_size * 2],
         param_position=10, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
     gate_grad_weight = TensorSpec(
-        "gate_grad_weight", [sre, hidden_size, intermediate_size * 2],
-        param_position=11, dtype_size=dtype_size, tensor_type=1, transpose=True)
+        "gate_grad_weight",
+        ([sre, intermediate_size * 2, hidden_size]
+         if weight_is_eoi else [sre, hidden_size, intermediate_size * 2]),
+        param_position=11, dtype_size=dtype_size, tensor_type=1,
+        transpose=not weight_is_eoi)
     gate_grad_y = TensorSpec(
         "gate_grad_y", [tsv.per_rank_seq, hidden_size],
         param_position=12, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
@@ -222,7 +231,8 @@ def build_backward_graph(tsv, *,
                          intermediate_size: int = 2048,
                          dtype_size:        int = 2,
                          num_cube_cores:    int = 24,
-                         swiglu_limit:      float | None = None) -> ComputeGraph:
+                         swiglu_limit:      float | None = None,
+                         expert_weight_layout: str = "EIO") -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -249,11 +259,16 @@ def build_backward_graph(tsv, *,
         num_cube_cores: number of AIC cube cores on the target device.
         swiglu_limit: optional positive clamp limit for SwiGLU; ``None`` keeps
             the original unclamped operator path.
+        expert_weight_layout: Logical expert-weight axis order, either ``"EIO"`` or ``"EOI"``.
 
     Returns:
         A fully-connected ComputeGraph ready for propagate_splits().
     """
-    specs = _build_bwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size)
+    if expert_weight_layout not in ("EIO", "EOI"):
+        raise ValueError(f"expert_weight_layout must be 'EIO' or 'EOI', got {expert_weight_layout!r}.")
+    specs = _build_bwd_tensor_specs(
+        tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
+    )
     dispatch, act_grad, w2_grad, swiglu_grad = _build_bwd_ops_first(
         tsv, specs,
         dispatch_sv=dispatch_sv, act_grad_sv=act_grad_sv,

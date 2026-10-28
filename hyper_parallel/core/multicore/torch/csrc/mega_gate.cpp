@@ -9,26 +9,11 @@
 
 #include <array>
 #include <cmath>
-#include <mutex>
 #include <tuple>
 
-#include "op_plugin/include/npu_cpp_extension.h"
+#include "csrc/cached_op_api.h"
 
 namespace {
-
-void GetMegaGateOpApiFunctionsOnce(std::once_flag &resolve_once, const char *api_name, const char *workspace_api_name,
-                                   void *&execute, void *&get_workspace_size) {
-  std::call_once(resolve_once, [&]() { ::GetApiFunc(api_name, workspace_api_name, execute, get_workspace_size); });
-}
-
-// EXEC_NPU_CMD_EXT otherwise resolves both symbols on every invocation. Each
-// V1/V2 expansion owns its once flag, preserving the macro's per-call-site
-// function pointers without serializing independent Route calls.
-#define GetApiFunc(api_name, workspace_api_name, execute, get_workspace_size)                               \
-  do {                                                                                                      \
-    static std::once_flag resolve_once;                                                                     \
-    GetMegaGateOpApiFunctionsOnce(resolve_once, api_name, workspace_api_name, execute, get_workspace_size); \
-  } while (false)
 
 void CheckRuntimeResources(const at::Tensor &reference, const at::Tensor &runtime_config,
                            const at::Tensor &diagnostic_buffer, const char *operation) {
@@ -90,9 +75,9 @@ RouteOutputs MegaGateRouteNpu(const at::Tensor &logits, const at::Tensor &text_b
   auto route_scores = at::empty({tokens, expert_count}, logits.options());
   auto selected_scores = at::empty({tokens, top_k}, logits.options());
   auto normalization_denominator = at::empty({tokens, 1}, logits.options());
-  EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config,
-                   diagnostic_buffer, routing_weights, expert_indices, route_scores, selected_scores,
-                   normalization_denominator, top_k, routed_scaling_factor, use_vision_bias);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config,
+                         diagnostic_buffer, routing_weights, expert_indices, route_scores, selected_scores,
+                         normalization_denominator, top_k, routed_scaling_factor, use_vision_bias);
   return std::make_tuple(routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator);
 }
 
@@ -137,9 +122,9 @@ RouteOutputs MegaGateRouteOutNpu(const at::Tensor &logits, const at::Tensor &tex
     }
   }
   if (!logits.is_meta()) {
-    EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config,
-                     diagnostic_buffer, routing_weights, expert_indices, route_scores, selected_scores,
-                     normalization_denominator, top_k, routed_scaling_factor, use_vision_bias);
+    HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config,
+                           diagnostic_buffer, routing_weights, expert_indices, route_scores, selected_scores,
+                           normalization_denominator, top_k, routed_scaling_factor, use_vision_bias);
   }
   return std::make_tuple(routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator);
 }
@@ -198,9 +183,9 @@ at::Tensor MegaGateRouteGradNpu(const at::Tensor &logits, const at::Tensor &rout
   CheckRouteGradInputs(logits, route_scores, selected_scores, normalization_denominator, expert_indices,
                        grad_routing_weights, runtime_config, diagnostic_buffer, top_k, routed_scaling_factor);
   auto grad_logits = at::empty_like(logits);
-  EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRouteGrad, logits, route_scores, selected_scores, normalization_denominator,
-                   expert_indices, grad_routing_weights, runtime_config, diagnostic_buffer, grad_logits, top_k,
-                   routed_scaling_factor);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRouteGrad, logits, route_scores, selected_scores, normalization_denominator,
+                         expert_indices, grad_routing_weights, runtime_config, diagnostic_buffer, grad_logits, top_k,
+                         routed_scaling_factor);
   return grad_logits;
 }
 
@@ -227,5 +212,3 @@ TORCH_LIBRARY_IMPL(hyper_parallel, Meta, m) {
   m.impl("mega_gate_route", &MegaGateRouteMeta);
   m.impl("mega_gate_route_grad", &MegaGateRouteGradMeta);
 }
-
-#undef GetApiFunc

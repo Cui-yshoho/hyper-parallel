@@ -54,9 +54,7 @@ PermuteOutputs permute_npu(const at::Tensor &tokens, const at::Tensor &indices, 
   if (indices.numel() != 0) {
     int64_t num_out_tokens = indices.numel();
     bool padded_mode = false;
-    static const hyper_parallel::multicore::CachedOpApi api("aclnnMoeTokenPermute",
-                                                            "aclnnMoeTokenPermuteGetWorkspaceSize");
-    hyper_parallel::multicore::execute_cached_op(api, tokens, indices, num_out_tokens, padded_mode, output, mapping);
+    HYPER_EXEC_NPU_CMD_EXT(aclnnMoeTokenPermute, tokens, indices, num_out_tokens, padded_mode, output, mapping);
   }
   return {output, mapping};
 }

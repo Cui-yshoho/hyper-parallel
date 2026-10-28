@@ -52,6 +52,7 @@ class MegaMoeSpec:
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
+    expert_weight_layout: str = "EIO"
 
     @property
     def plan_tokens(self) -> int:
@@ -204,6 +205,7 @@ def bind_mega_moe_spec(
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
         dispatch_mode=specification.get("dispatch_mode", "push"),
+        expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
         dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
