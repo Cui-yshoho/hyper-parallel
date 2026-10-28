@@ -154,16 +154,8 @@ def _allocate_backward_intermediates(
     reusable_dispatch: Any | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    if spec.expert_weight_layout == "EOI":
-        grad_weight1 = weight1.new_zeros(
-            (spec.local_experts, spec.hidden_size, spec.intermediate_size * 2)
-        )
-        grad_weight2 = weight2.new_zeros(
-            (spec.local_experts, spec.intermediate_size, spec.hidden_size)
-        )
-    else:
-        grad_weight1 = torch.zeros_like(weight1)
-        grad_weight2 = torch.zeros_like(weight2)
+    grad_weight1 = torch.zeros_like(weight1)
+    grad_weight2 = torch.zeros_like(weight2)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -181,13 +173,6 @@ def _allocate_backward_intermediates(
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
-
-
-def _restore_weight_gradient_layout(spec: Any, gradient: torch.Tensor) -> torch.Tensor:
-    """Return native weight gradients in the caller-selected physical layout."""
-    if spec.expert_weight_layout == "EOI":
-        return gradient.transpose(-2, -1)
-    return gradient
 
 
 def _native_weight_operand(weight: torch.Tensor, plan: MegaMoePlan) -> torch.Tensor:
@@ -621,17 +606,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None, None, None,
             ))
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
-            grad_weight1 = _restore_weight_gradient_layout(
-                plan.spec, execution.intermediates.grad_weight1
-            )
-            grad_weight2 = _restore_weight_gradient_layout(
-                plan.spec, execution.intermediates.grad_weight2
-            )
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
-                grad_weight1,
-                grad_weight2,
+                execution.intermediates.grad_weight1,
+                execution.intermediates.grad_weight2,
                 None,
                 None,
                 None,
