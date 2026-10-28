@@ -69,10 +69,15 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
 
 **PpPass** (pipeline-parallel, `PassConfig.pp_enabled`):
 
-- Splits the (post-FSDP) joint graph to this rank's stage at module-FQN
+- Splits the (post-FSDP) joint graph to this rank's stage(s) at module-FQN
   boundaries, exchanging boundary activations/gradients via P2P
-- Installs a self-contained GPipe / 1F1B schedule (`pp_schedule`) as a
-  `call_module` stub, so the trainer needs no PP wiring
+- Installs a self-contained GPipe / 1F1B / Interleaved-1F1B (VPP) schedule
+  (`pp_schedule`) as a `call_module` stub, so the trainer needs no PP wiring
+- `pp_chunks > 1` enables VPP: the model is split into
+  `pp_degree * pp_chunks` virtual stages, rank `r` owns
+  `r, r + pp_degree, ...`, and `pp_schedule: vpp` (alias
+  `interleaved_1f1b`) pipelines them with the classic interleaved-1F1B
+  warmup / steady / cooldown order
 - Pure PP: `fsdp_enabled=False`, `pp_degree == world_size`; the PP+FSDP /
   PP+DDP hybrid uses the 2-D `(pp, DP)` mesh built by the compiler, which
   registers the intra-stage DP group (`"fsdp"` / `"dp_replicate"`) and the
@@ -266,7 +271,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | Axis | Status | Notes |
 |------|--------|-------|
 | FSDP / DDP / HSDP | Implemented | `FSDPPass`; `PassConfig.dp_mode` selects the mode |
-| PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b`); pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
+| PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b` / `interleaved_1f1b` / `vpp`), including VPP via `pp_chunks > 1`; pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
 | PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
 | EP | Planned | — |
@@ -294,6 +299,11 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   intra-stage DP group and the cross-stage `"pp"` group. PP+HSDP (3-D mesh)
   and PP composed with an external `MeshContext` are not supported yet.
   Without a pp group (direct `PpPass` use), `fsdp_enabled=True` is rejected.
+- **VPP stage plan**: with `pp_chunks > 1`, a manual `GraphParallelPlan`
+  must declare `pp_degree * pp_chunks` exact module FQNs (one list per
+  virtual stage); auto split distributes layers evenly across the virtual
+  stages. The interleaved schedule ships boundary values between adjacent
+  virtual stages, including the last-stage -> rank-0 wrap edge.
 - **`AutoOverlapPass` is a placeholder no-op** — see the pass note above.
 - **Compilation is not idempotent**: the partitioning passes mutate the live
   model in place, so `GraphCompiler.compile` may only be called once — a
