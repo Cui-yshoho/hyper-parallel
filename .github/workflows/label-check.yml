@@ -8,12 +8,24 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: label-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   label-check:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
     steps:
+      # Label cleanup uses GITHUB_TOKEN, so it does not trigger an unlabeled run.
+      # The synchronize run must block without accepting the previous CI labels.
+      - name: Require a fresh CI result after a push
+        if: github.event.action == 'synchronize'
+        run: |
+          echo "::error::New commits were pushed. Waiting for CI to add a fresh pipeline-passed label."
+          exit 1
+
       - name: Check for required label
         env:
           GH_TOKEN: ${{ github.token }}
