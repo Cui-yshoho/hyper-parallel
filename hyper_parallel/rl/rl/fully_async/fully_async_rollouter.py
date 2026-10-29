@@ -19,13 +19,13 @@ import multiprocessing as mp
 import queue
 import time
 import traceback
+from contextlib import suppress
 from dataclasses import replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from rl.agentic.envs.environment import load_agentic_module
 from rl.utils.async_audit import EventTrace
-from rl.async_training.protocol import AsyncTrainingConfig
-from rl.async_training.protocol import SampleGroup, SamplingTask, ExperienceBuffer
+from rl.fully_async.protocol import AsyncTrainingConfig, SampleGroup, SamplingTask, ExperienceBuffer
 from rl.roles.model_setup import load_tokenizer
 from rl.dataset.data_source import StatefulPromptSource
 from rl.roles.rollout.client import AsyncGenerationClient
@@ -35,7 +35,8 @@ from rl.roles.rollout.collection import CandidateCollector
 class FullyAsyncRollouter:
     """Own the prompt iterator and independent task sessions in a spawned process."""
 
-    def __init__(self, config: Mapping[str, Any], connection: Any, results: Any, source: dict | None) -> None:
+    def __init__(self, config: Mapping[str, Any], connection: Any, results: Any, source: Optional[dict]) -> None:
+        """Build the prompt source, collector and versioned sampling client."""
         self.config = config
         self.settings = AsyncTrainingConfig.from_mapping(config["async_training"])
         self.trace = EventTrace(self.settings.audit_dir, "rollouter")
@@ -144,7 +145,7 @@ class FullyAsyncRollouter:
             self.collector.close()
 
 
-def run_rollouter(config: Mapping[str, Any], connection: Any, results: Any, source: dict | None) -> None:
+def run_rollouter(config: Mapping[str, Any], connection: Any, results: Any, source: Optional[dict]) -> None:
     """Spawn entry: clear inherited launcher identity and report errors over the control pipe."""
     for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
         os.environ.pop(key, None)
@@ -161,9 +162,10 @@ class AsyncRuntime:
     """Connect a single buffer owner to a CPU-only generation producer."""
 
     def __init__(
-        self, config: Mapping[str, Any], buffer: ExperienceBuffer, source: dict | None = None,
+        self, config: Mapping[str, Any], buffer: ExperienceBuffer, source: Optional[dict] = None,
         target: Any = run_rollouter, control_client: Any = None,
     ) -> None:
+        """Create the producer process and its bounded IPC channels."""
         self.settings = buffer.settings
         self.buffer = buffer
         self.trace = EventTrace(self.settings.audit_dir, "coordinator")
@@ -208,7 +210,7 @@ class AsyncRuntime:
         if not self.process.is_alive():
             raise RuntimeError(f"Sampler exited unexpectedly: {self.process.exitcode}")
 
-    def wait(self, kind: str | None = None) -> Any:
+    def wait(self, kind: Optional[str] = None) -> Any:
         """Pump until an acknowledgement arrives, or all result credits return."""
         deadline = time.monotonic() + self.settings.operation_timeout
         while True:
@@ -224,10 +226,7 @@ class AsyncRuntime:
     def fill(self, version: int, source_update: int) -> None:
         """Grant only pre-reserved tasks; one owner allocates monotonic identities."""
         self.pump()
-        while True:
-            task = self.buffer.reserve(version, source_update)
-            if task is None:
-                break
+        while (task := self.buffer.reserve(version, source_update)) is not None:
             self.trace.emit("admit", identity=task.identity, policy_version=version, source_update=source_update)
             self.connection.send(("task", task))
 
@@ -254,11 +253,9 @@ class AsyncRuntime:
             return
         self.closed = True
         if self.process.is_alive():
-            try:
+            # The child may exit after reporting the primary error.
+            with suppress(BrokenPipeError, EOFError, OSError):
                 self.connection.send(("stop" if graceful else "cancel", None))
-            except (BrokenPipeError, EOFError, OSError):
-                # The child may exit after reporting the primary error.
-                pass
             self.process.join(timeout=5 if graceful else min(30., self.settings.operation_timeout))
         for stop in (self.process.terminate, self.process.kill):
             if self.process.is_alive():

@@ -413,7 +413,22 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 
 See [runtime architecture](docs/architecture.md#rayless-asynchronous-grpo) for the
 single-node Qwen3 dense scope, launch entry, publication and recovery contracts.
-GSM8K, Search and SWE-Smith recipes live in `examples/async_training/configs/`.
+GSM8K, Search and SWE-Smith recipes live in `examples/fully_async/configs/`.
 The core contains five files, with a 1100 physical-line budget checked by
 `python -m pytest hyper_parallel/rl/tests/st/test_async_core_budget.py -q`.
 Shared helpers, examples and tests are counted separately. The synchronous loop remains independent.
+
+## 共卡异步 GRPO
+
+独立入口为 `examples/colocate_async/launch.py`，示例配置为
+[两卡 GSM8K](examples/colocate_async/configs/qwen3_4b_gsm8k.yaml)。
+只复用现有采样、轨迹、模型与发布组件，不改变同步和分离全异步的主循环。
+限定 Qwen3 dense GRPO、internal 单轮或现有 Codex 多轮采样、共卡 vLLM、训练 TP=1、推理 DP=1、CPU offload、
+eager、sleep level 1 和 full-gather IPC。已完成八卡 GSM8K/Search 两步流程验证，学习质量与长稳仍待验收。
+执行顺序、配置和恢复限制见[运行合同](docs/architecture.md#共卡异步-grpo)。
+八卡 [Codex Search 配置](examples/colocate_async/configs/qwen3_4b_search_r1.yaml) 需要原有主机 broker；
+评估时排空采样并交接网关，随后从冻结 source/buffer 重建 producer。
+
+共卡 GRPO 可通过 `colocate_async.off_policy.mode` 选择 `metrics_only` 或 `decoupled`，
+默认 `off`。支持固定训练锚点、token 级 IS 校正与可选整组拒绝补样，
+配置和数学边界见[off-policy 合同](docs/architecture.md#共卡-off-policy-校正)。

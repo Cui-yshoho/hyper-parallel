@@ -33,7 +33,7 @@ import uuid
 # Direct script execution puts search_r1/, not the RL root, on sys.path.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+    sys.path.insert(0, str(PROJECT_ROOT))  # pylint: disable=sys-path-mutation
 
 if __package__:
     from .container_execution import IMAGE, docker, execute_episode
@@ -56,9 +56,9 @@ def training_command(steps: int, resume: bool = False, overrides: list[str] | No
         "--data.test_path=/data/test.parquet", "--agentic.codex.session_root=/results/jobs",
     ]
     if fully_async:
-        command[command.index("train_rl.py")] = "examples/async_training/launch.py"
+        command[command.index("train_rl.py")] = "examples/fully_async/launch.py"
         command[command.index("examples/search_r1/configs/qwen3_4b_search_r1.yaml")] = (
-            "examples/async_training/configs/qwen3_4b_search_r1.yaml")
+            "examples/fully_async/configs/qwen3_4b_search_r1.yaml")
         command.append(f"--rollout.vllm.visible_devices={rollout_devices}")
         command.extend((f"--train.accelerator.dp_shard={processes}",
                         f"--rollout.vllm.data_parallel_size={processes}"))

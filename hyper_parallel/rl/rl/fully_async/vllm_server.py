@@ -18,7 +18,7 @@ import math
 import os
 from functools import partial, wraps
 from importlib.metadata import version as package_version
-from typing import Any
+from typing import Any, Optional
 
 from rl.utils.async_audit import EventTrace
 
@@ -26,7 +26,8 @@ from rl.utils.async_audit import EventTrace
 class PartialRequestService:
     """Serialize engine admission with pause and capture cumulative engine output."""
 
-    def __init__(self, engine: Any, sampling_factory: Any, trace: EventTrace | None = None) -> None:
+    def __init__(self, engine: Any, sampling_factory: Any, trace: Optional[EventTrace] = None) -> None:
+        """Initialize request admission and cumulative generation tracking."""
         self.engine, self.sampling_factory = engine, sampling_factory
         self.trace = trace or EventTrace(None, "inference")
         self.lock = asyncio.Lock()
@@ -34,7 +35,7 @@ class PartialRequestService:
         self.admission = asyncio.Event()
         self.admission.set()
         self.active = 0
-        self.committed_version: int | None = None
+        self.committed_version: Optional[int] = None
         self.idle = asyncio.Event()
         self.idle.set()
 
@@ -167,9 +168,11 @@ class CallAdmissionMiddleware:
     """Guard the native chat route without changing its token/tool protocol."""
 
     def __init__(self, app: Any, service_factory: Any, timeout: float) -> None:
+        """Bind native chat requests to the shared admission service."""
         self.app, self.service_factory, self.timeout = app, service_factory, timeout
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Stamp each admitted chat response with its committed policy version."""
         if scope["type"] != "http" or scope["path"].rstrip("/") != "/v1/chat/completions":
             await self.app(scope, receive, send)
             return
