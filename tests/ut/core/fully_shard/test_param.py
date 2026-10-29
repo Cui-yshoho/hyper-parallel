@@ -15,6 +15,7 @@
 """Unit tests for torch fully_shard parameter helper paths."""
 # pylint: disable=protected-access
 
+import gc
 import os
 import unittest
 import weakref
@@ -27,6 +28,7 @@ from unittest.mock import MagicMock, patch
 
 # pylint: disable=wrong-import-position
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -89,6 +91,34 @@ def _new_param():
     hsdp_param.mesh_info.replicate_process_group = None
     hsdp_param.sharded_state = ShardedState.SHARDED
     return hsdp_param
+
+
+def _new_materialized_single_shard_param(model_dtype=torch.bfloat16):
+    """Build the single-shard parameter lifecycle used after meta materialization."""
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(torch.empty((2, 2), dtype=model_dtype, device="meta"))
+    mesh_info = object.__new__(FSDPMeshInfo)
+    with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
+        mesh_info.mesh = DeviceMesh("cpu", [0], mesh_dim_names=("fsdp",), _init_backend=False)
+    mesh_info.shard_mesh_dim = 0
+    mesh_info.replicate_mesh_dim = None
+    mesh_info.shard_mesh_rank = 0
+    mesh_info.shard_mesh_size = 1
+    mesh_info.shard_process_group = None
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    hsdp_param = HSDPParamV2(
+        module.weight,
+        ParamModuleInfo(module, "weight", [], []),
+        mesh_info,
+        mp_policy=mp_policy,
+        device=torch.device("cpu"),
+    )
+    module.to_empty(device="cpu")
+    with torch.no_grad():
+        hsdp_param.reset_sharded_param()
+        torch.nn.init.normal_(module.weight, mean=2, std=0)
+    hsdp_param.init_dtype_attrs(mp_policy)
+    return module, hsdp_param
 
 
 class TestTorchHSDPParamHelpers(unittest.TestCase):
@@ -156,6 +186,9 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         torch.testing.assert_close(hsdp_param.sharded_param.to_local(), loaded_local_tensor)
         torch.testing.assert_close(hsdp_param._sharded_param_data[:6], torch.full((6,), 9.0))
         torch.testing.assert_close(hsdp_param._sharded_param_data[6:], torch.zeros(3))
+        self.assertFalse(hsdp_param._sharded_param_data.requires_grad)
+        self.assertTrue(hsdp_param.sharded_param._local_tensor.requires_grad)
+        self.assertTrue(hsdp_param.sharded_param._local_tensor.is_leaf)
 
     def test_reset_materialized_local_tensor_swaps_dtensor_storage(self):
         """Materialization should align both DTensor storage references without replacing the Parameter."""
@@ -392,6 +425,153 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             hsdp_param.unsharded_param,
             torch.arange(15, dtype=torch.float32).view(5, 3),
         )
+
+    def test_single_shard_unshards_after_no_grad_parameter_initialization(self):
+        """Unshard an initialized meta parameter without copying its single shard."""
+        module, hsdp_param = _new_materialized_single_shard_param()
+        sharded_buffer = hsdp_param._sharded_param_data
+        self.assertIsNone(hsdp_param.param_dtype)
+        self.assertTrue(sharded_buffer._is_view())
+        local_tensor = hsdp_param.sharded_param._local_tensor
+        self.assertIsNot(sharded_buffer._base, local_tensor)
+        self.assertFalse(sharded_buffer.requires_grad)
+        self.assertFalse(sharded_buffer._base.requires_grad)
+        self.assertTrue(local_tensor.requires_grad)
+        self.assertEqual(sharded_buffer.data_ptr(), local_tensor.data_ptr())
+        self.assertGreater(sharded_buffer._version, 0)
+
+        hsdp_param.unshard()
+        self.assertIs(hsdp_param.unsharded_param_buffers[0], sharded_buffer)
+        hsdp_param.wait_for_unshard()
+
+        unsharded = module.weight
+        self.assertIs(unsharded, hsdp_param.unsharded_param)
+        self.assertTrue(unsharded.is_leaf)
+        self.assertTrue(unsharded.requires_grad)
+        self.assertEqual(unsharded.data_ptr(), sharded_buffer.data_ptr())
+        torch.testing.assert_close(unsharded, torch.full((2, 2), 2, dtype=torch.bfloat16))
+        unsharded.square().sum().backward()
+        torch.testing.assert_close(unsharded.grad, torch.full((2, 2), 4, dtype=torch.bfloat16))
+        hsdp_param.apply_reduced_grad(unsharded.grad)
+        torch.testing.assert_close(
+            hsdp_param.sharded_param.grad._local_tensor,
+            torch.full((2, 2), 4, dtype=torch.bfloat16),
+        )
+
+        hsdp_param.shard()
+        self.assertGreater(sharded_buffer.untyped_storage().nbytes(), 0)
+        with torch.no_grad():
+            torch.nn.init.normal_(module.weight, mean=3, std=0)
+        hsdp_param.unshard()
+        hsdp_param.wait_for_unshard()
+        self.assertIs(module.weight, unsharded)
+        self.assertIs(hsdp_param.unsharded_param_buffers[0], sharded_buffer)
+        torch.testing.assert_close(module.weight, torch.full((2, 2), 3, dtype=torch.bfloat16))
+
+    def test_single_shard_unsharded_param_keeps_inplace_version_checks(self):
+        """A write through either shared alias remains visible to autograd."""
+        for write_to_shard in (False, True):
+            with self.subTest(write_to_shard=write_to_shard):
+                module, hsdp_param = _new_materialized_single_shard_param()
+                hsdp_param.unshard()
+                hsdp_param.wait_for_unshard()
+                unsharded = module.weight
+                with self.assertRaisesRegex(RuntimeError, "leaf Variable"):
+                    unsharded.add_(1)
+                loss = unsharded.square().sum()
+                original_version = unsharded._version
+                target = hsdp_param.sharded_param._local_tensor if write_to_shard else unsharded
+                with torch.no_grad():
+                    target.add_(1)
+                self.assertGreater(unsharded._version, original_version)
+                with self.assertRaisesRegex(RuntimeError, "modified by an inplace operation"):
+                    loss.backward()
+
+    def test_single_shard_cast_uses_separate_unsharded_storage(self):
+        """A parameter dtype conversion does not alias the initialized shard."""
+        module, hsdp_param = _new_materialized_single_shard_param(model_dtype=torch.float32)
+        self.assertEqual(hsdp_param.param_dtype, torch.bfloat16)
+
+        hsdp_param.unshard()
+        self.assertIsNot(hsdp_param.unsharded_param_buffers[0], hsdp_param._sharded_param_data)
+        self.assertFalse(hsdp_param.unsharded_param_buffers[0].requires_grad)
+        self.assertNotEqual(
+            hsdp_param.unsharded_param_buffers[0].data_ptr(),
+            hsdp_param._sharded_param_data.data_ptr(),
+        )
+        hsdp_param.wait_for_unshard()
+
+        self.assertEqual(module.weight.dtype, torch.bfloat16)
+        torch.testing.assert_close(module.weight, torch.full((2, 2), 2, dtype=torch.bfloat16))
+        module.weight.square().sum().backward()
+        torch.testing.assert_close(module.weight.grad, torch.full((2, 2), 4, dtype=torch.bfloat16))
+
+    def test_reset_sharded_param_releases_source_autograd_graph(self):
+        """Refreshing storage must not retain the graph of a converted local shard."""
+        _, hsdp_param = _new_materialized_single_shard_param()
+        source = torch.ones((2, 2), dtype=torch.bfloat16, requires_grad=True)
+        source_ref = weakref.ref(source)
+        source_storage_ref = StorageWeakRef(source.untyped_storage())
+        graph_local = source * 2
+        self.assertIsNotNone(graph_local.grad_fn)
+        hsdp_param.sharded_param._local_tensor = graph_local
+
+        hsdp_param.reset_sharded_param()
+
+        local_tensor = hsdp_param.sharded_param._local_tensor
+        self.assertTrue(local_tensor.requires_grad)
+        self.assertTrue(local_tensor.is_leaf)
+        self.assertIsNone(local_tensor.grad_fn)
+        self.assertIsNone(hsdp_param._sharded_param_data.grad_fn)
+        self.assertEqual(local_tensor.data_ptr(), hsdp_param._sharded_param_data.data_ptr())
+        del source, graph_local
+        gc.collect()
+        self.assertIsNone(source_ref())
+        self.assertTrue(source_storage_ref.expired())
+
+    def test_single_shard_unshards_native_dtensor_after_initialization(self):
+        """Keep a source DTensor's layout and gradient when rewrapping the buffer."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
+            root_mesh = DeviceMesh(
+                "cpu", [[0, 1]], mesh_dim_names=("fsdp", "ep"), _init_backend=False
+            )
+            fsdp_mesh, ep_mesh = root_mesh["fsdp"], root_mesh["ep"]
+            local_tensor = torch.empty((2, 2), dtype=torch.bfloat16, device="meta")
+            module = torch.nn.Module()
+            module.weight = torch.nn.Parameter(DTensor.from_local(local_tensor, ep_mesh, (Shard(0),)))
+            mesh_info = object.__new__(FSDPMeshInfo)
+            mesh_info.mesh = fsdp_mesh
+            mesh_info.shard_mesh_dim = 0
+            mesh_info.replicate_mesh_dim = None
+            mesh_info.shard_mesh_rank = 0
+            mesh_info.shard_mesh_size = 1
+            mesh_info.shard_process_group = None
+            mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+            hsdp_param = HSDPParamV2(
+                module.weight,
+                ParamModuleInfo(module, "weight", [], []),
+                mesh_info,
+                mp_policy=mp_policy,
+                device=torch.device("cpu"),
+                source_shard_info=SourceShardMetaInfo(ep_mesh, (Shard(0),), origin_is_dtensor=True),
+            )
+            module.to_empty(device="cpu")
+            with torch.no_grad():
+                hsdp_param.reset_sharded_param()
+                torch.nn.init.normal_(module.weight, mean=2, std=0)
+            hsdp_param.init_dtype_attrs(mp_policy)
+            hsdp_param.unshard()
+            hsdp_param.wait_for_unshard()
+
+            weight = module.weight
+            self.assertIsInstance(weight, DTensor)
+            self.assertTrue(weight.is_leaf)
+            self.assertTrue(weight.requires_grad)
+            self.assertEqual(weight.placements, (Shard(0),))
+            self.assertEqual(weight.to_local().data_ptr(), hsdp_param._sharded_param_data.data_ptr())
+            weight.to_local().square().sum().backward()
+            grad = weight.grad.to_local() if isinstance(weight.grad, DTensor) else weight.grad
+            torch.testing.assert_close(grad, torch.full((2, 2), 4, dtype=torch.bfloat16))
 
     def test_init_unsharded_param_requires_single_buffer(self):
         """Stable unsharded parameter initialization should require exactly one buffer."""

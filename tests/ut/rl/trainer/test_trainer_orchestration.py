@@ -27,6 +27,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 import rl.utils.process_cleanup as cleanup_module
 import rl.trainer as trainer_module
@@ -643,8 +644,7 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
             self.pad_token_id = self.eos_token_id
 
     class Dataset(PromptDataset):
-        def __init__(self, **kwargs: Any) -> None:
-            calls.append(("dataset", kwargs))
+        """Record dataset construction without invoking real data loading."""
 
         @staticmethod
         def __len__() -> int:
@@ -664,6 +664,7 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
         "from_pretrained",
         lambda *args, **kwargs: calls.append(("tokenizer", args, kwargs)) or tokenizer,
     )
+    monkeypatch.setattr(Dataset, "__init__", lambda _self, **kwargs: calls.append(("dataset", kwargs)))
     monkeypatch.setattr(trainer_module, "PromptDataset", Dataset)
     monkeypatch.setattr(trainer_module, "build_train_dataloader", build_dataloader)
     trainer = object.__new__(SyncTrainer)
@@ -997,6 +998,7 @@ def test_initial_rollout_release_resets_real_actor_reference_storage_before_forw
     original_actor = actor.weight
     original_reference = reference.weight
     previous_local = weakref.ref(actor.weight.to_local())
+    previous_storage = StorageWeakRef(actor.weight.to_local().untyped_storage())
     optimizer = torch.optim.SGD(actor.parameters(), lr=0.1)
     trainer = object.__new__(SyncTrainer)
     trainer.distillation_config = DistillationConfig()
@@ -1022,11 +1024,26 @@ def test_initial_rollout_release_resets_real_actor_reference_storage_before_forw
     for parameter, requires_grad in ((actor_parameter, True), (reference_parameter, False)):
         assert not parameter._sharded_param_data.is_meta
         assert parameter._sharded_param_data.grad_fn is None
-        assert parameter._sharded_param_data.requires_grad == requires_grad
+        local_tensor = parameter.sharded_param._local_tensor
+        assert not parameter._sharded_param_data.requires_grad, (
+            f"Expected non-trainable communication storage, got {parameter._sharded_param_data.requires_grad}"
+        )
+        assert local_tensor.requires_grad == requires_grad, (
+            f"Expected local requires_grad={requires_grad}, got {local_tensor.requires_grad}"
+        )
+        assert local_tensor.is_leaf, f"Expected a local leaf, got grad_fn={local_tensor.grad_fn}"
+        assert local_tensor.grad_fn is None, f"Expected no local conversion graph, got {local_tensor.grad_fn}"
+        assert parameter._sharded_param_data.data_ptr() == local_tensor.data_ptr(), (
+            f"Expected shared shard storage: communication={parameter._sharded_param_data.data_ptr()}, "
+            f"local={local_tensor.data_ptr()}"
+        )
         assert parameter.reduce_dtype is torch.float32
         torch.testing.assert_close(parameter.sharded_param.to_local(), torch.tensor([3.0, 5.0], dtype=torch.bfloat16))
     gc.collect()
     assert previous_local() is None
+    assert previous_storage.expired(), (
+        f"Expected the previous local storage to expire, got {previous_storage.expired()}"
+    )
     pointers = [parameter._sharded_param_data.data_ptr() for parameter in (actor_parameter, reference_parameter)]
 
     trainer._release_training_state_for_rollout()
@@ -1040,6 +1057,51 @@ def test_initial_rollout_release_resets_real_actor_reference_storage_before_forw
     assert reference.weight.to_local().grad is None
     trainer._release_training_state_for_rollout()
     torch.testing.assert_close(actor.weight.to_local().grad, torch.tensor([6.0, 10.0], dtype=torch.bfloat16))
+
+    loss = actor()
+    local_version = actor.weight.to_local()._version
+    with torch.no_grad():
+        actor_parameter._sharded_param_data.add_(1)
+    assert actor.weight.to_local()._version > local_version, (
+        f"Expected a shared version update: before={local_version}, after={actor.weight.to_local()._version}"
+    )
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        loss.backward()
+
+
+@pytest.mark.parametrize("requires_grad", [True, False])
+def test_rollout_reshard_frees_full_parameter_storage(
+    monkeypatch: pytest.MonkeyPatch, requires_grad: bool,
+) -> None:
+    """Rollout releases full storage for both trainable and frozen offloaded roles."""
+    model, parameter, state = _cpu_offload_role(monkeypatch, requires_grad=requires_grad)
+    state.lazy_init()
+    sharded_parameter = model.weight
+    shard_pointer = parameter._sharded_param_data.data_ptr()
+    # Materialize a gathered result without starting distributed communication.
+    parameter.init_unsharded_param_buffers(
+        all_gather_input_numels=[2], all_gather_input_dtypes=[torch.bfloat16],
+        world_size=2, device=torch.device("cpu"),
+    )
+    parameter.unsharded_param_buffers[0].copy_(torch.tensor([3.0, 5.0, 7.0, 11.0], dtype=torch.bfloat16))
+    parameter.init_unsharded_param()
+    parameter.to_unsharded()
+    state.is_shard = False
+    full_parameter = model.weight
+    full_storage = full_parameter.untyped_storage()
+    assert full_storage.nbytes() > 0, f"Expected allocated full storage, got {full_storage.nbytes()} bytes"
+
+    SyncTrainer._reshard_model(model)
+
+    assert full_storage.nbytes() == 0, f"Expected released full storage, got {full_storage.nbytes()} bytes"
+    assert model.weight is sharded_parameter, f"Expected the original shard, got {type(model.weight)}"
+    assert parameter._sharded_param_data.data_ptr() == shard_pointer, (
+        f"Expected unchanged shard storage: before={shard_pointer}, after={parameter._sharded_param_data.data_ptr()}"
+    )
+    assert model.weight.requires_grad == requires_grad, (
+        f"Expected shard requires_grad={requires_grad}, got {model.weight.requires_grad}"
+    )
+    torch.testing.assert_close(model.weight.to_local(), torch.tensor([3.0, 5.0], dtype=torch.bfloat16))
 
 
 def test_initial_rollout_release_rejects_unmaterialized_shards(
