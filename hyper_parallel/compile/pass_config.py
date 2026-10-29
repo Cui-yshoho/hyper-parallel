@@ -23,9 +23,21 @@ distributed guard inside ``FSDPPass`` (which still early-returns on
 distributed was initialized, leaving no way to run pure-TP / pure-PP graph
 mode. The explicit field fixes that. Pipeline-parallel (``pp_enabled``)
 follows the same contract: intent here, runtime guard in ``PpPass``.
+
+Note:
+    TP / SP / LP are deliberately NOT configurable here: their collectives
+    are baked into module boundary forwards by the automodel flow (shared
+    with eager mode), and no graph pass consumes them. ``PassConfig`` only
+    drives what the graph passes actually execute.
 """
 
-__all__ = ["PassConfig", "PP_SCHEDULES", "DP_MODES", "normalize_dp_mode"]
+__all__ = [
+    "PassConfig",
+    "PP_SCHEDULES",
+    "DP_MODES",
+    "normalize_dp_mode",
+    "build_pass_config_from_trainer_config",
+]
 
 import math
 from dataclasses import dataclass
@@ -113,12 +125,6 @@ class PassConfig:
             or ``world_size // fsdp_degree`` for HSDP / ``world_size`` for
             DDP). Kept separate from ``fsdp_degree`` (the shard axis) so an
             HSDP mesh is unambiguous.
-        tp_size: Tensor-parallel degree. Informational today (TP collectives
-            live inside boundary forwards baked by automodel, not in the
-            graph-mode passes); kept so a future TP-aware pass can read it
-            without API churn.
-        sequence_parallel: Enable sequence parallel (SP) on the TP axis.
-        loss_parallel: Enable loss parallel (LP) on the TP axis.
         pp_enabled: Drive ``PpPass`` (pipeline-parallel graph split). When
             ``True`` the joint fwd+bwd graph is sliced to this rank's stage
             along module-FQN boundaries declared in ``GraphParallelPlan``, cross-stage
@@ -164,9 +170,6 @@ class PassConfig:
     fsdp_degree: Optional[int] = None
     dp_mode: str = "fsdp"
     dp_replicate_degree: Optional[int] = None
-    tp_size: int = 1
-    sequence_parallel: bool = False
-    loss_parallel: bool = False
     pp_enabled: bool = False
     pp_degree: Optional[int] = None
     pp_microbatch_size: int = 1
@@ -183,10 +186,10 @@ class PassConfig:
         """Sanity-check invariants; also re-run after manual field mutation.
 
         Raises:
-            ValueError: On a negative ``tp_size``, a non-positive explicit
-                ``fsdp_degree`` / ``pp_degree``, a non-positive
-                ``pp_microbatch_size``, an unknown ``pp_schedule`` /
-                ``dp_mode``, or a non-positive ``dp_replicate_degree``.
+            ValueError: On a non-positive explicit ``fsdp_degree`` /
+                ``pp_degree``, a non-positive ``pp_microbatch_size``, an
+                unknown ``pp_schedule`` / ``dp_mode``, or a non-positive
+                ``dp_replicate_degree``.
         """
         self._validate_flags()
         self._validate_dp()
@@ -209,8 +212,6 @@ class PassConfig:
 
     def _validate_dp(self) -> None:
         """Validate the tensor-parallel and data-parallel degrees."""
-        if self.tp_size < 1:
-            raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
             raise ValueError(
                 f"fsdp_degree must be None or a positive int, got {self.fsdp_degree}"
@@ -255,9 +256,11 @@ def build_pass_config_from_trainer_config(
     This helper stays in the pass-config module because it computes the
     graph-pass surface from the trainer topology without altering runtime
     objects. Accepting ``Any`` keeps this module importable without the
-    trainer package.
+    trainer package. Only fields the graph passes actually consume are
+    projected: TP / SP / LP topology (``accelerator.tp_size`` /
+    ``sequence_parallel`` / ``loss_parallel``) is owned by the automodel
+    flow and deliberately not copied.
     """
-    accelerator = config.accelerator
     compile_config = getattr(config, "compile", None)
     if fsdp_enabled is None:
         fsdp_enabled = (
@@ -269,9 +272,6 @@ def build_pass_config_from_trainer_config(
         enable_overlap=enable_overlap,
         fsdp_enabled=fsdp_enabled,
         fsdp_degree=fsdp_degree,
-        tp_size=accelerator.tp_size,
-        sequence_parallel=accelerator.sequence_parallel,
-        loss_parallel=accelerator.loss_parallel,
         fsdp_reshard_after_forward=getattr(
             config.fsdp_config, "reshard_after_forward", True
         ),
@@ -283,6 +283,3 @@ def build_pass_config_from_trainer_config(
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
     )
-
-
-__all__ = ["PassConfig", "build_pass_config_from_trainer_config"]

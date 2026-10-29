@@ -18,8 +18,7 @@ Covers the rules the dataclass asserts and that have regressed before:
 
 1. Defaults match the documented intent (FSDP on, overlap on, degrees
    unresolved until runtime).
-2. ``__post_init__`` rejects negative ``tp_size`` and non-positive explicit
-   ``fsdp_degree``.
+2. ``__post_init__`` rejects non-positive explicit ``fsdp_degree``.
 3. ``validate()`` re-runs the same checks after a caller mutates a field
    (the compiler back-fills ``fsdp_degree`` from the mesh in
    ``GraphCompiler._init_device_mesh``).
@@ -65,9 +64,6 @@ class TestPassConfigDefaults(unittest.TestCase):
                 f"got {cfg.dp_replicate_degree}"
             ),
         )
-        self.assertEqual(
-            cfg.tp_size, 1, (f"tp_size default should be 1, got {cfg.tp_size}")
-        )
         # PP defaults: off by default (opt-in), degrees unresolved, safe
         # microbatch of 1.
         self.assertFalse(
@@ -99,7 +95,6 @@ class TestPassConfigDefaults(unittest.TestCase):
             fsdp_degree=8,
             dp_mode="hsdp",
             dp_replicate_degree=4,
-            tp_size=2,
             pp_enabled=True,
             pp_degree=4,
             pp_microbatch_size=2,
@@ -110,7 +105,6 @@ class TestPassConfigDefaults(unittest.TestCase):
         self.assertEqual(cfg.fsdp_degree, 8)
         self.assertEqual(cfg.dp_mode, "hsdp")
         self.assertEqual(cfg.dp_replicate_degree, 4)
-        self.assertEqual(cfg.tp_size, 2)
         self.assertTrue(cfg.pp_enabled)
         self.assertEqual(cfg.pp_degree, 4)
         self.assertEqual(cfg.pp_microbatch_size, 2)
@@ -147,20 +141,6 @@ class TestPassConfigDpMode(unittest.TestCase):
 
 class TestPassConfigValidation(unittest.TestCase):
     """``__post_init__`` catches misconfigurations early."""
-
-    def test_rejects_non_positive_tp_size(self):
-        """Test ``tp_size < 1`` raises ValueError at construction."""
-        for bad in (0, -1, -4):
-            with self.assertRaises(ValueError) as ctx:
-                PassConfig(tp_size=bad)
-            self.assertIn(
-                "tp_size",
-                str(ctx.exception),
-                (
-                    f"error for tp_size={bad} should mention tp_size, "
-                    f"got: {ctx.exception}"
-                ),
-            )
 
     def test_rejects_non_positive_fsdp_degree(self):
         """Test explicit ``fsdp_degree < 1`` raises ValueError."""
