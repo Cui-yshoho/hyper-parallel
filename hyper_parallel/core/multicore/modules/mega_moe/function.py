@@ -20,8 +20,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-import torch_npu
 
+from hyper_parallel.core.multicore._loader import load_torch_npu
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
@@ -512,7 +512,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if not workspace.in_use:
                 raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
         else:
-            workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
+            if not spec.auto_tokens:
+                workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
             workspace.claim()
         execution = None
         try:
@@ -543,7 +544,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
                 permutation_inputs += (output, probs)
-                output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
                           if ctx.source_rows else output[:0])
             _save_forward_state(
                 ctx,
