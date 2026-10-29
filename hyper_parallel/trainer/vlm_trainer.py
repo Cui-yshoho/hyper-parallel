@@ -23,7 +23,7 @@ from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.distributed.encoder_parallel import build_encoder_parallel_runtime
-from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
+from hyper_parallel.distributed.encoder_parallel.transport import EncoderParallelBatchTransport
 from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
@@ -164,10 +164,7 @@ class VLMTrainer:
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
-            get_batch.runtime_input_adapter = EncoderParallelInputAdapter(
-                runtime=encoder_runtime,
-                inner=get_batch.runtime_input_adapter,
-            )
+            get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
         self.base.get_batch = get_batch
 
     @property

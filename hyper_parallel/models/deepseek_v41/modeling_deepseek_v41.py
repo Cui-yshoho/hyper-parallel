@@ -1007,6 +1007,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             self, *, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor | None,
             token_types: torch.LongTensor | None, image_inputs: dict[str, Any],
             image_sequence_start: int, encoder_parallel_plan: Any | None,
+            encoder_parallel_inputs: Any | None = None,
     ) -> torch.Tensor:
         """Encode images and merge only records owned by this decoder rank."""
         if encoder_parallel_plan is None:
@@ -1017,7 +1018,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             )
             vision_grad_anchor = None
         else:
-            routed_records, vision_grad_anchor = encoder_parallel_plan.encode_and_route(image_inputs)
+            routed_records, vision_grad_anchor = encoder_parallel_plan.encode_and_route(
+                image_inputs if encoder_parallel_inputs is None else encoder_parallel_inputs,
+            )
             image_records = [
                 (item.batch_index, item.decoder_token_start, *item.metadata["llm_hw"], feature)
                 for item, feature in routed_records
@@ -1157,6 +1160,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_token_starts: torch.LongTensor | None = None,
             image_sequence_start: int = 0,
             encoder_parallel_plan: Any | None = None,
+            encoder_parallel_inputs: Any | None = None,
             **kwargs: Any,
     ) -> MoeModelOutputWithPast:
         """Execute image injection, Engram, shared attention, and pipelined mHC.
@@ -1177,6 +1181,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_token_starts: Global token start for each image span.
             image_sequence_start: Global start of this decoder hidden shard.
             encoder_parallel_plan: Derived visual work and feature route for this batch.
+            encoder_parallel_inputs: Device patches already packed for this encoder rank.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
@@ -1200,6 +1205,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                 "image_token_starts": image_token_starts,
             },
             image_sequence_start=image_sequence_start, encoder_parallel_plan=encoder_parallel_plan,
+            encoder_parallel_inputs=encoder_parallel_inputs,
         )
         image_mask = None if token_types is None else token_types >= 0
         engram_token_mask = None if image_mask is None else ~image_mask
