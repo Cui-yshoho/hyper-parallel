@@ -17,6 +17,7 @@
 import unittest
 from collections import OrderedDict
 from dataclasses import replace
+import struct
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
@@ -26,6 +27,11 @@ import torch
 from hyper_parallel.core.multicore import _automatic, _collective
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
+from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
+    get_w1_grad_tiling_bytes, get_w2_grad_tiling_bytes,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -150,6 +156,33 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertTrue(forward.get_op("down_proj").inputs[1].transpose)
         self.assertFalse(backward.get_op("act_grad").inputs[1].transpose)
         self.assertFalse(backward.get_op("gate_grad").inputs[1].transpose)
+
+        backward.propagate_splits(topology)
+        runtime = build_config_for_rank(backward, topology, 0)
+        for name, positions, shape, tiling_builder in (
+            ("w1_grad", [10, 17], [2, 16, 12], get_w1_grad_tiling_bytes),
+            ("w2_grad", [0, 5], [2, 12, 8], get_w2_grad_tiling_bytes),
+        ):
+            op = backward.get_op(name)
+            self.assertEqual(op.task_num, 48, msg=f"{name} tasks: expected=48, actual={op.task_num}")
+            self.assertEqual(op.outputs[0].shape, shape,
+                             msg=f"{name} output: expected={shape}, actual={op.outputs[0].shape}")
+            task = next(task for task in runtime.all_tasks[:runtime.task_num]
+                        if task.outputs[0].input_position == op.outputs[0].param_position)
+            actual_positions = [task.inputs[i].input_position for i in range(2)]
+            actual_transpose = [task.inputs[i].transpose_flag for i in range(2)]
+            self.assertEqual(actual_positions, positions,
+                             msg=f"{name} operands: expected={positions}, actual={actual_positions}")
+            self.assertEqual(actual_transpose, [1, 0],
+                             msg=f"{name} transpose: expected=[1, 0], actual={actual_transpose}")
+            tiling = tiling_builder(op.split_value, hidden_size=12, intermediate_size=8,
+                                   num_groups=2, expert_weight_layout="EOI")
+            words = struct.unpack(f"<{len(tiling) // 4}I", tiling)
+            matmul_start = words.index(393216) - 19
+            axes = list(words[matmul_start + 1:matmul_start + 3])
+            self.assertEqual(axes, shape[1:], msg=f"{name} tiling M/N: expected={shape[1:]}, actual={axes}")
+        self.assertTrue(can_reuse_backward_dispatch(runtime, 2, 24),
+                        msg=f"Expected safe dispatch reuse, actual={can_reuse_backward_dispatch(runtime, 2, 24)}")
 
         hidden_states = SimpleNamespace(dtype=torch.bfloat16, is_npu=True, device=torch.device("cpu"))
         noncontiguous_gate_up = torch.empty(2, 12, 16, dtype=torch.bfloat16).transpose(1, 2)
