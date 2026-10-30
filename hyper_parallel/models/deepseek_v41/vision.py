@@ -29,14 +29,17 @@ def _vision_cos_sin(
         rope_dim: int,
         rope_theta: float,
         device: torch.device,
+        *,
+        patch_start: int = 0,
+        patch_count: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build DeepSeek's flattened 2D RoPE coefficients for one image grid."""
     inverse_frequency = 1.0 / (
         rope_theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
     )
-    height_positions = torch.arange(grid_height, device=device).unsqueeze(1).expand(grid_height, grid_width)
-    width_positions = torch.arange(grid_width, device=device).unsqueeze(0).expand(grid_height, grid_width)
-    frequencies = torch.stack((height_positions, width_positions), dim=-1).reshape(-1, 2, 1).float()
+    count = grid_height * grid_width if patch_count is None else patch_count
+    positions = torch.arange(patch_start, patch_start + count, device=device)
+    frequencies = torch.stack((positions // grid_width, positions % grid_width), dim=-1).unsqueeze(-1).float()
     frequencies = (frequencies * inverse_frequency).flatten(1)
     return frequencies.cos().unsqueeze(1), frequencies.sin().unsqueeze(1)
 

@@ -793,3 +793,17 @@ logger.getEffectiveLevel()
 ```
 
 如果 logger 位于 `hyper_parallel.models.*`，仅设置 `debug.check_dataset: debug` 不会启用它。
+
+## 9. Encoder Parallel 输入显存
+
+启用 `accelerator.encoder_parallel.enabled` 后，`OmniParallelBatch` 在 CPU 上校验图片元数据，
+再根据 Encoder-DP bucket 和 Encoder-CP segment 提取各 rank 的 patch 分片。完整 `pixel_values`
+保留在 DataLoader 所在的 CPU，不参与普通 batch 的 device 广播。
+
+每个 decoder CP 坐标仍由 TP0 读取数据。由于 TP 组中的 rank 可能属于不同的 Encoder-DP bucket
+或 Encoder-CP 分片，TP0 分别传输各目标的局部 patches，使用最多 4 MiB 的 device staging。
+模型接收 `encoder_parallel_plan` 和 `encoder_parallel_inputs`，后者只包含本地 packed patches；
+padding 和空 bucket 的 dummy patches 均在 CPU 打包。视觉 RoPE 也仅计算本地位置。
+
+该输入路径自动生效，无需额外配置。它减少完整图片搬运导致的额外显存，视觉特征 gather、aligner
+和 attention 的工作空间仍由原有执行计划决定。直接调用模型的原生图片接口继续接受完整图片。

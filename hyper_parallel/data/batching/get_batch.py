@@ -90,6 +90,7 @@ class OmniParallelBatch:
         self.runtime_input_adapter = runtime_input_adapter
         self.cp_sharder = CPBatchSharder(self.parallel_context, token_fields=OMNI_CP_TOKEN_FIELDS)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
+        self.batch_transport = None
         self._batch_index = 0
 
     def __call__(
@@ -116,10 +117,17 @@ class OmniParallelBatch:
                 self.parallel_context.cp_world_size, self.parallel_context.cp_rank, enabled=True,
             )
 
-        device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
+        transport_inputs = {}
+        if self.batch_transport is None:
+            device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
+        else:
+            device_batch, transport_inputs = self.batch_transport(local_batch, self.tp_broadcaster)
         runtime_inputs = self._build_runtime_inputs(device_batch)
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
+        if set(transport_inputs).intersection((*device_batch, *runtime_inputs)):
+            raise ValueError("batch transport cannot replace Omni model or runtime inputs")
         model_inputs.update(runtime_inputs)
+        model_inputs.update(transport_inputs)
         # Shapes are host metadata; inspecting device tensor values here can stall collectives.
         logger.debug(
             "Omni get_batch: batch=%d transport_ready fields=%s runtime_fields=%s",
