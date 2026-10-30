@@ -29,6 +29,10 @@ import torch
 from hyper_parallel.data.batching.build_collate_fn import build_omni_collate_fn
 from hyper_parallel.data.constants import OMNI_CP_TOKEN_FIELDS
 from hyper_parallel.data.parallel import CPBatchSharder, DataLoaderParallelContext
+from hyper_parallel.distributed.context_parallel.compressed_document import (
+    compressed_document_offsets,
+    document_compression_plan,
+)
 from tests.common.mark_utils import arg_mark
 
 
@@ -66,6 +70,37 @@ def _collate_batch(batch: dict[str, torch.Tensor], cp_size: int, tp_size: int = 
 
 class TestOmniBatchCpSharding(unittest.TestCase):
     """Token fields shard per CP rank; modality metadata stays complete."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_natural_documents_keep_boundaries_and_compression_ownership(self) -> None:
+        """Feature: Natural document lengths through Omni CP batching.
+
+        Description: Collate odd documents and a separate ignored padding tail.
+        Expectation: CP preserves boundaries, empty owners and document-local blocks.
+        """
+        boundaries = [0, 1, 2, 3, 4, 7, 12, 15]
+        batch = _make_batch(seq_len=15, pad_tail=0)
+        batch["cu_seq_lens"] = torch.tensor(boundaries, dtype=torch.int32)
+        aligned = _collate_batch(batch, cp_size=4)
+        packed_boundaries = tuple(boundaries + [16])
+        self.assertEqual(aligned["cu_seq_lens"].tolist(), list(packed_boundaries))
+        self.assertEqual(aligned["labels"][0, 15:].tolist(), [-100])
+        torch.testing.assert_close(aligned["input_ids"][:, :15], batch["input_ids"])
+        self.assertEqual(compressed_document_offsets(packed_boundaries, 2),
+                         (0, 0, 0, 0, 0, 1, 3, 4, 4))
+
+        block_rows = []
+        for rank in range(4):
+            local = _build_sharder(4, rank).shard(aligned)
+            self.assertEqual(local["cu_seq_lens"].tolist(), list(packed_boundaries))
+            self.assertEqual(tuple(local["input_ids"].shape), (1, 4))
+            plan = document_compression_plan(packed_boundaries, 2, 4, 4, rank)
+            self.assertEqual(plan.counts, (0, 1, 2, 1))
+            rows = plan.indices(torch.device("cpu"))[0] + plan.route.global_start
+            block_rows.extend(rows.reshape(-1, 2).tolist())
+
+        self.assertEqual(block_rows, [[4, 5], [7, 8], [9, 10], [12, 13]])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -173,7 +208,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_batches_not_aligned_by_collate(self) -> None:
-        """The sharder rejects unaligned tokens instead of changing global boundaries."""
+        """Feature: CP input length validation.
+
+        Description: Shard batches whose lengths are not aligned by collate.
+        Expectation: Reject them without changing global document boundaries.
+        """
         batch = _make_batch(seq_len=11)
         for cp_size, tp_size in ((1, 4), (2, 4), (3, 1)):
             with self.subTest(cp_size=cp_size, tp_size=tp_size):
@@ -183,7 +222,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_boundaries_that_do_not_cover_the_global_sequence(self) -> None:
-        """Packed boundaries must start at zero and cover the complete pre-shard row."""
+        """Feature: Packed document boundary validation.
+
+        Description: Shard boundaries that omit part of the global sequence.
+        Expectation: Reject boundaries that do not cover the complete row.
+        """
         for boundaries in ([1, 8], [0, 7], [0]):
             with self.subTest(boundaries=boundaries):
                 batch = _make_batch()

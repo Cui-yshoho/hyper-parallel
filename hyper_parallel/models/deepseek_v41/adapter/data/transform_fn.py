@@ -97,7 +97,11 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
         return sample
 
     def encode_batch(self, batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Convert packing metadata into the V4.1 model batch contract."""
+        """Convert packing metadata into the V4.1 model batch contract.
+
+        Args:
+            batch: Packed token fields and optional image metadata.
+        """
         encoded_batch = dict(batch)
         if "pixel_values" not in encoded_batch:
             return encoded_batch
@@ -225,7 +229,11 @@ class DeepseekV41SFTTransform(_DeepseekV41OmniTransformBase):
         self.sample_format = sample_format
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
-        """Filter the configured messages or ShareGPT conversations column."""
+        """Filter the configured messages or ShareGPT conversations column.
+
+        Args:
+            sample: Raw conversation record in the configured format.
+        """
         message_key = "conversations" if self.sample_format == "sharegpt" else "messages"
         messages = sample.get(message_key)
         if not isinstance(messages, list):
@@ -236,6 +244,9 @@ class DeepseekV41SFTTransform(_DeepseekV41OmniTransformBase):
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
         """Encode native image conversations and supervise the final assistant reply.
+
+        Args:
+            sample: Raw conversation record, optionally containing images.
 
         Example:
             Input: {"messages": [{"role": "user", "content": "Hi"},
@@ -318,7 +329,11 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
         self.sample_format = sample_format
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
-        """Filter the explicitly selected image-caption or interleaved record schema."""
+        """Filter the explicitly selected image-caption or interleaved record schema.
+
+        Args:
+            sample: Raw image-caption or interleaved record.
+        """
         if self.sample_format == "interleaved":
             texts, images = sample.get("texts"), sample.get("images")
             if not isinstance(texts, list) or not isinstance(images, list):
@@ -336,6 +351,9 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
         """Encode image-caption or interleaved pretraining without adding chat roles.
+
+        Args:
+            sample: Raw image-caption or interleaved record.
 
         Example:
             image-caption input: {"image": "cat.jpg", "caption": "A cat."}
@@ -435,8 +453,9 @@ def build_deepseek_v41_omni_transform(
         sample_format: messages/openai/hf/sharegpt for SFT, image_caption/interleaved for pretrain.
             None retains the existing messages (SFT) or image_caption (pretrain) default.
         sample_alignment_size: Pad each sample before packing to this multiple, with ignored labels.
-            Use the least common multiple of positive CSA compression ratios (2 for CSA2).
-            Defaults to 1 to preserve unpadded samples. Samples exceeding max_seq_len after padding are skipped.
+            Defaults to 1: ordinary TopK supports natural document lengths without sample padding.
+            Explicit candidate-pool configurations still require compression-aligned samples.
+            Samples exceeding max_seq_len after padding are skipped.
 
     Returns:
         SFTTransform for final-reply supervision or PretrainTransform for image-caption/interleaved

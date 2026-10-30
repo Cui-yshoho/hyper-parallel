@@ -217,7 +217,7 @@ dataset:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     sample_format: image_caption  # pretrain: image_caption/interleaved; sft: messages/openai/hf/sharegpt.
     max_seq_len: 1024
-    sample_alignment_size: 2
+    sample_alignment_size: 1
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /path/to/image_caption/train.jsonl
   data_config: {}
