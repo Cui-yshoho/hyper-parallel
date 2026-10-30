@@ -24,7 +24,7 @@ from torch import nn
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
-from hyper_parallel.trainer.config import PlanOverride, Target, entries_to_module_replacements
+from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
 
 
 def _source(index_source=False):
@@ -153,10 +153,13 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         for use_fused_ops in (False, True):
             with self.subTest(use_fused_ops=use_fused_ops):
                 entry = PlanOverride(
-                    match="model.layers.*.self_attn", module_type="torch.nn.Module",
-                    replace_module=Target(attention.SharedCompressedDSAAttention,
-                                          target_path=f"{attention.__name__}.SharedCompressedDSAAttention",
-                                          use_fused_ops=use_fused_ops),
+                    match="model.layers.*.self_attn",
+                    replace=ReplaceAction(
+                        kind="module", source_type="torch.nn.Module",
+                        implementation=Target(attention.SharedCompressedDSAAttention,
+                                              target_path=f"{attention.__name__}.SharedCompressedDSAAttention",
+                                              use_fused_ops=use_fused_ops),
+                    ),
                 )
                 factory = entries_to_module_replacements([entry])[0].factory
                 source = _source(True)

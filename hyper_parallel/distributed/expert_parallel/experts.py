@@ -359,7 +359,7 @@ def _resolve_capacity_factor(module: Any) -> Optional[float]:
 
     Resolution order: the ``HP_EP_CAPACITY_FACTOR`` env override (handy for a sweep without
     editing YAML), then the MoE block's own ``capacity_factor`` attribute (set by the EP recipe
-    from ``plan_overrides[].local_compute_fn``), then off.  Off is the default, so an
+    from a ``plan_overrides[].replace`` forward implementation), then off. Off is the default, so an
     unconfigured run keeps the previous behaviour exactly.
 
     Args:

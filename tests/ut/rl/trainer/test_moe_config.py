@@ -59,7 +59,8 @@ def test_moe_runtime_uses_public_recipe_and_native_rollout(moe_config: dict) -> 
     assert runtime.accelerator.ep_size == 2
     assert runtime.fsdp_config.edp_shard_size == 2
     assert any(entry.when == "ep" for entry in runtime.plan_overrides)
-    assert any(entry.replace_module is not None for entry in runtime.plan_overrides)
+    assert any(entry.replace is not None and entry.replace.kind == "module"
+               for entry in runtime.plan_overrides)
     resolved = resolve_vllm_automatic_limits(moe_config)
     assert resolved["rollout"]["vllm"]["max_num_seqs"] > 0
 
