@@ -20,12 +20,12 @@ from typing import Any, Mapping, Sequence
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.distributed.context_parallel import ulysses_head_to_seq, ulysses_seq_to_head
 from hyper_parallel.distributed.encoder_parallel.attention import (
     current_encoder_attention_context,
+    encoder_attention_checkpoint_contexts,
 )
 from hyper_parallel.distributed.encoder_parallel.contracts import (
     EncoderParallelAdapterSpec,
@@ -36,6 +36,7 @@ from hyper_parallel.distributed.encoder_parallel.contracts import (
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAttention,
     _apply_vision_rotary,
+    _vision_attention,
     _vision_cos_sin,
 )
 from hyper_parallel.models.replacement import module_replacement
@@ -178,12 +179,16 @@ class DeepseekV41VisionBridge:
             raise NotImplementedError(
                 "unsupported encoder loss layout; config_path=accelerator.loss_parallel"
             )
+        supported = {id(block) for block in self.vision.blocks
+                     if isinstance(block, CheckpointWrapper)
+                     and block.checkpoint_kwargs.get("context_fn") is encoder_attention_checkpoint_contexts
+                     and block.checkpoint_kwargs.get("early_stop") is False}
         forbidden = [name for name, module in self.vision.named_modules()
-                     if isinstance(module, CheckpointWrapper)]
+                     if isinstance(module, CheckpointWrapper) and id(module) not in supported]
         forbidden.extend(name for name, module in self.aligner.named_modules()
                          if isinstance(module, CheckpointWrapper))
         if forbidden:
-            raise RuntimeError(f"vision activation checkpoint is unsupported: {forbidden}")
+            raise RuntimeError(f"encoder requires context-preserving full vision-block checkpoints: {forbidden}")
 
     def parse_images(self, batch: Mapping[str, Any]) -> tuple[EncoderWorkItem, ...]:
         """Validate native image metadata and expose complete image jobs.
@@ -345,14 +350,8 @@ class DeepseekV41EncoderParallelAttention(DeepseekV41VisionAttention):
             k = ulysses_seq_to_head(key[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
             v = ulysses_seq_to_head(value[start:stop], seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh)
             global_length = segment.local_padded_length * context.cp_mesh.size()
-            mask = None
-            if not segment.is_dummy and segment.item.sequence_length < global_length:
-                indices = torch.arange(global_length, device=q.device)
-                mask = (indices < segment.item.sequence_length).view(1, 1, -1)
-            attended = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), attn_mask=mask,
-                is_causal=False,
-            ).transpose(0, 1)
+            key_length = global_length if segment.is_dummy else segment.item.sequence_length
+            attended = _vision_attention(self, q, k, v, key_length=key_length)
             outputs.append(ulysses_head_to_seq(attended, seq_dim=0, head_dim=1, cp_mesh=context.cp_mesh))
         return self.wo(torch.cat(outputs, dim=0).reshape(count, -1))
 

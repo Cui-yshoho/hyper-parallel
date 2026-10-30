@@ -57,6 +57,62 @@ def _apply_vision_rotary(
     )
 
 
+def _npu_vision_attention(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+) -> torch.Tensor:
+    """Run bidirectional fused attention on canonical BNSD tensors."""
+    # The NPU extension is optional for CPU/GPU vision and checkpoint tests.
+    from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
+        npu_fusion_attention_forward,
+    )
+
+    output, _ = npu_fusion_attention_forward(
+        module, query, key, value, attention_mask=None,
+        dropout=0.0, scaling=query.shape[-1] ** -0.5,
+        is_causal=False, sparse_mode=0,
+        pre_tokens=2147483647, next_tokens=2147483647,
+    )
+    return output
+
+
+def _vision_attention(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_length: int | None = None,
+) -> torch.Tensor:
+    """Attend one image without materializing its padding mask.
+
+    Args:
+        module: Owning vision attention module.
+        query: Query rows in sequence/head/dimension order, including padding.
+        key: Key rows in the same order.
+        value: Value rows in the same order.
+        key_length: Valid key/value prefix length, or None for a complete image.
+
+    Returns:
+        Attended rows in sequence/head/dimension order.
+    """
+    if key_length is not None:
+        key = key[:key_length]
+        value = value[:key_length]
+    heads, head_dim = query.shape[1:]
+    # Canonical singleton strides are required by native attention entry points.
+    query = query.transpose(0, 1).contiguous().view(1, heads, query.shape[0], head_dim)
+    key = key.transpose(0, 1).contiguous().view(1, heads, key.shape[0], head_dim)
+    value = value.transpose(0, 1).contiguous().view(1, heads, value.shape[0], head_dim)
+    if query.device.type == "npu":
+        return _npu_vision_attention(module, query, key, value).squeeze(0)
+    output = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
+        query, key, value, is_causal=False,
+    )
+    return output.squeeze(0).transpose(0, 1)
+
+
 class DeepseekV41VisionRMSNorm(nn.Module):
     """The FP32-weight RMSNorm used by the released V4.1 vision tower."""
 
@@ -128,13 +184,8 @@ class DeepseekV41VisionAttention(nn.Module):
         )
         query = _apply_vision_rotary(query, cosine, sine)
         key = _apply_vision_rotary(key, cosine, sine)
-        attention_output = functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-            query.transpose(0, 1),
-            key.transpose(0, 1),
-            value.transpose(0, 1),
-            is_causal=False,
-        )
-        return self.wo(attention_output.transpose(0, 1).reshape(token_count, -1))
+        attention_output = _vision_attention(self, query, key, value)
+        return self.wo(attention_output.reshape(token_count, -1))
 
 
 class DeepseekV41VisionMLP(nn.Module):
@@ -182,6 +233,8 @@ class DeepseekV41VisionTower(nn.Module):
     def __init__(self, config: Any) -> None:
         """Create the configured vision tower from V4.1 extension fields."""
         super().__init__()
+        # Let the model-owned checkpoint policy discover every vision block.
+        self.gradient_checkpointing = False
         self.hidden_size = int(config.v41_vision_hidden_size)
         self.patch_size = int(config.v41_vision_patch_size)
         self.num_attention_heads = int(config.v41_vision_num_attention_heads)
