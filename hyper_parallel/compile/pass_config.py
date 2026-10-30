@@ -47,7 +47,10 @@ from typing import Any, Optional
 # Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
 # the config dataclass stays importable anywhere; ``pp_schedule``'s registry
 # (which does import torch) must expose exactly these keys.
-PP_SCHEDULES = ("gpipe", "1f1b")
+PP_SCHEDULES = ("gpipe", "1f1b", "interleaved_1f1b", "vpp")
+
+# Schedule names that can drive multiple virtual stages per physical rank.
+_INTERLEAVED_SCHEDULES = ("interleaved_1f1b", "vpp")
 
 # Data-parallel modes, mirroring simplefsdp's ``data_parallel`` modes:
 #   "fsdp" -> fully_shard        (Shard(0) on the fsdp axis)
@@ -129,18 +132,25 @@ class PassConfig:
             ``True`` the joint fwd+bwd graph is sliced to this rank's stage
             along module-FQN boundaries declared in ``GraphParallelPlan``, cross-stage
             activations are exchanged via P2P ``isend``/``irecv``, and a
-            self-contained GPipe schedule is installed as a ``call_module``
+            self-contained pipeline schedule is installed as a ``call_module``
             stub inside the rewritten graph, so the trainer needs no PP
             wiring. ``PpPass`` early-returns when distributed is not
             initialized or ``world_size == 1``.
-        pp_degree: Number of pipeline-parallel ranks (== number of stages
-            for the single-virtual-stage schedule shipped here). ``None``
-            means "resolve at runtime": pure-PP resolves it from
+        pp_degree: Number of pipeline-parallel ranks (physical stages).
+            ``None`` means "resolve at runtime": pure-PP resolves it from
             ``world_size``; the PP+DP hybrid resolves it from the 2-D
             ``(pp, DP)`` mesh built by ``GraphCompiler._init_pp_dp_mesh``
             (which also back-fills ``fsdp_degree`` /
             ``dp_replicate_degree``), subject to
             ``pp_degree * dp_degree == world_size``.
+        pp_chunks: Number of virtual pipeline stages per physical rank.
+            ``1`` (default) is the classic single-stage-per-rank layout used
+            by ``"gpipe"`` / ``"1f1b"``. Values ``> 1`` enable VPP
+            (interleaved 1F1B): the model is split into
+            ``pp_degree * pp_chunks`` virtual stages, rank ``r`` owns virtual
+            stages ``r, r + pp_degree, ...``, and the ``"interleaved_1f1b"``
+            schedule pipelines the virtual stages. Requires
+            ``pp_schedule`` to be an interleaved schedule.
         pp_microbatch_size: Number of samples per microbatch for the
             pipeline schedule. The per-step batch size (the leading dim of
             the trainer's input tensor) must be divisible by this. ``1`` means
@@ -154,6 +164,9 @@ class PassConfig:
             bubble and freeing each microbatch's activations as soon as its
             backward runs (GPipe retains all of them until the sweep ends);
             it requires ``num_microbatches >= pp_degree``.
+            ``"interleaved_1f1b"`` (alias ``"vpp"``) is the VPP schedule: it
+            supports ``pp_chunks > 1`` virtual stages per rank and uses the
+            classic interleaved-1F1B warmup / steady / cooldown order.
             ``PpPass`` resolves the name to a schedule class via
             ``pp_schedule.get_schedule_class``.
 
@@ -172,6 +185,7 @@ class PassConfig:
     dp_replicate_degree: Optional[int] = None
     pp_enabled: bool = False
     pp_degree: Optional[int] = None
+    pp_chunks: int = 1
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
     fsdp_allgather_prefetch: bool = True
@@ -189,7 +203,8 @@ class PassConfig:
             ValueError: On a non-positive explicit ``fsdp_degree`` /
                 ``pp_degree``, a non-positive ``pp_microbatch_size``, an
                 unknown ``pp_schedule`` / ``dp_mode``, or a non-positive
-                ``dp_replicate_degree``.
+                ``dp_replicate_degree``, or ``pp_chunks > 1`` with a
+                non-interleaved schedule.
         """
         self._validate_flags()
         self._validate_dp()
@@ -233,6 +248,8 @@ class PassConfig:
             raise ValueError(
                 f"pp_degree must be None or a positive int, got {self.pp_degree}"
             )
+        if self.pp_chunks < 1:
+            raise ValueError(f"pp_chunks must be >= 1, got {self.pp_chunks}")
         if self.pp_microbatch_size < 1:
             raise ValueError(
                 f"pp_microbatch_size must be >= 1, got {self.pp_microbatch_size}"
@@ -242,6 +259,14 @@ class PassConfig:
         ):
             raise ValueError(
                 f"pp_schedule must be one of {PP_SCHEDULES}, got {self.pp_schedule!r}"
+            )
+        if (
+            self.pp_chunks > 1
+            and self.pp_schedule.lower() not in _INTERLEAVED_SCHEDULES
+        ):
+            raise ValueError(
+                f"pp_chunks={self.pp_chunks} requires an interleaved schedule "
+                f"(one of {_INTERLEAVED_SCHEDULES}), got {self.pp_schedule!r}"
             )
 
 

@@ -86,6 +86,11 @@ class TestPassConfigDefaults(unittest.TestCase):
             "gpipe",
             (f"pp_schedule default should be 'gpipe', got {cfg.pp_schedule!r}"),
         )
+        self.assertEqual(
+            cfg.pp_chunks,
+            1,
+            (f"pp_chunks default should be 1, got {cfg.pp_chunks}"),
+        )
 
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
@@ -171,6 +176,21 @@ class TestPassConfigValidation(unittest.TestCase):
                 str(ctx.exception),
                 f"error for pp_schedule={bad!r} should mention pp_schedule",
             )
+
+    def test_pp_chunks_validation(self):
+        """Test ``pp_chunks`` bounds and its interleaved-schedule requirement."""
+        for bad in (0, -1):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_chunks=bad)
+            self.assertIn("pp_chunks", str(ctx.exception))
+        for bad_schedule in ("gpipe", "1f1b"):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_chunks=2, pp_schedule=bad_schedule)
+            self.assertIn("pp_chunks", str(ctx.exception))
+        for good in ("vpp", "interleaved_1f1b"):
+            cfg = PassConfig(pp_chunks=2, pp_schedule=good)
+            self.assertEqual(cfg.pp_chunks, 2)
+            self.assertEqual(cfg.pp_schedule, good)
 
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.
