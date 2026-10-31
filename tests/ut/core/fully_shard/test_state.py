@@ -719,7 +719,10 @@ class TestHSDPStateV2(unittest.TestCase):
         other_state.param_group.reset_iter_state.assert_not_called()
 
     def test_scheduler_reset_clears_pipeline_and_recompute_state(self):
-        """Scheduler reset should clear hooks and restore prefetch configuration."""
+        """Feature: Scheduler iteration reset.
+        Description: Reset communication, callback, and recompute bookkeeping.
+        Expectation: Pending state is cleared and prefetch configuration is restored.
+        """
         scheduler = object.__new__(HSDPSchedulerV2)
         scheduler.scheduler_state = object()
         scheduler._fsdp_group_post_pending = {object()}
@@ -732,10 +735,12 @@ class TestHSDPStateV2(unittest.TestCase):
         comm_ctx.all_reduce_param_group = object()
         comm_ctx.comm_handle = object()
         scheduler.scheduler_ctx.root_bp_state = True
+        scheduler.scheduler_ctx.post_backward_final_callback_queued = True
 
         scheduler.reset_iter_state()
 
         self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
+        self.assertFalse(scheduler.scheduler_ctx.post_backward_final_callback_queued)
         self.assertIsNone(scheduler.scheduler_state)
         self.assertEqual(scheduler._fsdp_group_post_pending, set())
         self.assertEqual(scheduler.forward_prefetch_cells, ["prefetch"])

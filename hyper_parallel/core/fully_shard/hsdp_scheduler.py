@@ -78,6 +78,7 @@ class HSDPSchedulerContext:
         # parameter state only on the first real forward.
         self.lazy_init_done: bool = False
         self.root_bp_state = False
+        self.post_backward_final_callback_queued = False
         # all_hsdp_schedulers (for one module tree structure), deduplicated at
         # registration time because ``fully_shard`` may be given a module list
         # whose modules share one scheduler.
@@ -219,6 +220,7 @@ class HSDPSchedulerV2:
     def reset_iter_state(self) -> None:
         """Reset scheduler bookkeeping after a completed iteration."""
         self.scheduler_ctx.root_bp_state = False
+        self.scheduler_ctx.post_backward_final_callback_queued = False
         self.scheduler_ctx.pre_reduce_scatter_params.clear()
         self.scheduler_ctx.pre_all_reduce_params.clear()
         self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
@@ -522,8 +524,10 @@ class HSDPSchedulerV2:
         """Execute backward pre hook."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
-        if self._is_root:
-            Variable._execution_engine.queue_callback(self._root_backward_hook)
+        if not self.scheduler_ctx.post_backward_final_callback_queued:
+            self.scheduler_ctx.post_backward_final_callback_queued = True
+            root_scheduler = self.scheduler_ctx.root_module.hsdp_scheduler
+            Variable._execution_engine.queue_callback(root_scheduler._root_backward_hook)
         self.scheduler_ctx.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
@@ -545,6 +549,11 @@ class HSDPSchedulerV2:
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
             self.launch_tp_replicate_reduce_and_apply()
+        # BACKWARD only deduplicates hooks within one autograd execution;
+        # accumulated no-sync gradients must outlive this state reset.
+        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            scheduler.scheduler_state = None
+        self.scheduler_ctx.post_backward_final_callback_queued = False
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.
