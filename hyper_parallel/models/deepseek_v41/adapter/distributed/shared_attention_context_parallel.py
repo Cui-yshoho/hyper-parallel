@@ -14,6 +14,8 @@
 # ============================================================================
 """Build TP/CP contexts for DeepSeek-V4.1 shared attention."""
 
+from __future__ import annotations
+
 from functools import wraps
 from typing import Any
 
@@ -33,11 +35,29 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
 from hyper_parallel.distributed.context_parallel.compressed_document import CompressionBoundaryRoute
+from hyper_parallel.distributed.context_parallel.indexer_balance import (
+    balanced_indexer_select, launch_indexer_inputs, resolve_indexer_balance_block_size,
+    validate_indexer_hybrid_threshold,
+)
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import async_sequence_dispatch
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
-def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentionCPContext:
-    """Bind existing CP gathers to the shared compression and attention module."""
+def _build_shared_attention_cp_context(
+        cp_mesh: Any, indexer_load_balance: str = "none",
+        main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
+        indexer_zigzag_min_length: int | None = None,
+) -> SharedCompressedAttentionCPContext:
+    """Build raw/main bank communication while keeping Index K globally gathered."""
+    if main_kv_comm not in ("all_gather", "all_to_all_v"):
+        raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+    indexer_balance_block_size = resolve_indexer_balance_block_size(
+        indexer_load_balance, indexer_balance_block_size,
+    )
+
+    validate_indexer_hybrid_threshold(
+        indexer_load_balance, indexer_zigzag_min_length,
+    )
 
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
@@ -62,12 +82,37 @@ def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentio
         # Even empty receives must remain connected so every rank participates in backward.
         return torch.cat((received, local), dim=0).movedim(0, 1).contiguous()
 
+    def _launch_dispatch(tensor: torch.Tensor, sequence_dim: int, route: Any) -> Any:
+        """Exchange planned bank intervals on the existing CP group."""
+        return async_sequence_dispatch(tensor, sequence_dim, route, cp_mesh.get_group())
+
+    def _balance_indexer(query_residual, weights, embeddings, selector, lengths, ratio):
+        """Move only selection tasks; differentiable banks and KL remain with owners."""
+        return balanced_indexer_select(
+            query_residual, weights, embeddings, selector, lengths, ratio, indexer_load_balance,
+            cp_mesh.get_group(), indexer_balance_block_size,
+            indexer_zigzag_min_length,
+        )
+
+    def _launch_balance(query_residual, weights, embeddings, lengths, ratio):
+        """Launch no-grad selection inputs before independent owner projections."""
+        return launch_indexer_inputs(
+            query_residual, weights, embeddings, lengths, ratio, indexer_load_balance,
+            cp_mesh.get_group(), indexer_balance_block_size,
+            indexer_zigzag_min_length,
+        )
+
     cp_context = SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
         gather_sequence=_gather_sequence,
         launch_sequence=_launch_sequence,
         exchange_boundary=_exchange_boundary,
+        launch_raw=_launch_dispatch,
+        launch_main=_launch_dispatch if main_kv_comm == "all_to_all_v" else None,
+        balance_indexer=_balance_indexer if indexer_load_balance != "none" else None,
+        launch_balance=_launch_balance if indexer_load_balance != "none" else None,
+        indexer_priority=True,
     )
     return cp_context
 
@@ -99,9 +144,9 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 ) -> _ForwardRewriteRequest:
     """Install V4.1's explicit TP Indexer and Colossal CP collectives.
 
-    Queries and Top-K indices remain sequence-local; raw KV, compressed KV,
-    and index keys use asynchronous differentiable all-gather. Projection
-    GEMMs overlap communication. Indexer Q/merge heads remain TP-local and
+    Raw KV uses SWA halo all-to-all-v.
+    Main KV selects prefix dispatch or all-gather; Index K remains globally gathered.
+    Launch/wait separation permits independent projection work. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
     Packed compression grouping is owned by the shared module; this adapter
     supplies communication callbacks without changing data boundaries.
@@ -117,7 +162,11 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 
     original_forward = target_module.forward
     cp_context = (
-        _build_shared_attention_cp_context(cp_mesh)
+        _build_shared_attention_cp_context(
+            cp_mesh, target_module.indexer_load_balance, target_module.main_kv_comm,
+            target_module.indexer_balance_block_size,
+            target_module.indexer_zigzag_min_length,
+        )
         if cp_mesh is not None and cp_mesh.size() > 1
         else None
     )
@@ -129,7 +178,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 
     @wraps(original_forward)
     def cp_forward(*args: Any, **kwargs: Any) -> Any:
-        """Run local queries against CP-replicated V4.1 key/value states."""
+        """Run local queries against the configured V4.1 bank layouts."""
         if "shared_attention_cp_context" in kwargs or "shared_attention_tp_context" in kwargs:
             raise ValueError("shared attention parallel contexts are owned by the wrapper")
         call_kwargs = dict(kwargs)
