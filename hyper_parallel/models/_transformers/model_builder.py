@@ -884,6 +884,16 @@ def _refresh_hsdp_precision_state(model: nn.Module) -> None:
             hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)
 
 
+def _model_fp32_parameter_ids(model: nn.Module) -> set[int]:
+    """Collect parameters declared by modules through local ``fp32_parameter_names``."""
+    return {
+        id(parameter)
+        for module in model.modules()
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False)
+        if name in getattr(module, "fp32_parameter_names", ())
+    }
+
+
 def _validate_model_state_dtype(
         model: nn.Module,
         target_dtype: torch.dtype,
@@ -891,10 +901,12 @@ def _validate_model_state_dtype(
     """Validate floating model parameters and buffers against a resolved dtype."""
     external = get_model_external_state(model)
     external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
+    fp32_ids = _model_fp32_parameter_ids(model)
     mismatched = [
         name
         for name, tensor in model.named_parameters(remove_duplicate=False)
-        if id(tensor) not in external_ids and tensor.is_floating_point() and tensor.dtype != target_dtype
+        if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
+        and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
     ]
     mismatched.extend(
         name for name, tensor in model.named_buffers(remove_duplicate=False)
