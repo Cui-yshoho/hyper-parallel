@@ -175,6 +175,15 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
         )
 
+        local_gradient = torch.arange(6, dtype=torch.float32).view(2, 3)
+        with patch.object(DTensor, "from_local", side_effect=AssertionError("slow constructor called")):
+            sharded_gradient = hsdp_param.to_sharded_dtensor(local_gradient)
+        self.assertIs(sharded_gradient.layout, hsdp_param._sharding_spec)
+        self.assertIs(sharded_gradient.to_local(), local_gradient)
+        self.assertEqual(sharded_gradient.shape, (5, 3))
+        self.assertEqual(sharded_gradient.placements, (Shard(0, uneven_shard=True),))
+        self.assertEqual(sharded_gradient.layout.tensor_stride, (3, 1))
+
         loaded_local_tensor = torch.full((2, 3), 9.0)
         loaded_dtensor = DTensor.from_local_with_layout(
             loaded_local_tensor,

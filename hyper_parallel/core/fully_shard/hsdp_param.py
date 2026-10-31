@@ -794,17 +794,18 @@ class HSDPParamV2:
         """
         Converts a local tensor representing either the sharded parameter or
         sharded gradient to DTensor.
+
+        The parameter-owned sharding specification already contains the
+        logical shape, stride, dtype, and placements. Reusing it avoids the
+        metadata deepcopy performed by ``DTensor.from_local`` when explicit
+        shape and stride are supplied. The returned DTensor intentionally
+        shares this layout with the sharded parameter.
         """
-        sharded_dtensor = DTensor.from_local(
+        return DTensor.from_local_with_layout(
             tensor,
-            self._sharding_spec.mesh,
-            self._sharding_spec.placements,
+            self._sharding_spec,
             shape=self._sharding_spec.tensor_shape,
-            stride=self._sharding_spec.tensor_stride,
         )
-        sharded_dtensor._layout = self._sharding_spec
-        sharded_dtensor._placements = tuple(self._sharding_spec.placements)
-        return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
         """Move the current unsharded gradient into the accumulation buffer."""
