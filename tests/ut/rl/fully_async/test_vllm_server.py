@@ -17,14 +17,14 @@ import asyncio
 import json
 import threading
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
 from rl.agentic.core.program_runner import ProgramAgentRunner
-from rl.async_training.vllm_server import CallAdmissionMiddleware, PartialRequestService, install_async_routes
+from rl.fully_async.vllm_server import CallAdmissionMiddleware, PartialRequestService, install_async_routes
 from rl.roles.rollout.base import GenerationRequest, GenerationSettings
 from rl.roles.rollout.client import HTTPGenerationEngine
 
@@ -65,6 +65,93 @@ class TestCallPublication(unittest.IsolatedAsyncioTestCase):
             await self.service.resume({"policy_version": 2})
         self.assertFalse(self.service.admission.is_set())
         self.assertTrue(self.service.closed)
+
+    async def test_pause_failure_keeps_admission_closed(self):
+        self.engine.pause_generation.side_effect = RuntimeError("pause failed")
+        with self.assertRaisesRegex(RuntimeError, "pause failed"):
+            await self.service.pause()
+        self.assertTrue(self.service.closed)
+        self.assertFalse(self.service.admission.is_set())
+        self.engine.resume_generation.assert_not_awaited()
+
+    async def test_resume_failure_keeps_admission_closed(self):
+        await self.service.pause()
+        self.engine.resume_generation.side_effect = RuntimeError("resume failed")
+        with self.assertRaisesRegex(RuntimeError, "resume failed"):
+            await self.service.resume({"policy_version": 1})
+        self.assertTrue(self.service.closed)
+        self.assertFalse(self.service.admission.is_set())
+        self.assertIsNone(self.service.committed_version)
+
+    async def test_admission_stays_closed_until_engine_resume_completes(self):
+        """Verify admission stays closed until engine resume completes."""
+        await self.service.pause()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def resume_engine() -> None:
+            """Hold engine recovery until the test releases it."""
+            entered.set()
+            await release.wait()
+
+        self.engine.resume_generation.side_effect = resume_engine
+        resume = asyncio.create_task(self.service.resume({"policy_version": 1}))
+        following = asyncio.create_task(self.service.enter_call("following"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            self.assertFalse(self.service.admission.is_set())
+            self.assertFalse(following.done())
+            release.set()
+            result, version = await asyncio.wait_for(asyncio.gather(resume, following), timeout=2)
+            self.assertEqual(result, {"status": "resumed"})
+            self.assertEqual(version, 1)
+            self.service.leave_call("following", version)
+        finally:
+            resume.cancel()
+            following.cancel()
+            await asyncio.gather(resume, following, return_exceptions=True)
+
+    async def test_pause_waits_for_request_registration_before_aborting(self):
+        """Verify pause waits for request registration before aborting."""
+        entered, registered, aborted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        output = SimpleNamespace(finished=True, outputs=[SimpleNamespace(
+            token_ids=[], logprobs=[], finish_reason="abort")])
+
+        async def receive_output() -> Any:
+            """Deliver the abort marker after engine pause."""
+            await aborted.wait()
+            return output
+
+        collector = Mock(get_nowait=Mock(return_value=None), get=AsyncMock(side_effect=receive_output))
+
+        async def add_request(*_args: Any) -> Any:
+            """Hold a request inside engine registration."""
+            entered.set()
+            await registered.wait()
+            return collector
+
+        self.engine.add_request = AsyncMock(side_effect=add_request)
+        self.engine.pause_generation.side_effect = lambda **_: aborted.set()
+        generation = asyncio.create_task(self.service.generate({
+            "request_id": "racing", "max_tokens": 4, "prompt_token_ids": [1]}))
+        pause = None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            pause = asyncio.create_task(self.service.pause())
+            await asyncio.sleep(0)
+            self.engine.pause_generation.assert_not_awaited()
+            registered.set()
+            result, status = await asyncio.wait_for(asyncio.gather(generation, pause), timeout=2)
+            self.assertEqual(result["finish_reason"], "abort")
+            self.assertEqual(status, {"status": "paused"})
+            self.assertEqual(self.service.active, 0)
+            self.assertTrue(self.service.idle.is_set())
+            self.assertFalse(self.service.admission.is_set())
+            collector.close.assert_called_once_with()
+        finally:
+            pending = [generation] if pause is None else [generation, pause]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def test_disagreeing_workers_cannot_admit_call(self):
         self.engine.collective_rpc.return_value = [{"version": 1}, {"version": 2}]
@@ -137,10 +224,10 @@ class TestCallPublication(unittest.IsolatedAsyncioTestCase):
         modules = {"vllm": vllm, "vllm.entrypoints": entrypoints,
                    "vllm.entrypoints.serve": serve, "vllm.sampling_params": sampling, "fastapi": fastapi}
         with patch.dict("sys.modules", modules), patch(
-                "rl.async_training.vllm_server.package_version",
+                "rl.fully_async.vllm_server.package_version",
                 side_effect=lambda name: "0.23.0" if name == "vllm" else "0.23.0.post1"):
             install_async_routes()
-            serve.register_vllm_serve_api_routers(app)
+            getattr(serve, "register_vllm_serve_api_routers")(app)
         routes = {call.args[0]: call.args[1] for call in app.add_api_route.call_args_list}
         self.assertEqual(set(routes), {"/v1/chat/completions", "/hyper_async/generate",
                                        "/hyper_async/pause", "/hyper_async/resume"})
@@ -156,7 +243,7 @@ class TestCallPublication(unittest.IsolatedAsyncioTestCase):
         registration = app.add_middleware.call_args
         middleware = registration.args[0](native_application, **registration.kwargs)
 
-        async def post(path: str, payload: dict | None = None) -> Any:
+        async def post(path: str, payload: Optional[dict] = None) -> Any:
             """Execute real control endpoints or capture real middleware ASGI messages."""
             if path.startswith("/hyper_async/"):
                 request = SimpleNamespace(app=app, url=SimpleNamespace(path=path),

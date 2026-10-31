@@ -19,7 +19,7 @@ import time
 from dataclasses import asdict, fields, replace
 from functools import partial
 from operator import methodcaller
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -28,9 +28,8 @@ from rl.utils.async_audit import (
     EventTrace, record_async_state, record_async_rollout, record_async_checkpoint, install_async_audit,
     begin_async_update, finish_async_update, record_async_selection, record_publication_timing,
 )
-from rl.async_training.protocol import AsyncCheckpoint, ExperienceBuffer
-from rl.async_training.protocol import decode_group, validate_async_config
-from rl.async_training.fully_async_rollouter import AsyncRuntime
+from rl.fully_async.protocol import AsyncCheckpoint, ExperienceBuffer, decode_group, validate_async_config
+from rl.fully_async.fully_async_rollouter import AsyncRuntime
 from rl.dataset.batch_builder import build_experience_batch
 from rl.trainer import RLRoleRuntime
 from rl.utils.monitoring.async_metrics import report_async_update
@@ -45,6 +44,7 @@ class FullyAsyncTrainer:
     """Keep optimizer updates and publication collectives on one training thread."""
 
     def __init__(self, config: Mapping[str, Any]) -> None:
+        """Build the learner runtime and bounded sampling coordinator."""
         self.settings = validate_async_config(config)
         self.config = dict(config)
         self.config["async_training"] = asdict(self.settings)
@@ -54,7 +54,7 @@ class FullyAsyncTrainer:
         self.trace = EventTrace(self.settings.audit_dir, "trainer", self.rank)
         self.loss_audit = install_async_audit(self.roles, self.trace, self.settings.audit_dir is not None)
         self.buffer = ExperienceBuffer(self.settings, config["rollout"]["num_return_sequences"])
-        self.sampler: AsyncRuntime | None = None
+        self.sampler: Optional[AsyncRuntime] = None
         self.source_update = self.last_publication = self.optimizer_steps = 0
         self.version = 1
 
@@ -216,13 +216,12 @@ class FullyAsyncTrainer:
         finally:
             failed = sys.exc_info()[0] is not None
             cleanup_errors = []
-            resources = []
-            if self.rank == 0 and self.sampler is not None:
-                resources.append(("sampler", lambda: self.sampler.close(graceful=completed)))
-            resources.extend((
+            resources = [
                 ("roles", self.roles.close),
                 ("trace", lambda: self.trace.emit("run_end", completed=completed, update=self.roles.state.global_step)),
-            ))
+            ]
+            if self.rank == 0 and self.sampler is not None:
+                resources.insert(0, ("sampler", lambda: self.sampler.close(graceful=completed)))
             for name, close in resources:
                 try:
                     close()
