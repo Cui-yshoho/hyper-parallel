@@ -228,3 +228,46 @@ The EMA Nesterov update folds the two interpolations into
 `u = (1 - mu1**2) * grad + mu1**2 * old_buffer`. The buffer still uses `mu2`,
 including when `mu1 != mu2`. Floating-point rounding may differ from two separate
 interpolations.
+
+### Optional Gram Newton-Schulz backend
+
+`get_hyper_optimizer(..., ns_backend="gram")` installs a Gram adapter through
+Muon's advanced `zeropower_fn` callback. The default `ns_backend="native"` retains
+the built-in implementation and does not import the optional package.
+
+Install [Dao-AILab Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz)
+with `pip install gram-newton-schulz --no-build-isolation`. Its documented runtime
+requirements are PyTorch 2.7.1+, CUDA 12.9+, and a Hopper or Blackwell GPU. CPU, NPU,
+older GPU architectures, and missing dependencies produce explicit errors when
+Gram is requested; select `"native"` for those environments.
+
+```python
+optimizer = get_hyper_optimizer(
+    model=model,
+    muon_params=muon_groups,
+    adamw_params=adamw_groups,
+    muon_kwargs={"momentum_mode": "vanilla", "ns_variant": "asym5", "ns_steps": 5},
+    ns_backend="gram",
+)
+```
+
+The adapter directly calls the package's `GramNewtonSchulz`; HyperParallel does
+not duplicate its algorithm. It forwards each group's effective coefficient
+schedule (`legacy`, `asym5`, or `custom`), `ns_steps`, and `ns_epsilon`, including
+changes after checkpoint restoration. Instances are cached by device, schedule,
+and epsilon. As in the
+[VeOmni package adapter](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/optim/muon.py),
+compilation is disabled for the wrapper. The default restart is after iteration 2
+when the schedule has more than two iterations. The package handles matrix shape,
+precision, and kernel selection; its floating-point results may differ from native NS.
+
+An explicit `zeropower_fn` conflicts with `ns_backend="gram"` and raises
+`ValueError`. Existing `zeropower_fn(tensor, steps=...)` callbacks keep their
+signature. Callbacks declaring an `ns_config` parameter also receive a dictionary
+with the current `ns_variant`, `ns_coefficients`, and `ns_epsilon`.
+
+Custom NS callbacks, including the Gram adapter, are eligible for `fsdp_overlap=True`
+when the other single-axis FSDP pipeline conditions are met. Callbacks run on the
+caller's compute stream and must join any internal streams before returning.
+The overlap memory estimate uses native NS workspace; reserve additional memory
+for custom backend workspace. CUDA/Gram overlap still requires hardware validation.

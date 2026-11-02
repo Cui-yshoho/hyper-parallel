@@ -15,6 +15,7 @@
 
 """Muon optimizer with HSDP shard-group-aware communication."""
 
+import inspect
 import math
 from collections.abc import Callable, Iterable
 from collections import defaultdict, deque
@@ -116,6 +117,16 @@ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOpti
     resolved = dict(_MUON_ADVANCED_DEFAULTS)
     resolved.update(options)
     return _MuonAdvancedOptions(**resolved)
+
+
+def _accepts_ns_config(function: Optional[Callable[..., Any]]) -> bool:
+    """Detect opt-in configuration forwarding without changing two-argument callbacks."""
+    if function is None:
+        return False
+    try:
+        return "ns_config" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 _TransformNSState = Dict[str, Any]
@@ -248,6 +259,8 @@ class Muon(BaseDistributedOptimizer):
                 fsdp_overlap. The callback must compute independently of other parameters and return
                 a tensor with the input shape, dtype, and device. It runs on the caller's compute
                 stream; work on internal streams must be joined to that stream before returning.
+                A callback declaring an ns_config parameter also receives the current group's
+                ns_variant, ns_coefficients, and ns_epsilon in that dictionary.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
             ns_transform_fn: Optional Newton-Schulz input transformation.
@@ -316,6 +329,7 @@ class Muon(BaseDistributedOptimizer):
         self.hsdp_replicate_dedup = hsdp_replicate_dedup
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
+        self._zeropower_accepts_ns_config = _accepts_ns_config(self.zeropower_fn)
         self.momentum_update_fn = advanced.momentum_update_fn
         self._update_muon_momentum_mode = momentum_mode
         self.ns_transform_fn = advanced.ns_transform_fn
@@ -1285,7 +1299,12 @@ class Muon(BaseDistributedOptimizer):
                 ns_coefficients=ns_coefficients,
             )
         else:
-            merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
+            kwargs = {"steps": ns_steps}
+            if getattr(self, "_zeropower_accepts_ns_config", False):
+                kwargs["ns_config"] = {
+                    "ns_variant": ns_variant, "ns_coefficients": ns_coefficients, "ns_epsilon": ns_epsilon,
+                }
+            merged_update = self.zeropower_fn(merged_input, **kwargs)
 
         if merged_input.dim() == 2:
             merged_update = merged_update.unsqueeze(0)

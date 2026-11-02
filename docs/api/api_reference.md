@@ -749,8 +749,16 @@ get_hyper_optimizer(
     adamw_params: List[Dict[str, Any]],
     muon_kwargs: Optional[Dict[str, Any]] = None,
     adamw_kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    ns_backend: str = "native",
 ) -> ChainedOptimizer
 ```
+
+`ns_backend` selects Muon's NS backend: `"native"` (default) or `"gram"`.
+The optional Gram backend delegates to
+[Dao-AILab Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz)
+through the advanced `zeropower_fn` callback; see the
+[optimizer guide](../guide/optimizer.md#optional-gram-newton-schulz-backend).
 
 **参数：**
 
