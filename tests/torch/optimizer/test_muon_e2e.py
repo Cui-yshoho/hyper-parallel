@@ -49,6 +49,19 @@ def test_muon_e2e_hybrid_shard_replicate_8p():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_muon_e2e_hybrid_shard_replicate_no_dedup_8p():
+    """
+    Feature: Muon e2e precision with HSDP replicate deduplication disabled.
+    Description:
+        All replicas on a (replicate=2, shard=4) mesh compute their own updates.
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_MUON_E2E, "test_muon_e2e_hybrid_shard_replicate_no_dedup_8p", None, 8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_muon_e2e_mixed_mesh_per_module_8p():
     """
     Feature: Muon e2e precision self-consistency with mixed sharding rules in one model.

@@ -343,6 +343,19 @@ def test_muon_e2e_hybrid_shard_replicate_8p():
     _run_sharding_parity_case(_shard_hybrid_2x4, {"hsdp_replica_count": 2})
 
 
+def test_muon_e2e_hybrid_shard_replicate_no_dedup_8p():
+    """
+    Feature: Muon HSDP with replicate deduplication disabled.
+    Description:
+        Each replica on a (replicate=2, shard=4) mesh owns all Muon state and
+        computes its own updates, retaining shard-group NS communication.
+    Expectation: Every step matches the single-card reference within tolerance.
+    """
+    _run_sharding_parity_case(
+        _shard_hybrid_2x4, {"hsdp_replicate_dedup": False, "hsdp_replica_count": 2},
+    )
+
+
 def test_muon_e2e_mixed_mesh_per_module_8p():
     """
     Feature: Muon e2e precision self-consistency with mixed sharding rules in one model.

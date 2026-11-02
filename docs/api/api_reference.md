@@ -707,9 +707,14 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         nesterov: bool = True,
         weight_decay: float = 0.1,
+        hsdp_replicate_dedup: bool = True,
         ...
     )
 ```
+
+`hsdp_replicate_dedup` 控制 HSDP replicate 组内的 Muon 动量和更新计算去冗余。
+默认为 `True`；设为 `False` 时每个 replica 独立维护动量并计算更新，不做 replicate
+广播，且忽略 `hsdp_replica_count`。shard 组内的通信和计算分配保持不变。
 
 ---
 

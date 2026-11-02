@@ -111,6 +111,27 @@ optimizer = get_hyper_optimizer(
 
 ---
 
+### Muon 的 HSDP replicate 去冗余开关
+
+`Muon` 的 `hsdp_replicate_dedup` 参数默认为 `True`，保持现有行为：在 replicate
+组内分配参数 owner，由 owner 维护动量、计算更新，再广播更新后的参数。
+
+设置为 `False` 时，每个 replica 独立维护全部本地参数的动量并计算更新，不进行 Muon
+replicate 参数或状态广播。此时忽略 `hsdp_replica_count`；shard 组内的 all-gather、
+Newton-Schulz 计算分配及更新通信保持不变。关闭去冗余会增加每个 replica 的计算量和优化器状态内存。
+
+```python
+from hyper_parallel.core.optimizer.muon import Muon
+
+optimizer = Muon(muon_params, hsdp_replicate_dedup=False)
+```
+
+通过 `get_hyper_optimizer` 创建时，在 `muon_kwargs` 中传入
+`{"hsdp_replicate_dedup": False}` 或 `{"muon_hsdp_replicate_dedup": False}`。
+所有参与同一 HSDP 通信的 rank 必须使用相同配置；该开关不影响链式优化器中的 AdamW。
+
+---
+
 ## gradient scaling factor + clip_grad
 
 ```python

@@ -228,6 +228,7 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
             momentum_mode: str = "legacy",
+            hsdp_replicate_dedup: bool = True,
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -253,14 +254,21 @@ class Muon(BaseDistributedOptimizer):
             post_update_fn: Optional callback applied after a parameter update.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
-            hsdp_replica_count: Optional optimizer-state replica group size.
-            momentum_mode: Momentum formula, either "legacy" or "vanilla" (EMA).
+            hsdp_replica_count: Optional optimizer-state replica group size. Ignored
+                when hsdp_replicate_dedup is False.
+            momentum_mode: Momentum formula, either "legacy" or "vanilla".
                 Both modes support distinct update and buffer coefficients.
+            hsdp_replicate_dedup: Whether to deduplicate momentum and update computation
+                across HSDP replicas. Defaults to True. If False, every replica maintains
+                its own momentum and computes updates without replicate broadcasts.
+                Shard-group communication and computation assignment are unchanged.
             fsdp_overlap: Pipeline single-axis FSDP communication with Newton-Schulz.
             fsdp_overlap_memory_budget_bytes: Estimated temporary storage budget for queued
                 buckets and prepared inputs. An explicit budget also controls serial buckets for fair comparisons.
                 The estimate uses native NS workspace; reserve extra memory for custom zeropower_fn workspace.
         """
+        if not isinstance(hsdp_replicate_dedup, bool):
+            raise ValueError(f"hsdp_replicate_dedup must be a bool, got {hsdp_replicate_dedup!r}")
         advanced = _resolve_muon_advanced_options(advanced_options)
         if momentum_mode not in ("legacy", "vanilla"):
             raise ValueError(f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}")
@@ -305,6 +313,7 @@ class Muon(BaseDistributedOptimizer):
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
+        self.hsdp_replicate_dedup = hsdp_replicate_dedup
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
@@ -319,12 +328,17 @@ class Muon(BaseDistributedOptimizer):
         self._pipeline_plans = {}
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
-        deduced_count = self._auto_deduce_replica_count()
-        if deduced_count is None:
-            self.hsdp_replica_count = None
-        elif self.hsdp_replica_count is None:
-            self.hsdp_replica_count = deduced_count
-        self._split_replicate_groups()
+        if self.hsdp_replicate_dedup:
+            deduced_count = self._auto_deduce_replica_count()
+            if deduced_count is None:
+                self.hsdp_replica_count = None
+            elif self.hsdp_replica_count is None:
+                self.hsdp_replica_count = deduced_count
+            self._split_replicate_groups()
+        else:
+            # Singleton ownership domains give every replica all local parameters
+            # and suppress broadcasts without creating singleton process groups.
+            self.hsdp_replica_count = 1
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
