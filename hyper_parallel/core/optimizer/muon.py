@@ -637,9 +637,10 @@ class Muon(BaseDistributedOptimizer):
             # m_for_update = (1 - momentum1) * grad + momentum1 * m_old
             # m_new = (1 - momentum2) * grad + momentum2 * m_old
             # pylint: disable=protected-access
-            local_us = torch._foreach_lerp(grads, bufs, weight=momentum1)
-            if nesterov:
-                torch._foreach_lerp_(local_us, grads, weight=1 - momentum1)
+            # The two Nesterov interpolations share grad and the old buffer,
+            # so their combined old-buffer coefficient is momentum1 squared.
+            update_momentum = momentum1 ** 2 if nesterov else momentum1
+            local_us = torch._foreach_lerp(grads, bufs, weight=update_momentum)
             torch._foreach_lerp_(bufs, grads, weight=1 - momentum2)
         elif self._update_muon_momentum_mode == "legacy":
             # Match muon_update_core():

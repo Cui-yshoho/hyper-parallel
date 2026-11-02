@@ -202,3 +202,8 @@ interpolation: `u = (1 - mu1) * grad + mu1 * u`.
 
 Pass `"momentum_mode": "vanilla"` in `get_hyper_optimizer`'s `muon_kwargs` to use
 this path through the factory. Keep the same mode when restoring a checkpoint.
+
+The EMA Nesterov update folds the two interpolations into
+`u = (1 - mu1**2) * grad + mu1**2 * old_buffer`. The buffer still uses `mu2`,
+including when `mu1 != mu2`. Floating-point rounding may differ from two separate
+interpolations.

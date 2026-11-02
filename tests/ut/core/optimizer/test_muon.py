@@ -653,3 +653,32 @@ class TestMuonMomentum(unittest.TestCase):
         outputs = opt._update_muon_momentum(opt.param_groups[0], [param])
         torch.testing.assert_close(outputs[param], torch.full_like(param, 0.5, dtype=torch.bfloat16))
         callback.assert_called_once()
+
+
+class TestMuonNesterovFolding(unittest.TestCase):
+    """Check the folded update independently from momentum state updates."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_folded_nesterov_matches_two_interpolations(self):
+        """
+        Feature: Folded EMA Nesterov interpolation.
+        Description: Compare nonzero old momentum against two explicit FP64 interpolations.
+        Expectation: One update interpolation matches the reference and the buffer uses its own coefficient.
+        """
+        for nesterov in (False, True):
+            with self.subTest(nesterov=nesterov):
+                param = torch.nn.Parameter(torch.zeros(2, 3))
+                param.grad = torch.tensor([[0.2, -0.4, 1.0], [-2.0, 0.0, 0.7]])
+                old = torch.tensor([[3.0, 0.1, -1.0], [0.3, 2.0, -0.2]])
+                opt = Muon([param], momentum=(0.8, 0.3), nesterov=nesterov, momentum_mode="vanilla")
+                opt.state[param]["momentum_buffer"] = old.clone()
+                expected = torch.lerp(param.grad.double(), old.double(), 0.8)
+                if nesterov:
+                    expected = torch.lerp(param.grad.double(), expected, 0.8)
+                with patch("hyper_parallel.core.optimizer.muon.torch._foreach_lerp",
+                           wraps=torch._foreach_lerp) as update_lerp:
+                    actual = opt._update_muon_momentum(opt.param_groups[0], [param])[param]
+                update_lerp.assert_called_once()
+                torch.testing.assert_close(actual.float(), expected.float(), rtol=0.004, atol=0.004)
+                torch.testing.assert_close(opt.state[param]["momentum_buffer"], 0.3 * old + 0.7 * param.grad)
