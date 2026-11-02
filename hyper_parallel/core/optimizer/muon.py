@@ -227,6 +227,7 @@ class Muon(BaseDistributedOptimizer):
             ns_steps: int = 5,
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            momentum_mode: str = "legacy",
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -253,12 +254,16 @@ class Muon(BaseDistributedOptimizer):
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
+            momentum_mode: Momentum formula, either "legacy" or "vanilla" (EMA).
+                Both modes support distinct update and buffer coefficients.
             fsdp_overlap: Pipeline single-axis FSDP communication with Newton-Schulz.
             fsdp_overlap_memory_budget_bytes: Estimated temporary storage budget for queued
                 buckets and prepared inputs. An explicit budget also controls serial buckets for fair comparisons.
                 The estimate uses native NS workspace; reserve extra memory for custom zeropower_fn workspace.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        if momentum_mode not in ("legacy", "vanilla"):
+            raise ValueError(f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}")
         if not isinstance(advanced.fsdp_overlap, bool):
             raise TypeError("fsdp_overlap must be a bool")
         budget = advanced.fsdp_overlap_memory_budget_bytes
@@ -303,6 +308,7 @@ class Muon(BaseDistributedOptimizer):
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
+        self._update_muon_momentum_mode = momentum_mode
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
         self.reset_optimizer_parameters()
@@ -616,24 +622,45 @@ class Muon(BaseDistributedOptimizer):
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
-        # Match muon_update_core():
-        # m_for_update = grad + momentum1 * m_old
-        # m_new = grad + momentum2 * m_old
-        # pylint: disable=protected-access
-        local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
-
-        torch._foreach_mul_(bufs, momentum2)
-        torch._foreach_add_(bufs, grads)
-
-        if group["nesterov"]:
-            torch._foreach_mul_(local_us, momentum1)
-            torch._foreach_add_(local_us, grads)
+        local_us = self._compute_momentum_inputs(grads, bufs, momentum1, momentum2, group["nesterov"])
 
         if local_us[0].dtype != torch.bfloat16:
             local_us = [update.to(torch.bfloat16) for update in local_us]
 
         param_updates = dict(zip(valid_params, local_us))
         return param_updates
+
+    def _compute_momentum_inputs(self, grads, bufs, momentum1, momentum2, nesterov):
+        """Apply the selected formula while retaining the old buffer for the update."""
+        if self._update_muon_momentum_mode == "vanilla":
+            # Match vanilla implementation in Muon paper & PyTorch implementation:
+            # m_for_update = (1 - momentum1) * grad + momentum1 * m_old
+            # m_new = (1 - momentum2) * grad + momentum2 * m_old
+            # pylint: disable=protected-access
+            local_us = torch._foreach_lerp(grads, bufs, weight=momentum1)
+            if nesterov:
+                torch._foreach_lerp_(local_us, grads, weight=1 - momentum1)
+            torch._foreach_lerp_(bufs, grads, weight=1 - momentum2)
+        elif self._update_muon_momentum_mode == "legacy":
+            # Match muon_update_core():
+            # m_for_update = grad + momentum1 * m_old
+            # m_new = grad + momentum2 * m_old
+            # pylint: disable=protected-access
+            local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
+
+            torch._foreach_mul_(bufs, momentum2)
+            torch._foreach_add_(bufs, grads)
+
+            if nesterov:
+                torch._foreach_mul_(local_us, momentum1)
+                torch._foreach_add_(local_us, grads)
+        else:
+            raise ValueError(
+                "Muon._update_muon_momentum_mode must be 'vanilla' or 'legacy', "
+                f"got {self._update_muon_momentum_mode!r}"
+            )
+
+        return local_us
 
     def _unshard_ns_batches(self, param_to_ns_input):
         """Yield original local NS batches, excluding empty local shards."""

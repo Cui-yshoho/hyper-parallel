@@ -191,3 +191,14 @@ and [VLM example](../../examples/training_demo/deepseek_v41/train_deepseek_v41_v
 for nested callback configuration and Engram parameter groups. The examples
 configure optimizer hyperparameters; they do not reproduce the report's full
 training schedule. Resume with the same optimizer partition and head layout.
+
+### Muon momentum formula
+
+`Muon(..., momentum_mode="vanilla")` selects the EMA formula; the default `"legacy"`
+retains the existing update. For `momentum=(mu1, mu2)`, EMA computes the update input
+as `u = (1 - mu1) * grad + mu1 * old_buffer` and stores
+`new_buffer = (1 - mu2) * grad + mu2 * old_buffer`. Nesterov applies another
+interpolation: `u = (1 - mu1) * grad + mu1 * u`.
+
+Pass `"momentum_mode": "vanilla"` in `get_hyper_optimizer`'s `muon_kwargs` to use
+this path through the factory. Keep the same mode when restoring a checkpoint.

@@ -16,6 +16,8 @@
 """Unit tests for the Muon optimizer."""
 
 from collections import defaultdict, deque
+import copy
+import unittest
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -545,6 +547,7 @@ def test_muon_lazy_local_momentum_matches_eager_updates():
     optimizer.ns_transform_fn = None
     optimizer.zeropower_fn = None
     optimizer.momentum_update_fn = None
+    optimizer._update_muon_momentum_mode = "legacy"
     optimizer.state = defaultdict(dict)
     torch.manual_seed(23)
     params = [torch.nn.Parameter(torch.randn(shape)) for shape in [(2, 3), (3, 2)]]
@@ -568,3 +571,85 @@ def test_muon_lazy_local_momentum_matches_eager_updates():
     for param, value, buffer in zip(params, expected, buffers):
         torch.testing.assert_close(param, value, rtol=0, atol=0)
         torch.testing.assert_close(optimizer.state[param]["momentum_buffer"], buffer, rtol=0, atol=0)
+
+
+class TestMuonMomentum(unittest.TestCase):
+    """Check both momentum formulas against an explicit recurrence."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_formula_reference_and_missing_gradient(self):
+        """
+        Feature: Selectable Muon momentum formulas.
+        Description: Compare update and buffer recurrences over several steps with distinct coefficients.
+        Expectation: Both formulas match the reference and leave absent gradients and input gradients untouched.
+        """
+        for mode in ("legacy", "vanilla"):
+            for nesterov in (False, True):
+                for momentum in ((0.7, 0.9), (0.0, 0.0), (1.0, 1.0)):
+                    with self.subTest(mode=mode, nesterov=nesterov, momentum=momentum):
+                        param = torch.nn.Parameter(torch.zeros(3, 2))
+                        absent = torch.nn.Parameter(torch.zeros(3, 2))
+                        opt = Muon([param, absent], momentum=momentum, momentum_mode=mode, nesterov=nesterov)
+                        old_buffer = torch.zeros_like(param)
+                        for scale in (1.0, -0.6, 2.3):
+                            grad = torch.arange(6, dtype=torch.float32).reshape(3, 2) * scale
+                            param.grad = grad.clone()
+                            mu1, mu2 = momentum
+                            if mode == "vanilla":
+                                update = (1 - mu1) * grad + mu1 * old_buffer
+                                if nesterov:
+                                    update = (1 - mu1) * grad + mu1 * update
+                                new_buffer = (1 - mu2) * grad + mu2 * old_buffer
+                            else:
+                                update = grad + mu1 * old_buffer
+                                if nesterov:
+                                    update = grad + mu1 * update
+                                new_buffer = grad + mu2 * old_buffer
+                            outputs = opt._update_muon_momentum(opt.param_groups[0], [param, absent])
+                            torch.testing.assert_close(outputs[param].float(), update, rtol=0.008, atol=0.008)
+                            torch.testing.assert_close(opt.state[param]["momentum_buffer"], new_buffer)
+                            torch.testing.assert_close(param.grad, grad, rtol=0, atol=0)
+                            self.assertNotIn(absent, outputs)
+                            self.assertNotIn(absent, opt.state)
+                            old_buffer = new_buffer
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_ema_checkpoint_resume(self):
+        """
+        Feature: EMA momentum checkpoint continuation.
+        Description: Resume the optimizer with a populated EMA buffer and apply the next gradient.
+        Expectation: The parameter and momentum buffer match uninterrupted execution.
+        """
+        param = torch.nn.Parameter(torch.ones(3, 2))
+        opt = Muon([param], momentum_mode="vanilla")
+        param.grad = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        opt.step()
+        restored_param = torch.nn.Parameter(param.detach().clone())
+        restored = Muon([restored_param], momentum_mode="vanilla")
+        restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+        param.grad = restored_param.grad = torch.full_like(param, -0.3)
+        opt.step()
+        restored.step()
+        torch.testing.assert_close(restored_param, param, rtol=0, atol=0)
+        torch.testing.assert_close(restored.state[restored_param]["momentum_buffer"],
+                                   opt.state[param]["momentum_buffer"], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_invalid_momentum_mode_and_custom_callback(self):
+        """
+        Feature: Momentum mode boundary and callback precedence.
+        Description: Reject an unknown mode and supply a custom update function in EMA mode.
+        Expectation: Invalid modes fail early and the custom callback supplies the update.
+        """
+        param = torch.nn.Parameter(torch.ones(3, 2))
+        with self.assertRaisesRegex(ValueError, "momentum_mode"):
+            Muon([param], momentum_mode="unknown")
+        callback = MagicMock(return_value=[torch.full_like(param, 0.5)])
+        opt = Muon([param], momentum_mode="vanilla", momentum_update_fn=callback)
+        param.grad = torch.ones_like(param)
+        outputs = opt._update_muon_momentum(opt.param_groups[0], [param])
+        torch.testing.assert_close(outputs[param], torch.full_like(param, 0.5, dtype=torch.bfloat16))
+        callback.assert_called_once()
