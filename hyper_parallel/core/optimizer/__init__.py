@@ -142,6 +142,7 @@ def get_hyper_optimizer(
         muon_kwargs: Optional[Dict[str, Any]] = None,
         adamw_kwargs: Optional[Dict[str, Any]] = None,
         *,
+        ns_backend: str = "native",
         sinkhorn_params: Optional[List[Dict[str, Any]]] = None,
         sinkhorn_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
@@ -153,6 +154,9 @@ def get_hyper_optimizer(
         adamw_params: Param groups for AdamW. Empty list disables AdamW.
         muon_kwargs: Dedicated configurations dict for Muon.
         adamw_kwargs: Dedicated configurations dict for AdamW.
+        ns_backend: Muon NS implementation, "native" (default) or "gram". Gram requires
+            the optional gram-newton-schulz package and supported CUDA hardware.
+            Cannot be combined with an explicit Muon zeropower_fn.
         sinkhorn_params: Optional Sinkhorn groups. Empty or None disables Sinkhorn.
         sinkhorn_kwargs: Dedicated configurations dict for Sinkhorn.
 
@@ -186,6 +190,8 @@ def get_hyper_optimizer(
 
         optimizer.step()
     """
+    if ns_backend not in ("native", "gram"):
+        raise ValueError(f"ns_backend must be 'native' or 'gram', got {ns_backend!r}")
     AdamW, Muon, ChainedOptimizer, detect_dtensor_backend = _load_torch_optimizer_runtime()
 
     filtered_adamw_config = _filter_optimizer_config(
@@ -210,6 +216,11 @@ def get_hyper_optimizer(
         )
 
     if muon_params:
+        if ns_backend == "gram":
+            if filtered_muon_config.get("zeropower_fn") is not None:
+                raise ValueError("ns_backend='gram' cannot be combined with a custom zeropower_fn")
+            gram_module = _import_module(".gram_ns", __name__)
+            filtered_muon_config["zeropower_fn"] = gram_module.GramNewtonSchulzAdapter()
         optimizers["muon"] = _build_configured_optimizer(
             "muon",
             Muon,

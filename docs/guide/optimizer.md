@@ -111,6 +111,27 @@ optimizer = get_hyper_optimizer(
 
 ---
 
+### Muon 的 HSDP replicate 去冗余开关
+
+`Muon` 的 `hsdp_replicate_dedup` 参数默认为 `True`，保持现有行为：在 replicate
+组内分配参数 owner，由 owner 维护动量、计算更新，再广播更新后的参数。
+
+设置为 `False` 时，每个 replica 独立维护全部本地参数的动量并计算更新，不进行 Muon
+replicate 参数或状态广播。此时忽略 `hsdp_replica_count`；shard 组内的 all-gather、
+Newton-Schulz 计算分配及更新通信保持不变。关闭去冗余会增加每个 replica 的计算量和优化器状态内存。
+
+```python
+from hyper_parallel.core.optimizer.muon import Muon
+
+optimizer = Muon(muon_params, hsdp_replicate_dedup=False)
+```
+
+通过 `get_hyper_optimizer` 创建时，在 `muon_kwargs` 中传入
+`{"hsdp_replicate_dedup": False}` 或 `{"muon_hsdp_replicate_dedup": False}`。
+所有参与同一 HSDP 通信的 rank 必须使用相同配置；该开关不影响链式优化器中的 AdamW。
+
+---
+
 ## gradient scaling factor + clip_grad
 
 ```python
@@ -191,3 +212,62 @@ and [VLM example](../../examples/training_demo/deepseek_v41/train_deepseek_v41_v
 for nested callback configuration and Engram parameter groups. The examples
 configure optimizer hyperparameters; they do not reproduce the report's full
 training schedule. Resume with the same optimizer partition and head layout.
+
+### Muon momentum formula
+
+`Muon(..., momentum_mode="vanilla")` selects the EMA formula; the default `"legacy"`
+retains the existing update. For `momentum=(mu1, mu2)`, EMA computes the update input
+as `u = (1 - mu1) * grad + mu1 * old_buffer` and stores
+`new_buffer = (1 - mu2) * grad + mu2 * old_buffer`. Nesterov applies another
+interpolation: `u = (1 - mu1) * grad + mu1 * u`.
+
+Pass `"momentum_mode": "vanilla"` in `get_hyper_optimizer`'s `muon_kwargs` to use
+this path through the factory. Keep the same mode when restoring a checkpoint.
+
+The EMA Nesterov update folds the two interpolations into
+`u = (1 - mu1**2) * grad + mu1**2 * old_buffer`. The buffer still uses `mu2`,
+including when `mu1 != mu2`. Floating-point rounding may differ from two separate
+interpolations.
+
+### Optional Gram Newton-Schulz backend
+
+`get_hyper_optimizer(..., ns_backend="gram")` installs a Gram adapter through
+Muon's advanced `zeropower_fn` callback. The default `ns_backend="native"` retains
+the built-in implementation and does not import the optional package.
+
+Install [Dao-AILab Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz)
+with `pip install gram-newton-schulz --no-build-isolation`. Its documented runtime
+requirements are PyTorch 2.7.1+, CUDA 12.9+, and a Hopper or Blackwell GPU. CPU, NPU,
+older GPU architectures, and missing dependencies produce explicit errors when
+Gram is requested; select `"native"` for those environments.
+
+```python
+optimizer = get_hyper_optimizer(
+    model=model,
+    muon_params=muon_groups,
+    adamw_params=adamw_groups,
+    muon_kwargs={"momentum_mode": "vanilla", "ns_variant": "asym5", "ns_steps": 5},
+    ns_backend="gram",
+)
+```
+
+The adapter directly calls the package's `GramNewtonSchulz`; HyperParallel does
+not duplicate its algorithm. It forwards each group's effective coefficient
+schedule (`legacy`, `asym5`, or `custom`), `ns_steps`, and `ns_epsilon`, including
+changes after checkpoint restoration. Instances are cached by device, schedule,
+and epsilon. As in the
+[VeOmni package adapter](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/optim/muon.py),
+compilation is disabled for the wrapper. The default restart is after iteration 2
+when the schedule has more than two iterations. The package handles matrix shape,
+precision, and kernel selection; its floating-point results may differ from native NS.
+
+An explicit `zeropower_fn` conflicts with `ns_backend="gram"` and raises
+`ValueError`. Existing `zeropower_fn(tensor, steps=...)` callbacks keep their
+signature. Callbacks declaring an `ns_config` parameter also receive a dictionary
+with the current `ns_variant`, `ns_coefficients`, and `ns_epsilon`.
+
+Custom NS callbacks, including the Gram adapter, are eligible for `fsdp_overlap=True`
+when the other single-axis FSDP pipeline conditions are met. Callbacks run on the
+caller's compute stream and must join any internal streams before returning.
+The overlap memory estimate uses native NS workspace; reserve additional memory
+for custom backend workspace. CUDA/Gram overlap still requires hardware validation.
