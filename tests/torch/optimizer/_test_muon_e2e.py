@@ -343,6 +343,19 @@ def test_muon_e2e_hybrid_shard_replicate_8p():
     _run_sharding_parity_case(_shard_hybrid_2x4, {"hsdp_replica_count": 2})
 
 
+def test_muon_e2e_hybrid_shard_replicate_no_dedup_8p():
+    """
+    Feature: Muon HSDP with replicate deduplication disabled.
+    Description:
+        Each replica on a (replicate=2, shard=4) mesh owns all Muon state and
+        computes its own updates, retaining shard-group NS communication.
+    Expectation: Every step matches the single-card reference within tolerance.
+    """
+    _run_sharding_parity_case(
+        _shard_hybrid_2x4, {"hsdp_replicate_dedup": False, "hsdp_replica_count": 2},
+    )
+
+
 def test_muon_e2e_mixed_mesh_per_module_8p():
     """
     Feature: Muon e2e precision self-consistency with mixed sharding rules in one model.
@@ -354,7 +367,24 @@ def test_muon_e2e_mixed_mesh_per_module_8p():
     _run_sharding_parity_case(_shard_mixed_meshes)
 
 
+def test_muon_e2e_overlap_full_shard_8p():
+    """Compare the pipelined HyperParallel DTensor trajectory with the unsharded reference."""
+    _run_sharding_parity_case(
+        _shard_full_8p, {"fsdp_overlap": True, "fsdp_overlap_memory_budget_bytes": 1024 * 1024},
+    )
+
+
 def test_muon_e2e_forward_backward_smoke_8p():
+    """Run real autograd through the serial Muon optimizer."""
+    _run_forward_backward_smoke()
+
+
+def test_muon_e2e_overlap_forward_backward_8p():
+    """Run real autograd through the pipelined Muon optimizer."""
+    _run_forward_backward_smoke(fsdp_overlap=True, fsdp_overlap_memory_budget_bytes=1024 * 1024)
+
+
+def _run_forward_backward_smoke(**muon_overrides):
     """
     Feature: Muon end-to-end training smoke under fully_shard.
     Description:
@@ -366,7 +396,7 @@ def test_muon_e2e_forward_backward_smoke_8p():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     model = fully_shard(_build_model(), mesh=mesh, reshard_after_forward=True,
                         mp_policy=MixedPrecisionPolicy())
-    optimizer = _make_optimizer(model)
+    optimizer = _make_optimizer(model, **muon_overrides)
     generator = torch.Generator().manual_seed(_INPUT_SEED)
     data = torch.randn(8, _DIM, generator=generator).npu()
 

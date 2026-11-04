@@ -15,6 +15,9 @@
 
 """Unit tests for the Muon optimizer."""
 
+from collections import defaultdict, deque
+import copy
+import unittest
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,6 +25,14 @@ import torch
 
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
+from hyper_parallel.core.optimizer.sharding_category import (
+    CommDomainKey,
+    HSDPCommGroup,
+    ParamLayoutSpec,
+    ParamRecord,
+)
+from tests.common.mark_utils import arg_mark
+
 
 
 def _plain_ns_group(**overrides):
@@ -40,9 +51,15 @@ def _plain_ns_group(**overrides):
     return group
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_compute_batched_ns_updates_accepts_plain_parameter_without_sharding():
-    """The no-shard path should support ordinary torch parameters."""
-    optimizer = Muon.__new__(Muon)
+    """
+    Feature: Muon optimizer correctness.
+    Description: The no-shard path should support ordinary torch parameters.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
     optimizer.reshape_fn = None
     optimizer.ns_transform_fn = None
     optimizer.zeropower_fn = None
@@ -56,9 +73,15 @@ def test_compute_batched_ns_updates_accepts_plain_parameter_without_sharding():
     assert updates[parameter].shape == parameter.shape
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_compute_batched_ns_updates_with_transform_accepts_plain_parameter():
-    """The ns_transform_fn routing path should also support plain parameters."""
-    optimizer = Muon.__new__(Muon)
+    """
+    Feature: Muon optimizer correctness.
+    Description: The ns_transform_fn routing path should also support plain parameters.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
     optimizer.reshape_fn = None
     optimizer.ns_transform_fn = lambda param_fqn, ns_input: None
     optimizer.zeropower_fn = None
@@ -72,14 +95,26 @@ def test_compute_batched_ns_updates_with_transform_accepts_plain_parameter():
     assert updates[parameter].shape == parameter.shape
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_muon_rejects_invalid_ns_variant():
-    """ns_variant outside legacy/asym5/custom must raise."""
+    """
+    Feature: Muon optimizer correctness.
+    Description: ns_variant outside legacy/asym5/custom must raise.
+    Expectation: Values and execution order match the reference.
+    """
     with pytest.raises(ValueError, match="ns_variant"):
         Muon([torch.nn.Parameter(torch.ones(2, 2))], ns_variant="unknown")
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_muon_rejects_ns_coefficients_without_custom_variant():
-    """ns_coefficients is only valid together with ns_variant='custom'."""
+    """
+    Feature: Muon optimizer correctness.
+    Description: ns_coefficients is only valid together with ns_variant='custom'.
+    Expectation: Values and execution order match the reference.
+    """
     with pytest.raises(ValueError, match="ns_coefficients"):
         Muon(
             [torch.nn.Parameter(torch.ones(2, 2))],
@@ -88,8 +123,14 @@ def test_muon_rejects_ns_coefficients_without_custom_variant():
         )
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_muon_rejects_missing_or_short_ns_coefficients():
-    """Custom NS requires at least ns_steps coefficient groups."""
+    """
+    Feature: Muon optimizer correctness.
+    Description: Custom NS requires at least ns_steps coefficient groups.
+    Expectation: Values and execution order match the reference.
+    """
     with pytest.raises(ValueError, match="ns_coefficients"):
         Muon([torch.nn.Parameter(torch.ones(2, 2))], ns_variant="custom")
     with pytest.raises(ValueError, match="exceeds"):
@@ -101,8 +142,14 @@ def test_muon_rejects_missing_or_short_ns_coefficients():
         )
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_muon_rejects_malformed_ns_coefficients():
-    """Each custom coefficient group must hold three finite values."""
+    """
+    Feature: Muon optimizer correctness.
+    Description: Each custom coefficient group must hold three finite values.
+    Expectation: Values and execution order match the reference.
+    """
     with pytest.raises(ValueError, match="exactly three"):
         Muon(
             [torch.nn.Parameter(torch.ones(2, 2))],
@@ -119,16 +166,157 @@ def test_muon_rejects_malformed_ns_coefficients():
         )
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_muon_rejects_invalid_ns_epsilon_and_zero_rms_scale_mode():
-    """ns_epsilon must be finite non-negative; zero_rms_scale_mode must be known."""
+    """
+    Feature: Muon optimizer correctness.
+    Description: ns_epsilon must be finite non-negative; zero_rms_scale_mode must be known.
+    Expectation: Values and execution order match the reference.
+    """
     with pytest.raises(ValueError, match="ns_epsilon"):
         Muon([torch.nn.Parameter(torch.ones(2, 2))], ns_epsilon=-1e-10)
     with pytest.raises(ValueError, match="zero_rms_scale_mode"):
         Muon([torch.nn.Parameter(torch.ones(2, 2))], zero_rms_scale_mode="keep")
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "false"])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+def test_muon_rejects_non_boolean_hsdp_replicate_dedup(value):
+    """
+    Feature: Muon replicate dedup configuration validation.
+    Description: Pass non-boolean values to the public constructor.
+    Expectation: Invalid values raise ValueError.
+    """
+    with pytest.raises(ValueError, match="hsdp_replicate_dedup must be a bool"):
+        Muon([torch.nn.Parameter(torch.ones(2, 2))], hsdp_replicate_dedup=value)
+
+
+def _make_replica_optimizer(replicate_sizes, replicate_coord, is_shard=False, **options):
+    """Use real assignment construction with mocked mesh topology and collectives."""
+    params = [torch.nn.Parameter(torch.full((2, 2), float(index + 1))) for index in range(6)]
+    for param in params:
+        param.device_mesh = MagicMock()
+    replicate_dims = tuple(range(len(replicate_sizes)))
+    shard_axes = ((len(replicate_sizes), 0),) if is_shard else ()
+    layout = ParamLayoutSpec(2, shard_axes, replicate_dims)
+    comm_key = CommDomainKey(
+        replicate_sizes + ((2,) if is_shard else ()), (), replicate_dims, layout.shard_mesh_dims,
+    )
+    hsdp_group = HSDPCommGroup(
+        comm_key, layout,
+        replicate_pgs=tuple(MagicMock() for _ in replicate_sizes),
+        shard_pgs=(MagicMock(),) if is_shard else (),
+        records=[ParamRecord(index, param) for index, param in enumerate(params)],
+    )
+    with patch(
+            "hyper_parallel.core.optimizer.optimizer.group_parameters_for_hsdp",
+            return_value=([], [hsdp_group]),
+    ), patch(
+            "hyper_parallel.core.optimizer.optimizer.get_multi_dim_logical_info",
+            return_value=(replicate_coord, replicate_sizes),
+    ), patch(
+            "hyper_parallel.core.optimizer.optimizer.dist",
+    ) as mock_dist, patch(
+            "hyper_parallel.core.optimizer.muon.dist",
+    ) as mock_muon_dist, patch(
+            "hyper_parallel.core.optimizer.sharding_category.dist",
+    ), patch.object(
+            Muon, "_auto_deduce_replica_count", return_value=None,
+    ), patch.object(
+            Muon, "_build_param_shard_metadata",
+    ), patch.object(
+            Muon, "_get_shard_info", return_value=((2,), (0,), hsdp_group.shard_pgs, 2),
+    ):
+        mock_muon_dist.get_world_size.return_value = 2
+        mock_muon_dist.all_gather_into_tensor.side_effect = (
+            lambda output, value, **kwargs: output.copy_(value.repeat(2))
+        )
+        optimizer = Muon(params, **options)
+        # Parameter replacement / checkpoint restores also rebuild these caches.
+        optimizer.reset_optimizer_parameters()
+        if options.get("hsdp_replicate_dedup") is False:
+            mock_dist.new_group.assert_not_called()
+    return optimizer, params
+
+
+@pytest.mark.parametrize("replicate_sizes, replicate_coord", [((2,), (1,)), ((2, 3), (1, 2))])
+@pytest.mark.parametrize("is_shard", [False, True])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+def test_muon_disabled_dedup_owns_all_params_without_replica_broadcast(replicate_sizes, replicate_coord, is_shard):
+    """
+    Feature: Disable Muon replicate dedup on single- and multi-axis meshes.
+    Description: Build and reset assignments on a nonzero replica with and without sharding.
+    Expectation: Every replica owns all parameters, with shard communication preserved and no replica broadcasts.
+    """
+    optimizer, params = _make_replica_optimizer(
+        replicate_sizes, replicate_coord, is_shard,
+        hsdp_replicate_dedup=False, hsdp_replica_count=2,
+    )
+    assignment = optimizer._hsdp_assignment_batches[0]["batch_groups"][0]["sub_batches"][0]
+    assert [id(param) for param in assignment.owned_params] == [id(param) for param in params], (
+        f"owned param count={len(assignment.owned_params)}, expected={len(params)}"
+    )
+    assert not assignment.is_replicated, f"effective replica sizes={assignment.replicate_sizes}"
+    assert assignment.is_shard == is_shard, f"is_shard={assignment.is_shard}, expected={is_shard}"
+    assert bool(assignment.shard_pgs) == is_shard, f"shard groups={assignment.shard_pgs}, expected={is_shard}"
+    assert not optimizer._param_to_broadcast_info, f"unexpected broadcasts={optimizer._param_to_broadcast_info}"
+
+
+@pytest.mark.parametrize("options", [{}, {"hsdp_replicate_dedup": True}])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+def test_muon_default_and_enabled_dedup_partition_replica_ownership(options):
+    """
+    Feature: Preserve Muon replicate dedup by default.
+    Description: Compare ownership on two replicas using default and explicit enabled settings.
+    Expectation: Ownership partitions the parameters and registers replicate broadcasts.
+    """
+    owned_indices = []
+    for rank in range(2):
+        optimizer, _ = _make_replica_optimizer((2,), (rank,), **options)
+        assignment = optimizer._hsdp_assignment_batches[0]["batch_groups"][0]["sub_batches"][0]
+        owned_indices.append({record.index for record in assignment.owned_records})
+        assert assignment.is_replicated, f"effective replica sizes={assignment.replicate_sizes}"
+        assert len(optimizer._param_to_broadcast_info) == 6, (
+            f"broadcast count={len(optimizer._param_to_broadcast_info)}, expected=6"
+        )
+    assert owned_indices[0].isdisjoint(owned_indices[1]), f"overlapping owners={owned_indices}"
+    assert owned_indices[0] | owned_indices[1] == set(range(6)), f"incomplete owners={owned_indices}"
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+def test_muon_disabled_dedup_step_matches_plain_muon_and_keeps_momentum():
+    """
+    Feature: Muon numerical behavior with replicate dedup disabled.
+    Description: Run repeated steps on a nonzero replica and a plain optimizer.
+    Expectation: Parameters and momentum match at every step without replica broadcasts.
+    """
+    optimizer, params = _make_replica_optimizer((2,), (1,), hsdp_replicate_dedup=False)
+    reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
+    reference = Muon(reference_params)
+    with patch("hyper_parallel.core.optimizer.optimizer.dist") as mock_dist:
+        for step in range(3):
+            for param, ref_param in zip(params, reference_params):
+                param.grad = torch.full_like(param, 0.1 * (step + 1))
+                ref_param.grad = param.grad.clone()
+            optimizer.step()
+            reference.step()
+            for param, ref_param in zip(params, reference_params):
+                torch.testing.assert_close(param, ref_param)
+                torch.testing.assert_close(
+                    optimizer.state[param]["momentum_buffer"], reference.state[ref_param]["momentum_buffer"],
+                )
+        mock_dist.broadcast.assert_not_called()
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
 def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
-    """A relay dimension must wait before forwarding the shared buffer."""
+    """
+    Feature: Muon optimizer correctness.
+    Description: A relay dimension must wait before forwarding the shared buffer.
+    Expectation: Values and execution order match the reference.
+    """
     first_work = MagicMock()
     final_work = MagicMock()
     process_groups = (MagicMock(), MagicMock())
@@ -151,3 +339,481 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_overlap_rejects_invalid_budget(budget):
+    """
+    Feature: Muon optimizer correctness.
+    Description: A workspace budget must be an explicit positive byte count.
+    Expectation: Values and execution order match the reference.
+    """
+    with pytest.raises(ValueError, match="positive integer"):
+        Muon([torch.nn.Parameter(torch.ones(2, 2))], fsdp_overlap_memory_budget_bytes=budget)
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_overlap_rejects_non_boolean_switch():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Reject accidental string configuration before distributed initialization.
+    Expectation: Values and execution order match the reference.
+    """
+    with pytest.raises(TypeError, match="bool"):
+        Muon([torch.nn.Parameter(torch.ones(2, 2))], fsdp_overlap="true")
+
+
+@pytest.mark.parametrize("bucket_count", [2, 3, 5])
+@pytest.mark.parametrize("queue_capacity", [2, 4])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_pipeline_collective_order_and_backpressure(bucket_count, queue_capacity):
+    """
+    Feature: Muon optimizer correctness.
+    Description: Submit broadcast before host backpressure and prepare momentum only once.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    optimizer._overlap_streams = {}
+    optimizer.fsdp_overlap_memory_budget_bytes = queue_capacity
+    optimizer._shard_compute_coord = {0: {}}
+    params = [MagicMock() for _ in range(bucket_count)]
+    optimizer._param_shard_metadata = {p: MagicMock() for p in params}
+    for meta in optimizer._param_shard_metadata.values():
+        meta.stage_metas[0].pad_shape = (1, 1)
+    buckets = [{"index": i, "apply_done": MagicMock()} for i in range(bucket_count)]
+    assignment = MagicMock(owned_params=params, shard_pgs=(MagicMock(),))
+    backend = MagicMock()
+    events = []
+
+    def _gather(bucket, *_args):
+        events.append(("gather", bucket["index"]))
+
+    def _record_ns(bucket, *_args):
+        events.append(("ns", bucket["index"]))
+
+    def _record_broadcast(bucket, *_args):
+        events.append(("broadcast", bucket["index"]))
+
+    def _record_apply(bucket, *_args):
+        events.append(("apply", bucket["index"]))
+
+    def _retire(bucket):
+        if bucket is not None:
+            events.append(("retire", bucket["index"]))
+
+    with patch.object(optimizer, "_pipeline_bucket_bytes", return_value=1), \
+            patch.object(optimizer, "_pipeline_prepared_bytes", return_value=0), \
+            patch.object(optimizer, "_shard_pipeline_batches", return_value=[[p] for p in params]), \
+            patch.object(optimizer, "_update_muon_momentum", return_value={}) as momentum, \
+            patch.object(optimizer, "_prepare_pipeline_buckets", return_value=buckets), \
+            patch.object(optimizer, "_launch_pipeline_gather", side_effect=_gather), \
+            patch.object(optimizer, "_enqueue_pipeline_ns", side_effect=_record_ns), \
+            patch.object(optimizer, "_enqueue_pipeline_broadcast", side_effect=_record_broadcast), \
+            patch.object(optimizer, "_enqueue_pipeline_apply", side_effect=_record_apply), \
+            patch.object(optimizer, "_retire_pipeline_bucket", side_effect=_retire), \
+            patch("hyper_parallel.core.optimizer.muon.to_local_if_dtensor",
+                  return_value=MagicMock(device=torch.device("cuda:0"))), \
+            patch("hyper_parallel.core.optimizer.muon.dist.get_world_size", return_value=2), \
+            patch("hyper_parallel.core.optimizer.muon.torch.cuda", backend):
+        optimizer._process_shard_params_pipelined({}, assignment, 0)
+
+    collectives = [event for event in events if event[0] in ("gather", "broadcast")]
+    expected = [("gather", 0)]
+    for index in range(bucket_count):
+        if index + 1 < bucket_count:
+            expected.append(("gather", index + 1))
+        expected.append(("broadcast", index))
+    assert collectives == expected
+    momentum.assert_called_once_with({}, params)
+    for index in range(1, bucket_count):
+        assert events.index(("broadcast", index - 1)) < events.index(("ns", index))
+        assert events.index(("ns", index)) < events.index(("apply", index - 1))
+    queue_depth = min(bucket_count, queue_capacity)
+    retired = [event for event in events if event[0] == "retire"]
+    assert retired == [("retire", index) for index in range(bucket_count - queue_depth)]
+    for _, index in retired:
+        assert events.index(("broadcast", index + queue_depth - 1)) < events.index(("retire", index))
+    assert events[-1] == ("apply", bucket_count - 1)
+
+
+@pytest.mark.parametrize("callback_name", ["reshape_fn", "momentum_update_fn", "ns_transform_fn", "post_update_fn"])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_pipeline_preserves_replica_and_callback_fallbacks(callback_name):
+    """
+    Feature: Muon optimizer correctness.
+    Description: HSDP and callbacks other than zeropower_fn retain the original stream semantics.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    optimizer.fsdp_overlap = True
+    assignment = MagicMock(is_shard=True, is_replicated=True)
+    assert not optimizer._can_overlap_shard(assignment)
+    assignment.is_replicated = False
+    assignment.shard_pgs = (MagicMock(),)
+    for name in ("reshape_fn", "zeropower_fn", "momentum_update_fn", "ns_transform_fn", "post_update_fn"):
+        setattr(optimizer, name, None)
+    setattr(optimizer, callback_name, MagicMock())
+    assert not optimizer._can_overlap_shard(assignment)
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_pipeline_accepts_custom_zeropower(device_type):
+    """
+    Feature: Muon overlap with a custom NS backend.
+    Description: A local zeropower_fn must not force an otherwise eligible assignment into serial execution.
+    Expectation: Custom NS callbacks are eligible on both supported accelerator types.
+    """
+    optimizer = Muon([torch.nn.Parameter(torch.ones(2, 3))], fsdp_overlap=True, zeropower_fn=MagicMock())
+    assignment = MagicMock(is_shard=True, is_replicated=False, shard_pgs=(MagicMock(),))
+    with patch("hyper_parallel.core.optimizer.muon.to_local_if_dtensor",
+               return_value=MagicMock(device=MagicMock(type=device_type))):
+        eligible = optimizer._can_overlap_shard(assignment)
+    assert eligible, f"Custom NS eligibility on {device_type}: expected=True, got={eligible}"
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_pipeline_custom_zeropower_runs_between_gather_and_event():
+    """
+    Feature: Muon overlap with a custom NS backend.
+    Description: Run the real batched NS path after gathering and record completion after the callback.
+    Expectation: The callback receives the configured steps and its allocated output becomes the bucket update.
+    """
+    events = []
+
+    def _zeropower_fn(tensor: torch.Tensor, steps: int) -> torch.Tensor:
+        """Record the configured steps and allocate the callback result."""
+        events.append(("zeropower", steps, tuple(tensor.shape)))
+        return tensor.mul(0.5)
+
+    params = [torch.nn.Parameter(torch.ones(2, 3)), torch.nn.Parameter(torch.ones(2, 3))]
+    optimizer = Muon(params, zeropower_fn=_zeropower_fn)
+    inputs = [torch.full((2, 3), value, dtype=torch.bfloat16) for value in (2.0, 4.0)]
+    expected = [tensor * 0.5 for tensor in inputs]
+    pending = MagicMock()
+
+    def _finish_gather():
+        """Record gather completion before exposing its results."""
+        events.append("gather_done")
+        return inputs
+
+    pending.finish.side_effect = _finish_gather
+    bucket = {"params": params, "pending": pending}
+    backend, compute_stream = MagicMock(), MagicMock()
+    backend.Event.return_value.record.side_effect = lambda stream: events.append(("ns_done", stream))
+    group = _plain_ns_group(ns_steps=3, matched_adamw_rms=0.0, zero_rms_scale_mode="use_lr")
+
+    optimizer._enqueue_pipeline_ns(bucket, group, 2, backend, compute_stream)
+
+    expected_events = ["gather_done", ("zeropower", 3, (2, 2, 3)), ("ns_done", compute_stream)]
+    assert events == expected_events, f"Pipeline ordering: expected={expected_events}, got={events}"
+    pending.gathered_view.record_stream.assert_called_once_with(compute_stream)
+    for param, tensor in zip(params, expected):
+        torch.testing.assert_close(bucket["updates"][param], tensor, rtol=0, atol=0)
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_overlap_configuration_rejects_rank_disagreement():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Detect a divergent collective schedule before the first optimizer step.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    optimizer.fsdp_overlap = True
+    optimizer.fsdp_overlap_memory_budget_bytes = 4096
+    parameter = torch.nn.Parameter(torch.ones(2, 2))
+    assignment = MagicMock(is_replicated=False, shard_pgs=(MagicMock(),), owned_params=[parameter])
+    optimizer.shard_assignments_by_group = {0: [assignment]}
+
+    def _gather(output, config, **_kwargs):
+        output.view(2, 3).copy_(config.expand(2, 3))
+        output[3] = 0
+
+    with patch.object(optimizer, "_can_overlap_shard", return_value=True), \
+            patch("hyper_parallel.core.optimizer.muon.dist.get_world_size", return_value=2), \
+            patch("hyper_parallel.core.optimizer.muon.dist.all_gather_into_tensor", side_effect=_gather):
+        with pytest.raises(ValueError, match="must agree across ranks"):
+            optimizer._validate_overlap_configuration()
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_overlap_budget_preserves_serial_default_and_bounds_buckets():
+    """
+    Feature: Muon optimizer correctness.
+    Description: An implicit overlap budget must not change unsupported serial/HSDP execution.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    optimizer.fsdp_overlap_memory_budget_bytes = None
+    params = [object() for _ in range(4)]
+    with patch.object(optimizer, "_split_into_memory_safe_batches", return_value=[params]), \
+            patch.object(optimizer, "_pipeline_prepared_bytes", return_value=0), \
+            patch.object(optimizer, "_pipeline_parameter_bytes", return_value=128 * 1024 * 1024):
+        assert optimizer._shard_pipeline_batches(params, 2) == [params]
+        assert optimizer._shard_pipeline_batches(params, 2, use_overlap_budget=True) == [params[:2], params[2:]]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_gather_reuse_does_not_wait_for_parameter_apply():
+    """
+    Feature: Muon optimizer correctness.
+    Description: The receive slot is reusable once its old NS consumer has finished.
+    Expectation: Values and execution order match the reference.
+    """
+    bucket = {"prepared": MagicMock()}
+    previous = {"ns_done": MagicMock(), "apply_done": MagicMock()}
+    stream = MagicMock()
+    assignment = MagicMock(shard_pgs=[MagicMock()])
+    cache = {}
+    Muon._launch_pipeline_gather(bucket, assignment, cache, previous, stream)
+    stream.wait_event.assert_called_once_with(previous["ns_done"])
+    previous["apply_done"].synchronize.assert_not_called()
+    bucket["prepared"].launch.assert_called_once_with(assignment.shard_pgs[0], cache)
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_pipeline_backpressure_does_not_wait_for_apply():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Host throttling bounds NS temporaries without draining the update stream.
+    Expectation: Values and execution order match the reference.
+    """
+    bucket = {"ns_done": MagicMock(), "apply_done": MagicMock()}
+    Muon._retire_pipeline_bucket(bucket)
+    bucket["ns_done"].synchronize.assert_called_once_with()
+    bucket["apply_done"].synchronize.assert_not_called()
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_bucket_workspace_is_owned_per_rank():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Eight owners need one matrix of NS workspace each, not eight on every rank.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    params = [torch.nn.Parameter(torch.empty(512, 1024, device="meta")) for _ in range(8)]
+    optimizer._shard_param_compute_coord = {param: (rank,) for rank, param in enumerate(params)}
+    optimizer._param_shard_metadata = {param: MagicMock() for param in params}
+    for meta in optimizer._param_shard_metadata.values():
+        meta.stage_metas[0].pad_shape = (64, 1024)
+    optimizer.fsdp_overlap_memory_budget_bytes = 80 * 1024 * 1024
+    with patch.object(optimizer, "_split_into_memory_safe_batches", return_value=[params]):
+        assert optimizer._shard_pipeline_batches(params, 8) == [params]
+    distributed = optimizer._pipeline_bucket_bytes(params, 8)
+    optimizer._shard_param_compute_coord = {param: (0,) for param in params}
+    concentrated = optimizer._pipeline_bucket_bytes(params, 8)
+    assert concentrated - distributed == 7 * 32 * params[0].numel()
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_local_ns_batches_preserve_grouping_and_skip_empty_shards():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Interleaving must preserve the original NS batches and consume each input once.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    params = [torch.nn.Parameter(torch.zeros(2, 3)), torch.nn.Parameter(torch.zeros(3, 2)),
+              torch.nn.Parameter(torch.zeros(2, 3)), torch.nn.Parameter(torch.zeros(0, 3))]
+    inputs = {param: torch.zeros_like(param) for param in params}
+    batches = list(optimizer._unshard_ns_batches(inputs))
+    assert [list(batch) for batch in batches] == [[params[0], params[2]], [params[1]]]
+    for batch in batches:
+        for param, value in batch.items():
+            assert value is inputs[param]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_interleaved_local_updates_match_unsplit_execution():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Moving complete native batches must preserve updates including weight decay.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    optimizer.reshape_fn = None
+    optimizer.ns_transform_fn = None
+    optimizer.zeropower_fn = None
+    torch.manual_seed(17)
+    params = [torch.nn.Parameter(torch.randn(shape)) for shape in [(2, 3), (3, 2), (2, 3)]]
+    inputs = {param: torch.randn_like(param, dtype=torch.bfloat16) for param in params}
+    original_inputs = {param: value.clone() for param, value in inputs.items()}
+    originals = [param.detach().clone() for param in params]
+    group = _plain_ns_group(weight_decay=0.1)
+    with torch.no_grad():
+        optimizer._process_unshard_params(group, inputs)
+        expected = [param.clone() for param in params]
+        for param, original in zip(params, originals):
+            param.copy_(original)
+            inputs[param].copy_(original_inputs[param])
+        batches = list(optimizer._unshard_ns_batches(inputs))
+        for batch in batches:
+            optimizer._process_unshard_params(group, batch)
+    for param, reference in zip(params, expected):
+        torch.testing.assert_close(param, reference, rtol=0, atol=0)
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_muon_lazy_local_momentum_matches_eager_updates():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Local assignment inputs may be generated lazily without changing momentum or updates.
+    Expectation: Values and execution order match the reference.
+    """
+    optimizer = object.__new__(Muon)
+    optimizer.reshape_fn = None
+    optimizer.ns_transform_fn = None
+    optimizer.zeropower_fn = None
+    optimizer.momentum_update_fn = None
+    optimizer._update_muon_momentum_mode = "legacy"
+    optimizer.state = defaultdict(dict)
+    torch.manual_seed(23)
+    params = [torch.nn.Parameter(torch.randn(shape)) for shape in [(2, 3), (3, 2)]]
+    for param in params:
+        param.grad = torch.randn_like(param)
+    initial = [param.detach().clone() for param in params]
+    group = _plain_ns_group(weight_decay=0.1, momentum=0.95, nesterov=True)
+    with torch.no_grad():
+        inputs = optimizer._update_muon_momentum(group, params)
+        optimizer._process_unshard_params(group, inputs)
+        expected = [param.clone() for param in params]
+        buffers = [optimizer.state[param]["momentum_buffer"].clone() for param in params]
+        optimizer.state.clear()
+        for param, value in zip(params, initial):
+            param.copy_(value)
+        work = {"batches": deque(([param], None) for param in params)}
+        for _ in params:
+            optimizer._run_local_ns_batch(group, work)
+        optimizer._run_local_ns_batch(group, work)
+    assert not work["batches"]
+    for param, value, buffer in zip(params, expected, buffers):
+        torch.testing.assert_close(param, value, rtol=0, atol=0)
+        torch.testing.assert_close(optimizer.state[param]["momentum_buffer"], buffer, rtol=0, atol=0)
+
+
+class TestMuonMomentum(unittest.TestCase):
+    """Check both momentum formulas against an explicit recurrence."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_formula_reference_and_missing_gradient(self):
+        """
+        Feature: Selectable Muon momentum formulas.
+        Description: Compare update and buffer recurrences over several steps with distinct coefficients.
+        Expectation: Both formulas match the reference and leave absent gradients and input gradients untouched.
+        """
+        for mode in ("legacy", "vanilla"):
+            for nesterov in (False, True):
+                for momentum in ((0.7, 0.9), (0.0, 0.0), (1.0, 1.0)):
+                    with self.subTest(mode=mode, nesterov=nesterov, momentum=momentum):
+                        param = torch.nn.Parameter(torch.zeros(3, 2))
+                        absent = torch.nn.Parameter(torch.zeros(3, 2))
+                        opt = Muon([param, absent], momentum=momentum, momentum_mode=mode, nesterov=nesterov)
+                        old_buffer = torch.zeros_like(param)
+                        for scale in (1.0, -0.6, 2.3):
+                            grad = torch.arange(6, dtype=torch.float32).reshape(3, 2) * scale
+                            param.grad = grad.clone()
+                            mu1, mu2 = momentum
+                            if mode == "vanilla":
+                                update = (1 - mu1) * grad + mu1 * old_buffer
+                                if nesterov:
+                                    update = (1 - mu1) * grad + mu1 * update
+                                new_buffer = (1 - mu2) * grad + mu2 * old_buffer
+                            else:
+                                update = grad + mu1 * old_buffer
+                                if nesterov:
+                                    update = grad + mu1 * update
+                                new_buffer = grad + mu2 * old_buffer
+                            outputs = opt._update_muon_momentum(opt.param_groups[0], [param, absent])
+                            torch.testing.assert_close(outputs[param].float(), update, rtol=0.008, atol=0.008)
+                            torch.testing.assert_close(opt.state[param]["momentum_buffer"], new_buffer)
+                            torch.testing.assert_close(param.grad, grad, rtol=0, atol=0)
+                            self.assertNotIn(absent, outputs)
+                            self.assertNotIn(absent, opt.state)
+                            old_buffer = new_buffer
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_ema_checkpoint_resume(self):
+        """
+        Feature: EMA momentum checkpoint continuation.
+        Description: Resume the optimizer with a populated EMA buffer and apply the next gradient.
+        Expectation: The parameter and momentum buffer match uninterrupted execution.
+        """
+        param = torch.nn.Parameter(torch.ones(3, 2))
+        opt = Muon([param], momentum_mode="vanilla")
+        param.grad = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        opt.step()
+        restored_param = torch.nn.Parameter(param.detach().clone())
+        restored = Muon([restored_param], momentum_mode="vanilla")
+        restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+        param.grad = restored_param.grad = torch.full_like(param, -0.3)
+        opt.step()
+        restored.step()
+        torch.testing.assert_close(restored_param, param, rtol=0, atol=0)
+        torch.testing.assert_close(restored.state[restored_param]["momentum_buffer"],
+                                   opt.state[param]["momentum_buffer"], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_invalid_momentum_mode_and_custom_callback(self):
+        """
+        Feature: Momentum mode boundary and callback precedence.
+        Description: Reject an unknown mode and supply a custom update function in EMA mode.
+        Expectation: Invalid modes fail early and the custom callback supplies the update.
+        """
+        param = torch.nn.Parameter(torch.ones(3, 2))
+        with self.assertRaisesRegex(ValueError, "momentum_mode"):
+            Muon([param], momentum_mode="unknown")
+        callback = MagicMock(return_value=[torch.full_like(param, 0.5)])
+        opt = Muon([param], momentum_mode="vanilla", momentum_update_fn=callback)
+        param.grad = torch.ones_like(param)
+        outputs = opt._update_muon_momentum(opt.param_groups[0], [param])
+        torch.testing.assert_close(outputs[param], torch.full_like(param, 0.5, dtype=torch.bfloat16))
+        callback.assert_called_once()
+
+
+class TestMuonNesterovFolding(unittest.TestCase):
+    """Check the folded update independently from momentum state updates."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_folded_nesterov_matches_two_interpolations(self):
+        """
+        Feature: Folded EMA Nesterov interpolation.
+        Description: Compare nonzero old momentum against two explicit FP64 interpolations.
+        Expectation: One update interpolation matches the reference and the buffer uses its own coefficient.
+        """
+        for nesterov in (False, True):
+            with self.subTest(nesterov=nesterov):
+                param = torch.nn.Parameter(torch.zeros(2, 3))
+                param.grad = torch.tensor([[0.2, -0.4, 1.0], [-2.0, 0.0, 0.7]])
+                old = torch.tensor([[3.0, 0.1, -1.0], [0.3, 2.0, -0.2]])
+                opt = Muon([param], momentum=(0.8, 0.3), nesterov=nesterov, momentum_mode="vanilla")
+                opt.state[param]["momentum_buffer"] = old.clone()
+                expected = torch.lerp(param.grad.double(), old.double(), 0.8)
+                if nesterov:
+                    expected = torch.lerp(param.grad.double(), expected, 0.8)
+                with patch("hyper_parallel.core.optimizer.muon.torch._foreach_lerp",
+                           wraps=torch._foreach_lerp) as update_lerp:
+                    actual = opt._update_muon_momentum(opt.param_groups[0], [param])[param]
+                update_lerp.assert_called_once()
+                torch.testing.assert_close(actual.float(), expected.float(), rtol=0.004, atol=0.004)
+                torch.testing.assert_close(opt.state[param]["momentum_buffer"], 0.3 * old + 0.7 * param.grad)

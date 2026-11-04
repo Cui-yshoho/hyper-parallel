@@ -20,6 +20,8 @@ HyperParallel 提供 `fully_shard` 接口实现 FSDP（Fully Sharded Data Parall
 
 切分入口为 `fully_shard`，将模块应用 FSDP/HSDP 切分，原地改写并返回。混合精度与 offload 行为通过策略类（`MixedPrecisionPolicy`、`OffloadPolicy` / `CPUOffloadPolicy`）作为参数传入。切分后优化器状态会自动随参数切分，无需额外配置。
 
+`MixedPrecisionPolicy.grad_dtype_fn` 可按原始参数选择展开后叶子参数的梯度 dtype；返回 `None` 时保留默认行为。此功能需要支持 `Tensor.grad_dtype` 的 PyTorch。要消除转换开销，反向算子还须能直接输出所选 dtype；设置该字段本身不改变算子的累加精度或输出能力。
+
 ```python
 fully_shard(
     module,                       # 要切分的模块，或模块列表（列表内合并为一个切分单元）
@@ -54,11 +56,17 @@ fully_shard(
 |------|------|
 | `model.set_modules_to_forward_prefetch(modules)` | 设置正向预取的模块列表 |
 | `model.set_modules_to_backward_prefetch(modules)` | 设置反向预取的模块列表 |
+| `model.set_reduce_comm_interval(interval)` | 在首次前向前设置梯度 ReduceScatter 的等待间隔，默认 1；间隔按非融合 FSDP 单元计数，不改变规约次数 |
 | `model.set_requires_gradient_sync(flag)` | 控制本次反向是否做梯度同步，用于梯度累积 |
 | `model.set_gradient_scaling_factor(factor)` | 设置梯度缩放因子 |
 | `model.set_reduce_op_type("avg" / "sum")` | 设置梯度归约算子类型，默认 `avg` |
 | `model.set_reshard_after_forward(flag)` | 运行期切换正向后是否 reshard |
 | `model.unshard()` / `model.reshard()` | 手动还原 / 重新切分参数 |
+
+`model.set_reduce_comm_interval(2)` 允许 ReduceScatter 与后续两个单元的反向计算重叠，再等待其结果。
+反向结束时 root hook 仍会等待所有未完成的规约并写回梯度；HSDP 的副本 AllReduce 在对应 ReduceScatter 完成后下发。
+更大的间隔会保留更多梯度通信 buffer，需要结合显存和通信时序验证。配置作用于 root 的整个模块树，必须在首次前向前设置。
+开启 `comm_fusion=True` 时，间隔固定为 1；请求大于 1 的值会产生警告并回退到 1。
 
 ---
 

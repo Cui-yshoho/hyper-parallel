@@ -259,6 +259,8 @@ class MixedPrecisionPolicy:
         output_dtype: Data type for module outputs. If None, no casting applied.
         custom_params: Per-parameter overrides that take precedence over this policy's
             ``param_dtype`` and ``reduce_dtype`` defaults.
+        grad_dtype_fn: Optional per-original-parameter unsharded leaf gradient
+            dtype callback. Operators must support the requested dtype.
     """
     param_dtype: Optional[DType] = None
     reduce_dtype: Optional[DType] = None
@@ -266,6 +268,7 @@ class MixedPrecisionPolicy:
     cast_forward_inputs: bool = True
     apply_grad_on_fp32_main_grad: bool = False
     custom_params: Optional[Mapping[nn.Parameter, Mapping[str, Optional[DType]]]] = None
+    grad_dtype_fn: Optional[Callable[[nn.Parameter], Optional[DType]]] = None
 
     def __post_init__(self) -> None:
         """Validate overrides and index dtype configurations by source Parameter ID."""
