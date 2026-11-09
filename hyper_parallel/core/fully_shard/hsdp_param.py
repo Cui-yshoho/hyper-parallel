@@ -18,12 +18,16 @@
 """HSDP parameter"""
 # pylint: disable=W0212
 from dataclasses import dataclass
-from typing import Callable, List, Optional, cast
+from typing import Callable, List, Optional, Union, cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch._prims_common import make_contiguous_strides_for
+from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+from torch.distributed.tensor import DTensor as TorchDTensor
+from torch.distributed.tensor import Replicate as TorchReplicate
+from torch.distributed.tensor import Shard as TorchShard
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -140,6 +144,7 @@ class HSDPParamV2:
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
         source_shard_info: Optional[SourceShardMetaInfo] = None,
+        _dtensor_type: Optional[type] = None,
     ) -> None:
         """
         Initialize HSDPParamV2 and shard the parameter.
@@ -155,13 +160,24 @@ class HSDPParamV2:
             device (torch.device, optional): Target device for the sharded parameter.
             source_shard_info (SourceShardMetaInfo, optional): Source TP/EP layout metadata, built by
                 the owning ``HSDPStateV2``. Must be supplied (with ``origin_is_dtensor=True``)
-                whenever ``param`` is a native DTensor, and omitted otherwise.
+                whenever ``param`` has a source compute layout. A Torch DTensor
+                replicated only over the FSDP domain needs no extra source layout.
+            _dtensor_type: Optional final storage representation selected by the integration entry.
 
         Raises:
             ValueError: If ``source_shard_info.origin_is_dtensor`` disagrees with whether
                 ``param`` is a native DTensor.
         """
         self._module_info: ParamModuleInfo = module_info
+        if _dtensor_type not in (None, TorchDTensor):
+            raise ValueError("Unsupported parameter storage representation.")
+        self._dtensor_type = _dtensor_type or (TorchDTensor if isinstance(param, TorchDTensor) else DTensor)
+        self._torch_mesh = None
+        if isinstance(param, TorchDTensor) and (
+            (source_shard_info is not None and not source_shard_info.origin_is_dtensor)
+            or (source_shard_info is None and any(not placement.is_replicate() for placement in param.placements))
+        ):
+            raise ValueError("Torch DTensor source sharding requires its original layout metadata.")
         self.mesh_info = mesh_info
         self._src_parameter_id = id(param)
         self.device = device
@@ -178,7 +194,7 @@ class HSDPParamV2:
         # describes that parameter's own mesh/placements. Only the agreement
         # between the two is re-checked here, because it is the invariant the
         # sharding math below depends on.
-        if isinstance(param, DTensor) != (
+        if not isinstance(param, TorchDTensor) and isinstance(param, DTensor) != (
             source_shard_info is not None and source_shard_info.origin_is_dtensor
         ):
             raise ValueError(
@@ -193,6 +209,8 @@ class HSDPParamV2:
         self._orig_dtensor_placements = (
             tuple(source_shard_info.placements) if self._orig_param_is_dtensor else None
         )
+        if isinstance(param, TorchDTensor):
+            self._orig_dtensor_mesh, self._orig_dtensor_placements = param.device_mesh, tuple(param.placements)
         self._storage_source_layout = self._build_storage_source_layout()
         self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
@@ -265,9 +283,15 @@ class HSDPParamV2:
 
         storage_dim_names = []
         for dim_index, dim_name in enumerate(source_mesh_dim_names):
-            if not self._source_dim_covered_by_fsdp(
+            covered = self._source_dim_covered_by_fsdp(
                 source_mesh, dim_index, coordinate, fsdp_ranks
+            )
+            if (
+                self._dtensor_type is TorchDTensor and covered
+                and source_placements[dim_index].is_shard() and source_mesh.size(dim_index) > 1
             ):
+                raise NotImplementedError("Torch source sharding must be disjoint from the FSDP rank domain.")
+            if not covered:
                 storage_dim_names.append(dim_name)
         storage_dim_names = tuple(storage_dim_names)
         if not storage_dim_names or storage_dim_names == source_mesh_dim_names:
@@ -359,7 +383,10 @@ class HSDPParamV2:
             Layout containing all FSDP, TP, and EP placements.
         """
         logical_global_stride = None
-        if isinstance(source_param, DTensor):
+        if isinstance(source_param, TorchDTensor):
+            logical_global_size = source_param.size()
+            logical_global_stride = source_param.stride()
+        elif isinstance(source_param, DTensor):
             logical_global_size = source_param.size()
             logical_global_stride = source_param.layout.tensor_stride
         elif self.source_shard_info is not None:
@@ -582,7 +609,7 @@ class HSDPParamV2:
         hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
         self.hsdp_placement = hsdp_placement
         base_placements = list(self._get_base_spmd_placements())
-        param_data = param.to_local() if self._orig_param_is_dtensor else param
+        param_data = param.to_local() if isinstance(param, (DTensor, TorchDTensor)) else param
         shard_dim = hsdp_placement.dim
         if param_data.ndim == 0:
             raise ValueError("fully_shard does not support scalar parameters")
@@ -751,11 +778,17 @@ class HSDPParamV2:
             storage_offset=0,
         )
         if self.source_shard_info is not None and self.source_shard_info.origin_is_dtensor:
-            unsharded_param = DTensor.from_local(
-                unsharded_param,
-                self.source_shard_info.mesh,
-                self.source_shard_info.placements,
-            )
+            if self._dtensor_type is TorchDTensor:
+                unsharded_param = TorchDTensor.from_local(
+                    unsharded_param, self._orig_dtensor_mesh, self._orig_dtensor_placements,
+                    run_check=False, shape=self._sharding_spec.tensor_shape, stride=self._sharding_spec.tensor_stride,
+                )
+            else:
+                unsharded_param = DTensor.from_local(
+                    unsharded_param,
+                    self.source_shard_info.mesh,
+                    self.source_shard_info.placements,
+                )
         self._unsharded_param = nn.Parameter(
             unsharded_param,
             requires_grad=self.sharded_param.requires_grad,
@@ -793,7 +826,7 @@ class HSDPParamV2:
             else:
                 setattr(shared_module, shared_param_name, param)
 
-    def to_sharded_dtensor(self, tensor: torch.Tensor) -> DTensor:
+    def to_sharded_dtensor(self, tensor: torch.Tensor) -> Union[DTensor, TorchDTensor]:
         """
         Converts a local tensor representing either the sharded parameter or
         sharded gradient to DTensor.
@@ -804,6 +837,26 @@ class HSDPParamV2:
         shape and stride are supplied. The returned DTensor intentionally
         shares this layout with the sharded parameter.
         """
+        if self._dtensor_type is TorchDTensor:
+            if self._torch_mesh is None:
+                self._torch_mesh = TorchDeviceMesh.from_group(
+                    self._spmd_mesh.get_all_groups(),
+                    self._spmd_mesh.device_type,
+                    mesh=torch.tensor(self._spmd_mesh.mesh.tolist(), dtype=torch.int64),
+                    mesh_dim_names=self._spmd_mesh.mesh_dim_names,
+                )
+            placements = []
+            for placement in self._spmd_placements:
+                if type(placement) is Replicate:
+                    placements.append(TorchReplicate())
+                elif type(placement) is Shard:
+                    placements.append(TorchShard(placement.dim))
+                else:
+                    raise NotImplementedError(f"Torch storage does not yet support placement {placement!r}.")
+            return TorchDTensor.from_local(
+                tensor, self._torch_mesh, placements, run_check=False,
+                shape=self._sharding_spec.tensor_shape, stride=self._sharding_spec.tensor_stride,
+            )
         return DTensor.from_local_with_layout(
             tensor,
             self._sharding_spec,
@@ -816,7 +869,7 @@ class HSDPParamV2:
             return
         # Keep local gradients alive across no-sync / delayed-sync steps even
         # after the parameter transitions back to the sharded view.
-        unsharded_grad = self._unsharded_param.grad
+        unsharded_grad = self.unsharded_grad_data
         self._unsharded_param.grad = None
         if self.reduce_dtype is not None and unsharded_grad.dtype != self.reduce_dtype:
             unsharded_grad = unsharded_grad.to(self.reduce_dtype)
@@ -833,7 +886,7 @@ class HSDPParamV2:
             self.unsharded_accumulated_grad is not None
             and self.unsharded_param.grad is not None
         ):
-            grad = self.unsharded_param.grad
+            grad = self.unsharded_grad_data
             if self.reduce_dtype is not None and grad.dtype != self.reduce_dtype:
                 grad = grad.to(self.reduce_dtype)
             self.unsharded_param.grad = None
@@ -880,7 +933,8 @@ class HSDPParamV2:
         """
         Get the unsharded gradient data as a local tensor.
         """
-        return self._unsharded_param.grad
+        grad = self._unsharded_param.grad
+        return grad.to_local() if isinstance(grad, TorchDTensor) else grad
 
     @property
     def unsharded_accumulated_grad_data(self) -> torch.Tensor:
@@ -912,7 +966,7 @@ class HSDPParamV2:
                 f"Expects swap_tensors to preserve object but got {new_param} "
                 f"instead of {self.sharded_param}"
             )
-        if isinstance(new_param, DTensor):
+        if isinstance(new_param, (DTensor, TorchDTensor)):
             self.sharded_param = new_param
             if not getattr(self.sharded_param, "_hsdp_param_initialized", None):
                 # reset _hsdp_param_initialized flag.
@@ -1002,7 +1056,8 @@ class HSDPParamV2:
         not part of a forward computation.
         """
         new_param = self._resolve_reset_param()
-        local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
+        is_dtensor = isinstance(new_param, (DTensor, TorchDTensor))
+        local_tensor = new_param._local_tensor if is_dtensor else new_param
         if local_tensor.is_meta:
             return
         # local_tensor can be padded twice
@@ -1017,7 +1072,7 @@ class HSDPParamV2:
         if not same_local_tensor:
             local_tensor = self._validate_reset_local_tensor(local_tensor)
         local_tensor, pinned_local_tensor = self._pin_reset_local_tensor_if_needed(local_tensor)
-        if not isinstance(self.sharded_param, DTensor):
+        if not isinstance(self.sharded_param, self._dtensor_type):
             raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
         if not same_local_tensor or pinned_local_tensor:
             self._refresh_sharded_local_tensor(local_tensor, shard_dim)
@@ -1035,6 +1090,10 @@ class HSDPParamV2:
         self._setattr_on_modules(self.sharded_param)
 
     def _update_shardedparam_storage_forcely(self,):
+        if isinstance(self.sharded_param, TorchDTensor):
+            # Torch DTensor is a wrapper subclass: its TensorImpl must never be
+            # swapped with local storage as done for Hyper's storage subclass.
+            return
         sharded_param_data = self.sharded_param.data
         local_tensor_data = self.sharded_param._local_tensor.data
         if (

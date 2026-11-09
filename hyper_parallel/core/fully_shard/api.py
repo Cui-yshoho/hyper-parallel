@@ -19,6 +19,7 @@ from typing import Any, List, Mapping, cast, Optional, Union
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor as TorchDTensor
 
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
@@ -162,13 +163,15 @@ class HSDPModule:
     def hsdp_init(self, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
-                  source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]] = None):
+                  source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]] = None,
+                  _dtensor_type: Optional[type] = None):
         """init hsdp2 scheduler."""
         resolved_comm_fusion_zero_copy = _resolve_comm_fusion_zero_copy_default(
             comm_fusion,
             comm_fusion_zero_copy,
         )
 
+        storage_options = {} if _dtensor_type is None else {"_dtensor_type": _dtensor_type}
         self.hsdp_scheduler = HSDPSchedulerV2(module,
                                               mesh,
                                               reshard_after_forward,
@@ -181,6 +184,7 @@ class HSDPModule:
                                               comm_fusion,
                                               resolved_comm_fusion_zero_copy,
                                               source_shard_infos=source_shard_infos,
+                                              **storage_options,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync: bool, *, recurse: bool = True) -> None:
@@ -622,7 +626,7 @@ def _validate_managed_params_source_shard_infos(
 
     managed_parameters = set(managed_parameters)
 
-    if any(isinstance(parameter, DTensor) for parameter in managed_parameters):
+    if any(isinstance(parameter, (DTensor, TorchDTensor)) for parameter in managed_parameters):
         raise ValueError(
             "source_shard_infos cannot be provided when fully_shard manages a native DTensor parameter"
         )
@@ -670,6 +674,7 @@ def fully_shard(
         comm_fusion: bool = False,
         comm_fusion_zero_copy: Optional[bool] = None,
         source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]] = None,
+        use_torch_dtensor: bool = False,
 ) -> Union[nn.Module, List[nn.Module]]:
 
     """
@@ -739,11 +744,21 @@ def fully_shard(
             view-backed parameters.
         source_shard_infos (Optional[Mapping[nn.Parameter, SourceShardMetaInfo]]):
             Source TP/EP mesh and placements for the plain-parameter dual mode.
+        use_torch_dtensor (bool, default=False):
+            Construct final parameter and gradient shards as genuine Torch
+            DTensors using Hyper's existing partitioning and scheduling.
+            Ordinary parameters enter partitioning directly, without a replicated
+            Torch DTensor intermediate. Existing Hyper DTensor inputs cannot be
+            converted by this flag. False preserves native behavior: ordinary
+            parameters use Hyper DTensors and existing Torch inputs retain their
+            representation.
 
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
     _validate_module_for_fully_shard(module)
+    if not isinstance(use_torch_dtensor, bool):
+        raise ValueError("use_torch_dtensor must be bool")
 
     arg_module = module
     if isinstance(module, list):
@@ -751,11 +766,16 @@ def fully_shard(
     else:
         modules = (module,)
 
+    params = _get_modules_parameters(modules, ignored_params)
+    if use_torch_dtensor:
+        if any(isinstance(param, DTensor) for param in params):
+            raise ValueError("use_torch_dtensor cannot convert existing Hyper DTensor parameters.")
+        if any(param.grad is not None for param in params):
+            raise ValueError("Apply fully_shard before accumulating gradients.")
     for mod in modules:
         _extend_module_with_hsdp_interface(mod)
 
-    params = _get_modules_parameters(modules, ignored_params)
-    has_dtensor_param = any(isinstance(param, DTensor) for param in params)
+    has_dtensor_param = any(isinstance(param, (DTensor, TorchDTensor)) for param in params)
     _validate_managed_params_source_shard_infos(set(params), source_shard_infos)
 
     replicate_params = _normalize_replicate_params(replicate_params)
@@ -770,6 +790,7 @@ def fully_shard(
     device = _get_device_from_mesh(mesh)
 
     init_modules = modules
+    storage_options = {"_dtensor_type": TorchDTensor} if use_torch_dtensor else {}
     modules[0].hsdp_init(
         init_modules,
         mesh,
@@ -783,6 +804,7 @@ def fully_shard(
         comm_fusion,
         comm_fusion_zero_copy,
         source_shard_infos=source_shard_infos,
+        **storage_options,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:

@@ -111,6 +111,7 @@ class HSDPSchedulerV2:
         comm_fusion,
         comm_fusion_zero_copy=False,
         source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]] = None,
+        _dtensor_type: Optional[type] = None,
     ):
         """init hsdp scheduler.
 
@@ -127,6 +128,7 @@ class HSDPSchedulerV2:
             comm_fusion: Communication fusion configuration.
             comm_fusion_zero_copy: Whether fused communication writes into views.
             source_shard_infos: Optional per-parameter TP/EP source metadata.
+            _dtensor_type: Optional parameter storage type selected by an integration entry.
         """
         self.modules = (cell,) if isinstance(cell, nn.Module) else tuple(cell)
         self.cell = self.modules[0]
@@ -140,6 +142,7 @@ class HSDPSchedulerV2:
         self.device = device
         self.reshard_after_forward = reshard_after_forward
         self.source_shard_infos = source_shard_infos
+        self._dtensor_type = _dtensor_type
         self.scheduler_state = None
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
@@ -162,6 +165,8 @@ class HSDPSchedulerV2:
             HSDPStateV2,
         )
 
+        storage_type = getattr(self, "_dtensor_type", None)
+        storage_options = {} if storage_type is None else {"_dtensor_type": storage_type}
         self.hsdp_state = HSDPStateV2(
             self.modules,
             self.mesh,
@@ -174,6 +179,7 @@ class HSDPSchedulerV2:
             self.scheduler_ctx,
             self.device,
             source_shard_infos=self.source_shard_infos,
+            **storage_options,
         )
 
     def _register_hooks(self):

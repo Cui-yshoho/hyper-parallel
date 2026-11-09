@@ -577,6 +577,7 @@ class TestHSDPParamV2(unittest.TestCase):
         )
         param_v2 = object.__new__(HSDPParamV2)
         param_v2.source_shard_info = source_shard_info
+        param_v2._dtensor_type = DTensor
         param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
         param_v2.mesh_info.mesh = fsdp_mesh
 

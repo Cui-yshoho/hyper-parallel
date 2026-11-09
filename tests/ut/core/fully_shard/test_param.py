@@ -16,7 +16,6 @@
 # pylint: disable=protected-access
 
 import gc
-import os
 import unittest
 import weakref
 from functools import partial
@@ -47,6 +46,8 @@ from hyper_parallel.core.fully_shard.hsdp_param import (
 def _new_param():
     """Create an uninitialized HSDPParamV2 with common test fields."""
     hsdp_param = object.__new__(HSDPParamV2)
+    hsdp_param._dtensor_type = DTensor
+    hsdp_param._torch_mesh = None
     hsdp_param.unsharded_param_buffers = []
     hsdp_param.device = torch.device("cpu")
     hsdp_param.shard_size = 2

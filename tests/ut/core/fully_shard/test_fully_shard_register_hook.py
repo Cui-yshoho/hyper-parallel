@@ -19,7 +19,6 @@ requires_grad=False tensors, the requires_grad attribute is preserved correctly
 after passing through PostBackwardFunction.apply.
 """
 # pylint: disable=W0212
-import os
 import unittest
 from functools import partial
 from types import SimpleNamespace

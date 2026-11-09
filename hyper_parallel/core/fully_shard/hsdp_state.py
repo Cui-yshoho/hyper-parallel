@@ -20,9 +20,14 @@ from typing import List, Mapping, Optional
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor as TorchDTensor
+from torch.distributed.tensor import Replicate as TorchReplicate
+from torch.distributed.tensor import Shard as TorchShard
 
 from hyper_parallel.tools.logging import get_logger
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     _get_param_module_infos,
 )
@@ -71,6 +76,7 @@ class HSDPStateV2:
         scheduler_ctx,
         device,
         source_shard_infos: Optional[Mapping[torch.nn.Parameter, SourceShardMetaInfo]] = None,
+        _dtensor_type: Optional[type] = None,
     ):
         """
         Initialize HSDPStateV2.
@@ -87,8 +93,10 @@ class HSDPStateV2:
             scheduler_ctx: Scheduler context shared by this module tree.
             device (torch.device): Target device.
             source_shard_infos: Optional per-parameter TP/EP source metadata.
+            _dtensor_type: Optional parameter storage type selected by an integration entry.
         """
         self.source_shard_infos = source_shard_infos
+        self._dtensor_type = _dtensor_type
         self.modules = (cell,) if isinstance(cell, nn.Module) else tuple(cell)
         self.cell = self.modules[0]
         self.mesh = mesh
@@ -164,14 +172,34 @@ class HSDPStateV2:
         self, param: torch.nn.Parameter
     ) -> Optional[SourceShardMetaInfo]:
         """Build normalized source-layout metadata for one managed parameter."""
-        if isinstance(param, DTensor):
+        if isinstance(param, (DTensor, TorchDTensor)):
             if self.source_shard_infos is not None:
                 raise ValueError(
                     "source_shard_infos cannot be provided when fully_shard manages a native DTensor parameter"
                 )
+            source_mesh, placements = param.device_mesh, tuple(param.placements)
+            if isinstance(param, TorchDTensor):
+                placements = []
+                for placement in param.placements:
+                    if type(placement) is TorchReplicate:
+                        placements.append(Replicate())
+                    elif type(placement) is TorchShard:
+                        placements.append(Shard(placement.dim))
+                    else:
+                        raise NotImplementedError(f"Unsupported Torch DTensor source placement: {placement!r}.")
+                source_mesh = DeviceMesh.from_group(
+                    param.device_mesh.get_all_groups(), param.device_mesh.device_type,
+                    mesh=param.device_mesh.mesh, mesh_dim_names=param.device_mesh.mesh_dim_names,
+                )
+                # Replication over this FSDP domain is only an input representation,
+                # not an additional compute or gradient-reduction domain.
+                source_ranks = set(source_mesh.mesh.flatten().tolist())
+                fsdp_ranks = set(self.mesh.mesh.flatten().tolist())
+                if all(placement.is_replicate() for placement in placements) and source_ranks <= fsdp_ranks:
+                    return None
             return SourceShardMetaInfo(
-                mesh=param.device_mesh,
-                placements=tuple(param.placements),
+                mesh=source_mesh,
+                placements=tuple(placements),
                 origin_is_dtensor=True,
             )
         if self.source_shard_infos is None:
@@ -196,6 +224,8 @@ class HSDPStateV2:
 
         module_infos = _get_param_module_infos(filtered_params, tuple(self.modules))
         for param, module_info in zip(filtered_params, module_infos):
+            storage_type = getattr(self, "_dtensor_type", None)
+            storage_options = {} if storage_type is None else {"_dtensor_type": storage_type}
             self.hsdp_params.append(
                 HSDPParamV2(
                     param,
@@ -206,6 +236,7 @@ class HSDPStateV2:
                     offload_policy=self.offload_policy,
                     device=self.device,
                     source_shard_info=self._build_param_source_shard_info(param),
+                    **storage_options,
                 )
             )
 

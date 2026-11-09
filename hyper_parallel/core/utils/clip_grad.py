@@ -46,6 +46,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor as TorchDTensor
+from torch.distributed.tensor import Partial as TorchPartial
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from hyper_parallel.core.dtensor.placement_types import Partial
 
@@ -74,6 +77,13 @@ class NormShardPlan:
 def _norm_coverage(param: torch.nn.Parameter) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...]]:
     """Describe the exact global rectangle represented by a local parameter."""
     global_shape = tuple(param.shape)
+    if isinstance(param, TorchDTensor):
+        local_shape, offsets = compute_local_shape_and_global_offset(
+            global_shape, param.device_mesh, param.placements,
+        )
+        if tuple(local_shape) != tuple(param.to_local().shape):
+            raise ValueError("Torch layout cannot describe the exact local parameter coverage")
+        return global_shape, tuple((int(start), int(start + size)) for start, size in zip(offsets, local_shape))
     layout = getattr(param, "layout", None) if _is_dtensor(param) else None
     if layout is None:
         area = tuple((0, size) for size in global_shape)
@@ -138,6 +148,7 @@ def build_norm_shard_plan(model: torch.nn.Module, excluded_params: Iterable[torc
         rank = 0
     mesh = getattr(mesh_context, "device_mesh", None)
     stage_ranks = (tuple(mesh.rank_list) if mesh is not None and hasattr(mesh, "rank_list")
+                   else tuple(mesh.mesh.flatten().tolist()) if mesh is not None and hasattr(mesh, "mesh")
                    else tuple(range(len(gathered))))
     stage_data = {member: gathered[member] for member in stage_ranks}
     reference_names = set(local)
@@ -245,14 +256,14 @@ _GradGroups = namedtuple(
 
 
 def _is_dtensor(value: object) -> bool:
-    """Return whether *value* is a HyperParallel DTensor.
+    """Recognize either storage representation without changing norm math.
 
     The DTensor module imports ``core.utils`` during initialization, so keep
     this import lazy to avoid a package initialization cycle.
     """
     from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
 
-    return isinstance(value, DTensor)
+    return isinstance(value, (DTensor, TorchDTensor))
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +389,7 @@ def _get_param_mesh_info(
     partial_info = tuple(
         (i, *_str_to_reduce_op(p.reduce_op))
         for i, p in enumerate(spec_source.placements)
-        if isinstance(p, Partial)
+        if isinstance(p, (Partial, TorchPartial))
     )
     return spec_source.device_mesh, shard_dims, partial_info
 

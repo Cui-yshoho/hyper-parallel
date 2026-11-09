@@ -27,6 +27,10 @@ from unittest.mock import patch, MagicMock
 # pylint: disable=C0413
 import torch
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+from torch.distributed.tensor import DTensor as TorchDTensor
+from torch.distributed.tensor import Replicate as TorchReplicate
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
 from hyper_parallel.core.fully_shard.api import (
     _check_hsdp_input_valid,
@@ -397,6 +401,55 @@ class TestFullyShardListAPI(unittest.TestCase):
             fully_shard(module, mesh=mesh, source_shard_infos=None)
 
         self.assertIsNone(mock_hsdp_init.call_args.kwargs["source_shard_infos"])
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    def test_torch_entry_forwards_storage_selection_to_list_scheduler(self, mock_get_device):
+        """The private selection reaches the shared scheduler for every root."""
+        mock_get_device.return_value = self.device
+        modules = [SimpleLinear(2, 2), SimpleLinear(2, 2)]
+        modules[0].hsdp_scheduler = MagicMock()
+        torch_mesh = MagicMock(spec=TorchDeviceMesh)
+        torch_mesh.ndim = 1
+        torch_mesh.device_type = "cpu"
+        for module in modules:
+            for name, parameter in module.named_parameters():
+                spec = DTensorSpec(
+                    torch_mesh, (TorchReplicate(),),
+                    TensorMeta(parameter.shape, parameter.stride(), parameter.dtype),
+                )
+                setattr(module, name, nn.Parameter(TorchDTensor(parameter.detach(), spec, requires_grad=True)))
+        parameters = list(modules[0].parameters())
+        with patch.object(HSDPModule, "hsdp_init") as initialize:
+            result = fully_shard(modules, mesh=self._create_mock_mesh(), use_torch_dtensor=True)
+        self.assertIs(result, modules)
+        self.assertNotIn("use_torch_dtensor", initialize.call_args.kwargs)
+        self.assertIs(initialize.call_args.kwargs["_dtensor_type"], TorchDTensor)
+        self.assertIs(modules[0].weight, parameters[0])
+        self.assertIs(modules[0].hsdp_scheduler, modules[1].hsdp_scheduler)
+
+    def test_public_entry_rejects_non_boolean_storage_flag(self):
+        """Do not silently interpret integers, strings or classes as a flag."""
+        for value in (1, None, "true", TorchDTensor):
+            with self.subTest(value=value):
+                module = SimpleLinear(2, 2)
+                original_type = type(module)
+                with self.assertRaisesRegex(ValueError, "use_torch_dtensor must be bool"):
+                    fully_shard(module, use_torch_dtensor=value)
+                self.assertIs(type(module), original_type)
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.dist.get_world_size", return_value=2)
+    def test_torch_storage_reuses_native_default_mesh(self, _world, mock_get_device):
+        """Plain inputs can use the same default DP mesh construction as native inputs."""
+        parent = nn.Sequential(SimpleLinear(2, 2))
+        original_parameter = parent[0].weight
+        mock_get_device.return_value = self.device
+        with patch("hyper_parallel.core.fully_shard.api.init_device_mesh") as mesh, \
+                patch.object(HSDPModule, "hsdp_init") as initialize:
+            fully_shard(parent, use_torch_dtensor=True)
+        mesh.assert_called_once_with(device_type="npu", mesh_shape=(2,))
+        self.assertIs(initialize.call_args.kwargs["_dtensor_type"], TorchDTensor)
+        self.assertIs(parent[0].weight, original_parameter)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     def test_fully_shard_single_module_returns_module(self, mock_get_device):
