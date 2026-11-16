@@ -84,15 +84,101 @@ checkpoint with a different head-block layout or LR policy is rejected.
 These options use Hyper's existing optimizer interfaces without modifying
 its FSDP or Muon core algorithms.
 
-Direct factory calls default to `gram_quack`, matching VeOmni; unsupported
-devices fall back to Gram through VeOmni's existing dispatcher. Parameters
-shaped `[E, 1, H]` are presented as E independent `[1, H]` matrices to NS.
+Hyper Muon bridges VeOmni's existing `muon_ns_implementation` selector:
+
+| VeOmni value | Hyper NS path | Symmetric GEMM backend |
+| --- | --- | --- |
+| `std` | Standard NS with VeOmni's resolved coefficient schedule | Native matmul |
+| `gram` | Existing shape-selected Hyper Gram with the same schedule | CANN/native matmul |
+| `gram_quack` (default) | Same Hyper Gram implementation | Automatic Ascend C / native matmul |
+
+All three paths use Hyper's built-in NS with no VeOmni NS callback. Parameter
+splitting and head layout resolution still use VeOmni. Inputs shaped `[E, 1, H]`
+are presented as E independent `[1, H]` matrices.
+
+Hyper Muon defaults to vanilla EMA momentum. The VeOmni adapter fixes this mode
+internally; its momentum coefficient and Nesterov selection remain controlled by
+`muon_momentum` and `muon_nesterov`. No new VeOmni configuration fields are needed:
+
+```yaml
+model:
+  optimizer:
+    type: muon
+    use_hyper_optimizer: true
+    muon_ns_implementation: gram_quack  # std / gram / gram_quack
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_eps: 1.0e-10
+    muon_gram_ns_reset_iterations: [2]
+```
+
+For programmatic construction, pass the selection through the existing config
+or explicit `muon_kwargs`, which override the config key by key:
+
+```python
+from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+from veomni.arguments.arguments_types import OptimizerConfig
+import veomni.optim.optimizer as optimizer_module
+
+apply_hyper_parallel_patch()
+# Construct the model after activating the bindings.
+optimizer_config = OptimizerConfig(type="muon", use_hyper_optimizer=True)
+optimizer = optimizer_module.build_optimizer(
+    model=model,
+    optimizer_type="muon",
+    param_groups=None,
+    lr=1e-4,
+    optimizer_config=optimizer_config,
+    muon_kwargs={"ns_implementation": "gram_quack", "eps": 1e-10},
+)
+```
+
+`use_hyper_optimizer` belongs to `OptimizerConfig`, not the factory's keyword
+arguments. The Hyper adapter does not expose `momentum_mode`, `use_gram`,
+`ns_backend` or `ns_variant` through VeOmni kwargs; explicit overrides raise.
+Direct Hyper Muon callers retain those core options, including explicit legacy
+momentum.
+
+All modes use VeOmni's own coefficient parser, preserving default/custom triples
+and per-step coefficient schedules. The effective schedule length becomes Hyper's
+`ns_steps`; no mode substitutes asym5 for the configured coefficients. Epsilon
+and `muon_gram_ns_reset_iterations` are translated into the corresponding Hyper
+options. Gram accepts other iteration counts and restart positions; zero,
+negative and out-of-schedule restart indices have no effect, as in VeOmni.
+
+The existing Hyper arithmetic is retained. Its optimizer prepares BF16 NS inputs,
+while native VeOmni Gram normalizes in FP32 and defaults to FP16 iterations. Hyper's
+static shape policy can select standard NS for small or near-square inputs;
+native VeOmni Gram falls back only for square matrices. Matching configurations
+therefore preserve parameter semantics without promising bitwise numerical parity
+or identical algorithm selection. The default Hyper cost heuristic was calibrated
+for five steps with a restart at index two; other schedules are supported without
+claiming that this heuristic is optimal for them.
+
+`gram_quack` uses `backend="auto"` for each symmetric product. Eligible NPU
+FP16/BF16 inputs with `N > 256`, at least 20 GFLOPs and an installed native
+library use Ascend C; other products use native matmul. An absent optional
+library permits fallback, while broken installed libraries and kernel errors
+still raise. Selection uses a static rule without runtime timing or tuning.
+`gram` always selects native matmul and makes no Ascend C calls. Install the
+feature version of HyperParallel with the matching CANN toolkit to enable the
+automatic Ascend C path; native libraries are compiled during installation.
+Direct Hyper callers can still force `ns_backend="ascendc"` for validation.
+
 Checkpoint restore requires matching NS coefficients, epsilon, iteration count,
-variant, implementation and Gram reset indices. Mismatches are rejected before
-loading that Muon optimizer, because NS callbacks retain construction-time
-settings. During real VeOmni DCP loads, required option templates contain
-unloaded markers rather than usable current defaults. Partial loading cannot
-make an absent checkpoint option appear to have been saved.
+variant, implementation, Gram reset indices and resolved momentum/backend
+settings. Mismatches are rejected before loading that Muon optimizer. During
+VeOmni DCP loads, required option templates contain unloaded markers rather than
+usable current defaults. Partial loading cannot make an absent checkpoint
+option appear to have been saved.
+
+The core options are also recorded in parameter groups and checked before
+checkpoint restore. A changed EMA/Gram/backend setting is rejected. Missing
+metadata for active options requires explicit historical confirmation through
+`confirm_legacy_muon_checkpoint_options`, including when partial DCP loading
+leaves an unloaded marker. Only confirm values known to have produced the saved
+state; this is not a way to change algorithms while resuming a checkpoint.
 
 Old checkpoints missing NS metadata are rejected by default. If the historical
 settings are known, explicitly confirm the missing values before loading:
@@ -183,7 +269,7 @@ ordinary Shard/Replicate placements; special layouts fail rather than lose seman
 VeOmni dependencies are maintained in two places: `adapter.py` owns
 the weight dispatcher's `_dispatch_parameter`/`_find_submodule` (under
 `models.checkpoint.weights`, or `models.module_utils` in older versions) and FSDP/clipping bindings;
-`optimizer.py` owns `build_optimizer`, `_collect_muon_kwargs`,
+`optimizer.py` owns `build_optimizer`, `_collect_muon_kwargs`, `_as_coeff_schedule`,
 `_make_param_groups_for_subset`, and native Muon grouping/NS calls.
 Optimizer binding requires named, keyword-compatible `model`, `optimizer_type`
 and `param_groups` parameters. Additional parameters are allowed; incompatible

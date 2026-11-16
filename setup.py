@@ -20,7 +20,7 @@ import shutil
 import stat
 import platform
 import subprocess
-from importlib import import_module
+from importlib import import_module, util
 from setuptools import setup, find_packages, find_namespace_packages, Distribution
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
@@ -28,6 +28,12 @@ from setuptools.command.install import install
 
 ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
+
+# PEP 517 executes setup.py without putting the source root on sys.path.
+_native_spec = util.spec_from_file_location("setup_ascendc", os.path.join(ROOT_DIR, "setup_ascendc.py"))
+_native_build = util.module_from_spec(_native_spec)
+sys.modules[_native_spec.name] = _native_build
+_native_spec.loader.exec_module(_native_build)
 
 TORCH26_REQUIRES = [
     "torch==2.6.0",
@@ -173,6 +179,9 @@ class BuildPy(build_py):
 
     def run(self) -> None:
         """Build Python sources and copy the explicitly prepared native payload."""
+        if self.editable_mode:
+            super().run()
+            return
         shutil.rmtree(self.build_lib, ignore_errors=True)
         super().run()
         target_lib_dir = os.path.join(self.build_lib, 'hyper_parallel')
@@ -225,6 +234,7 @@ if __name__ == '__main__':
         'egg_info': EggInfo,
         'build_py': BuildPy,
         'install': Install,
+        'build_ext': _native_build.AscendCBuildExt,
     }
     setup(
         name='hyper_parallel',
@@ -266,12 +276,13 @@ if __name__ == '__main__':
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',
             ],
-            'hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers': [
+            'hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers': [  # codespell:ignore nd
                 'mapping.yaml',
             ],
         },
         cmdclass=_cmdclass,
         distclass=BinaryDistribution,
+        ext_modules=_native_build.ascendc_extensions(),
         python_requires='>=3.10,<3.13',
         install_requires=get_install_requires(),
         extras_require=get_extra_requires(),

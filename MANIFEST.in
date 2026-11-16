@@ -3,6 +3,8 @@ include README.md
 include README.zh.md
 include LICENSE
 include build.sh
+include setup_ascendc.py
+include pyproject.toml
 include hyper_parallel/rl/pyproject.toml
 include hyper_parallel/rl/docker/patches/patch_sampler.py
 include hyper_parallel/data/indexed/csrc/Makefile

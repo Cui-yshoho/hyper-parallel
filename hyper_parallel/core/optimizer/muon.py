@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.functional.symmetric_matmul import symmetric_matmul
+from hyper_parallel.core.optimizer.muon_gram import newton_schulz_with_gram
 from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -78,6 +80,9 @@ class MuonPostUpdateContext:
 _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "ns_coefficients": None,
     "ns_epsilon": 1e-10,
+    "use_gram": False,
+    "ns_backend": None,
+    "gram_reset_iterations": (2,),
     "zeropower_fn": None,
     "momentum_update_fn": None,
     "reshape_fn": None,
@@ -94,6 +99,9 @@ class _MuonAdvancedOptions:
 
     ns_coefficients: Optional[Sequence[Tuple[float, float, float]]]
     ns_epsilon: float
+    use_gram: bool
+    ns_backend: Optional[str]
+    gram_reset_iterations: Tuple[int, ...]
     zeropower_fn: Optional[Callable[..., torch.Tensor]]
     momentum_update_fn: Optional[Callable[..., torch.Tensor]]
     reshape_fn: Optional[Callable[..., Any]]
@@ -116,14 +124,96 @@ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOpti
 _TransformNSState = Dict[str, Any]
 
 
+def _update_momentum_buffers(grads, buffers, momentum, nesterov, mode):
+    """Apply the selected momentum formula and return pre-NS updates."""
+    momentum1, momentum2 = momentum
+    if mode == "vanilla":
+        # Fold the Nesterov EMA interpolation into one lerp.
+        update_momentum = momentum1 ** 2 if nesterov else momentum1
+        updates = torch._foreach_lerp(grads, buffers, weight=update_momentum)
+        torch._foreach_lerp_(buffers, grads, weight=1 - momentum2)
+    elif mode == "legacy":
+        updates = torch._foreach_add(grads, buffers, alpha=momentum1)
+        torch._foreach_mul_(buffers, momentum2)
+        torch._foreach_add_(buffers, grads)
+        if nesterov:
+            torch._foreach_mul_(updates, momentum1)
+            torch._foreach_add_(updates, grads)
+    else:
+        raise ValueError(
+            "Muon._update_muon_momentum_mode must be 'vanilla' or 'legacy', "
+            f"got {mode!r}"
+        )
+    return updates
+
+
+def _ns_step_coefficients(
+        ns_variant: str,
+        steps: int,
+        ns_coefficients: Optional[Sequence[Tuple[float, float, float]]],
+) -> Sequence[Tuple[float, float, float]]:
+    """Resolve the coefficient schedule without changing iteration arithmetic."""
+    if ns_variant == "legacy":
+        return [_NS_LEGACY_COEFFS] * steps
+    if ns_variant == "asym5":
+        return _NS_ASYM5_COEFFS[:steps]
+    if ns_variant == "custom":
+        if ns_coefficients is None:
+            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
+        if steps > len(ns_coefficients):
+            raise ValueError(
+                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
+            )
+        return tuple(ns_coefficients[:steps])
+    raise ValueError(f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}")
+
+
 def zeropower_via_newtonschulz5(
         ns_inputs: torch.Tensor,
         steps: int,
         ns_variant: str = "asym5",
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+        use_gram: bool = False,
+        ns_backend: Optional[str] = None,
+        gram_reset_iterations: Sequence[int] = (2,),
 ) -> torch.Tensor:
-    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
+    """Orthogonalize with optional shape-selected Gram and symmetric GEMM dispatch.
+
+    ``use_gram=False`` retains the original implementation. When enabled, the
+    resolved coefficient schedule reaches the existing static Gram policy,
+    independently of its coefficient family, step count or floating-point dtype.
+    Symmetric products select Ascend C or native matmul independently, subject
+    to the selected backend's dtype support.
+
+    ``ns_backend=None`` uses native matmul for either algorithm. Explicit "auto", "cann" or
+    "ascendc" selects symmetric GEMM independently of Gram. Standard NS keeps
+    its separate coefficient operations in the input dtype.
+
+    Args:
+        ns_inputs: Matrix or batched matrix to orthogonalize.
+        steps: Number of polynomial iterations.
+        ns_variant: Coefficient family: asym5, legacy or custom.
+        epsilon: Normalization stability term.
+        ns_coefficients: Explicit coefficient groups for the custom variant.
+        use_gram: Enable shape-selected Gram with the configured coefficients.
+        ns_backend: Independent symmetric GEMM backend; None uses native matmul.
+        gram_reset_iterations: Zero-based iterations refreshing the Gram matrix.
+
+    Returns:
+        Orthogonalized update with the input shape and dtype.
+    """
+    if ns_backend not in (None, "auto", "cann", "ascendc"):
+        raise ValueError("ns_backend must be None, auto, cann or ascendc")
+    if not isinstance(use_gram, bool):
+        raise ValueError("use_gram must be a bool")
+    if use_gram:
+        coefficients = _ns_step_coefficients(ns_variant, steps, ns_coefficients)
+        if not coefficients:
+            raise ValueError("Gram requires at least one Newton-Schulz step")
+        return newton_schulz_with_gram(
+            ns_inputs, coefficients, epsilon, ns_backend or "cann", reset_iterations=gram_reset_iterations,
+        )
     mat_x = ns_inputs
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
@@ -137,26 +227,15 @@ def zeropower_via_newtonschulz5(
     buf_b = torch.empty_like(buf_a)
     buf_c = torch.empty(mat_x.shape, dtype=mat_x.dtype, device=mat_x.device)
 
-    if ns_variant == "legacy":
-        step_coeffs = [_NS_LEGACY_COEFFS] * steps
-    elif ns_variant == "asym5":
-        step_coeffs = _NS_ASYM5_COEFFS[:steps]
-    elif ns_variant == "custom":
-        if ns_coefficients is None:
-            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
-        if steps > len(ns_coefficients):
-            raise ValueError(
-                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
-            )
-        step_coeffs = tuple(ns_coefficients[:steps])
-    else:
-        raise ValueError(
-            f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
-        )
+    step_coeffs = _ns_step_coefficients(ns_variant, steps, ns_coefficients)
 
     for coeff_a, coeff_b, coeff_c in step_coeffs:
-        torch.matmul(mat_x, mat_x.mT, out=buf_a)
-        torch.matmul(buf_a, buf_a, out=buf_b)
+        if ns_backend is None:
+            torch.matmul(mat_x, mat_x.mT, out=buf_a)
+            torch.matmul(buf_a, buf_a, out=buf_b)
+        else:
+            symmetric_matmul(mat_x, mat_x.mT, out=buf_a, backend=ns_backend)
+            symmetric_matmul(buf_a, buf_a, out=buf_b, backend=ns_backend)
         buf_a.mul_(coeff_b)
         buf_b.mul_(coeff_c)
         buf_a.add_(buf_b)
@@ -176,7 +255,16 @@ def compute_muon_slice_scale(
         matched_adamw_rms: float,
         zero_rms_scale_mode: str = "zero",
 ) -> float:
-    """Compute Muon scale from the logical matrix dims of a reshaped slice."""
+    """Compute Muon scale from the logical matrix dims of a reshaped slice.
+
+    Args:
+        slice_tensor: Update tensor whose logical matrix dimensions set the scale.
+        matched_adamw_rms: Target update RMS multiplier.
+        zero_rms_scale_mode: Whether a zero multiplier keeps the learning-rate scale.
+
+    Returns:
+        Scale to apply to the orthogonalized update.
+    """
     if not matched_adamw_rms:
         return 1.0 if zero_rms_scale_mode == "use_lr" else 0.0
     shape = tuple(slice_tensor.shape)
@@ -208,6 +296,7 @@ class Muon(BaseDistributedOptimizer):
             ns_steps: int = 5,
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            momentum_mode: str = "vanilla",
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -223,6 +312,15 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: Newton-Schulz coefficient variant.
             ns_coefficients: Optional custom Newton-Schulz coefficients.
             ns_epsilon: Numerical stability term used during normalization.
+            use_gram: Opt into static Gram/standard NS selection with the configured
+                coefficient schedule, independently of the GEMM backend. Defaults to False. An explicit
+                zeropower_fn overrides this option.
+            ns_backend: Symmetric GEMM backend: None uses native matmul,
+                "auto" selects Ascend C by static cost, "cann" uses native matmul,
+                and "ascendc" forces Ascend C. Independent of use_gram. Standard
+                NS retains separate coefficient operations in the input dtype.
+                An explicit zeropower_fn overrides this option.
+            gram_reset_iterations: Zero-based steps refreshing the Gram matrix, default (2,).
             zeropower_fn: Optional Newton-Schulz implementation override.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
@@ -231,8 +329,19 @@ class Muon(BaseDistributedOptimizer):
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
+            momentum_mode: Momentum formula, either "legacy" or "vanilla" (default).
+                Both modes support distinct update and buffer coefficients.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        if advanced.ns_backend not in (None, "auto", "cann", "ascendc"):
+            raise ValueError("ns_backend must be None, auto, cann or ascendc")
+        if not isinstance(advanced.use_gram, bool):
+            raise ValueError("use_gram must be a bool")
+        gram_resets = tuple(int(index) for index in advanced.gram_reset_iterations)
+        if momentum_mode not in ("legacy", "vanilla"):
+            raise ValueError(
+                f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}"
+            )
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -261,6 +370,9 @@ class Muon(BaseDistributedOptimizer):
             "ns_variant": ns_variant,
             "ns_coefficients": normalized_coefficients,
             "ns_epsilon": advanced.ns_epsilon,
+            "use_gram": advanced.use_gram,
+            "ns_backend": advanced.ns_backend,
+            "gram_reset_iterations": gram_resets,
             "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
@@ -268,6 +380,7 @@ class Muon(BaseDistributedOptimizer):
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
+        self._update_muon_momentum_mode = momentum_mode
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
         self.reset_optimizer_parameters()
@@ -322,6 +435,32 @@ class Muon(BaseDistributedOptimizer):
 
     __repr__ = __str__
 
+    def _prepare_step_ns_inputs(self) -> Dict[int, Dict]:
+        """Advance step counters and prepare momentum without communication."""
+        for group in self.param_groups:
+            group['step'] = (group.get('step') or 0) + 1
+
+        # Compute momentum only for no-comm params upfront.
+        no_comm_ns: Dict[int, Dict] = {}
+        for group_idx, group in enumerate(self.param_groups):
+            info = self._hsdp_assignment_batches.get(group_idx)
+            if not info:
+                # No HSDP info — all params are no_comm.
+                unshard_params = self.unshard_params_by_group.get(group_idx, [])
+                no_comm_ns[group_idx] = self._update_muon_momentum(
+                    group, unshard_params
+                )
+            else:
+                no_comm_params = info.get("no_comm", [])
+                if no_comm_params:
+                    no_comm_ns[group_idx] = self._update_muon_momentum(
+                        group, no_comm_params
+                    )
+                else:
+                    no_comm_ns[group_idx] = {}
+
+        return no_comm_ns
+
     @torch.no_grad()
     def step(
             self,
@@ -347,27 +486,7 @@ class Muon(BaseDistributedOptimizer):
 
         num_groups = len(self.param_groups)
 
-        for group in self.param_groups:
-            group['step'] = (group.get('step') or 0) + 1
-
-        # Compute momentum only for no-comm params upfront.
-        no_comm_ns: Dict[int, Dict] = {}
-        for group_idx in range(num_groups):
-            info = self._hsdp_assignment_batches.get(group_idx)
-            if not info:
-                # No HSDP info — all params are no_comm.
-                unshard_params = self.unshard_params_by_group.get(group_idx, [])
-                no_comm_ns[group_idx] = self._update_muon_momentum(
-                    self.param_groups[group_idx], unshard_params
-                )
-            else:
-                no_comm_params = info.get("no_comm", [])
-                if no_comm_params:
-                    no_comm_ns[group_idx] = self._update_muon_momentum(
-                        self.param_groups[group_idx], no_comm_params
-                    )
-                else:
-                    no_comm_ns[group_idx] = {}
+        no_comm_ns = self._prepare_step_ns_inputs()
 
         # Process no-comm params.
         for group_idx in range(num_groups):
@@ -530,18 +649,9 @@ class Muon(BaseDistributedOptimizer):
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
-        # Match muon_update_core():
-        # m_for_update = grad + momentum1 * m_old
-        # m_new = grad + momentum2 * m_old
-        # pylint: disable=protected-access
-        local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
-
-        torch._foreach_mul_(bufs, momentum2)
-        torch._foreach_add_(bufs, grads)
-
-        if group["nesterov"]:
-            torch._foreach_mul_(local_us, momentum1)
-            torch._foreach_add_(local_us, grads)
+        local_us = _update_momentum_buffers(
+            grads, bufs, (momentum1, momentum2), group["nesterov"], self._update_muon_momentum_mode
+        )
 
         if local_us[0].dtype != torch.bfloat16:
             local_us = [update.to(torch.bfloat16) for update in local_us]
@@ -785,7 +895,12 @@ class Muon(BaseDistributedOptimizer):
         _, reshaped_inputs = self._reshape_ns_input(param, working_input)
 
         def restore_view_updates(updates: List[torch.Tensor], output: torch.Tensor) -> None:
-            """Write reshaped NS updates back into the views and the working input."""
+            """Write reshaped NS updates back into the views and the working input.
+
+            Args:
+                updates: Orthogonalized updates matching the prepared views.
+                output: Destination tensor for the restored parameter update.
+            """
             for reshaped_input, update in zip(reshaped_inputs, updates):
                 reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
             if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
@@ -822,6 +937,9 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: str = "asym5",
             ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
             ns_epsilon: float = 1e-10,
+            use_gram: bool = False,
+            ns_backend: Optional[str] = None,
+            gram_reset_iterations: Sequence[int] = (2,),
     ) -> List[torch.Tensor]:
         """Run batched NS on mixed-shape tensors and restore their original shapes."""
 
@@ -864,6 +982,9 @@ class Muon(BaseDistributedOptimizer):
                 ns_variant=ns_variant,
                 epsilon=ns_epsilon,
                 ns_coefficients=ns_coefficients,
+                use_gram=use_gram,
+                ns_backend=ns_backend,
+                gram_reset_iterations=gram_reset_iterations,
             )
         else:
             merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
@@ -963,7 +1084,10 @@ class Muon(BaseDistributedOptimizer):
                 )
         for tensor_list in state["reshape_groups"].values():
             updates = self._compute_batched_ns_outputs_for_tensors(
-                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
+                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"],
+                use_gram=group.get("use_gram", False),
+                ns_backend=group.get("ns_backend"),
+                gram_reset_iterations=group.get("gram_reset_iterations", (2,)),
             )
             for reshaped_input, update in zip(tensor_list, updates):
                 scale = compute_muon_slice_scale(
@@ -1029,6 +1153,9 @@ class Muon(BaseDistributedOptimizer):
                 ns_variant=group["ns_variant"],
                 ns_coefficients=group["ns_coefficients"],
                 ns_epsilon=group["ns_epsilon"],
+                use_gram=group.get("use_gram", False),
+                ns_backend=group.get("ns_backend"),
+                gram_reset_iterations=group.get("gram_reset_iterations", (2,)),
             )
 
             # Scale updates.

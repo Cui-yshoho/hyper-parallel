@@ -46,7 +46,7 @@ pip install /absolute/path/to/the-built-wheel.whl
 
 General build requirements: Python 3.10–3.12, matching development headers, setuptools, wheel, pybind11, and a C++17 host toolchain. Each wheel targets one Python ABI and host architecture. Each native component defines its own SDK, framework, and device requirements. Runtime environments for source and prebuilt wheels must also satisfy the glibc, framework ABI, and SDK constraints recorded in the final ELF binaries.
 
-Each unified build regenerates `build/native/payload/hyper_parallel` and ships only components that succeeded in that build. `--strict on` aborts when a selected component fails and is suitable for acceptance and release builds. The default permissive mode continues packaging after optional component failures, so generating a wheel does not prove that all optional components are available. `python setup.py bdist_wheel` does not trigger native compilation; without an explicit payload, it packages Python sources only. When Multicore is enabled, activate its CANN custom OPP before starting Python.
+Each unified build regenerates `build/native/payload/hyper_parallel` and ships only components that succeeded in that build. `--strict on` aborts when a selected component fails and is suitable for acceptance and release builds. The default permissive mode continues packaging after optional component failures, so generating a wheel does not prove that all optional components are available. `python setup.py bdist_wheel` assembles the explicitly prepared native payload; the optional Ascend C symmetric GEMM also uses the automatic build hook described below. When Multicore is enabled, activate its CANN custom OPP before starting Python.
 
 ## 3. Activate the Multicore CANN Custom OPP
 
@@ -78,3 +78,30 @@ import importlib.metadata as metadata
 
 print(metadata.version("hyper_parallel"))
 ```
+
+## 5. Ascend C Symmetric GEMM
+
+With CANN 8.5.0, a C++ toolchain and CMake >= 3.16 available, wheel builds and editable installs compile the native library automatically:
+
+```bash
+source /path/to/cann/set_env.sh
+python -m pip wheel --no-deps . -w dist
+python -m pip install -e .
+```
+
+`python -m build` and the existing `build.sh` wheel packaging use the same setuptools build hook.
+The wheel includes the host library and two kernel libraries; installing a wheel requires a matching CANN runtime but no compiler.
+The source distribution includes the native sources. Editable installation places all three libraries beside the Python launcher in the current source tree.
+
+The build searches `ASCEND_HOME_PATH`, `ASCEND_CANN_PACKAGE_PATH`, then standard CANN installation paths.
+Without CANN, installation succeeds and the operator uses native Torch matmul.
+`HP_BUILD_ASCENDC=on` requires native compilation; `off` disables it explicitly.
+An incomplete detected CANN toolchain or compilation failure fails installation.
+By default, CANN supplies the full local SoC identifier without importing Torch.
+`HP_ASCEND_SOC_VERSION` overrides the target and is required for cross-compilation without a usable device runtime.
+`CMAKE_BUILD_PARALLEL_LEVEL` controls build parallelism, defaulting to 4.
+The validated target is Ascend910B3 / CANN 8.5.0 / torch-npu 2.9.
+Other SoCs and toolchains require separate validation; successful compilation alone does not establish runtime compatibility.
+
+No manual library-path environment variable is needed, and imports never compile native code.
+Reinstall after changing the native sources, target SoC or CANN toolchain.
