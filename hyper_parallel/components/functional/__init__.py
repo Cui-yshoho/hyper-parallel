@@ -61,6 +61,7 @@ _EXPORT_TO_MODULE = {
     "situ": "activation_situ",
     "situ_packed": "activation_situ",
     "swiglu": "swiglu",
+    "symmetric_matmul": "symmetric_matmul",
 }
 
 
@@ -113,4 +114,5 @@ __all__ = [
     "situ",
     "situ_packed",
     "swiglu",
+    "symmetric_matmul",
 ]

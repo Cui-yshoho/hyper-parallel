@@ -43,6 +43,13 @@ _MUON_NS_KEYS = (
     "ns_variant",
     "gram_ns_reset_iterations",
 )
+_MUON_CORE_KEYS = ("momentum_mode", "use_gram", "ns_backend", "gram_reset_iterations")
+_MUON_NS_IMPLEMENTATIONS = {
+    "std": (False, None),
+    "gram": (True, "cann"),
+    "gram_quack": (True, "auto"),
+}
+_MUON_DEFAULT_COEFFICIENTS = (3.4445, -4.775, 2.0315)
 _MISSING_CHECKPOINT_STRING = "__hyper_muon_not_loaded__"
 _MISSING_CHECKPOINT_INTEGER = -(2**63)
 
@@ -76,6 +83,7 @@ def build_optimizer_state_binding(native_class: type) -> tuple:
         """Distinguish DCP-loaded Muon settings from missing template entries."""
 
         def state_dict(self) -> dict:
+            """Return saved values or a load-only template with missing-field markers."""
             state = super().state_dict()
             if self._load and isinstance(self.optimizer, HyperOptimizerAdapter):
                 return self.optimizer.dcp_load_template(state)
@@ -96,6 +104,11 @@ def _canonical_muon_option(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(_canonical_muon_option(item) for item in value)
     return value
+
+
+def _muon_checkpoint_keys(configured: dict) -> tuple:
+    """Require optional core metadata only when the active optimizer exposes it."""
+    return (*_MUON_NS_KEYS, *(key for key in _MUON_CORE_KEYS if key in configured))
 
 
 def _fill_checkpoint_templates(state: dict, optimizer: Any, parameters: dict) -> None:
@@ -270,9 +283,9 @@ class HyperOptimizerAdapter:
         take precedence, and every value must match the active Muon configuration.
         The caller must know the historical settings; this API does not infer them.
         """
-        if options.keys() - set(_MUON_NS_KEYS):
+        if options.keys() - set((*_MUON_NS_KEYS, *_MUON_CORE_KEYS)):
             raise ValueError(
-                "Legacy Muon confirmation accepts NS configuration keys only."
+                "Legacy Muon confirmation accepts NS configuration keys and Hyper core options only."
             )
         self._legacy_muon_checkpoint_options = {
             key: _canonical_muon_option(value) for key, value in options.items()
@@ -284,6 +297,7 @@ class HyperOptimizerAdapter:
         for key, value in state.items():
             if key.startswith("param_groups.") and key.rsplit(".", 1)[-1] in (
                 *_MUON_NS_KEYS,
+                *_MUON_CORE_KEYS,
                 "head_blocks",
                 "adjust_lr_fn",
             ):
@@ -373,7 +387,7 @@ class HyperOptimizerAdapter:
             )
         if "ns_implementation" not in configured:
             return
-        for key in _MUON_NS_KEYS:
+        for key in _muon_checkpoint_keys(configured):
             if prefix + key not in state_dict:
                 raise ValueError(f"Muon checkpoint is missing NS configuration: {key}.")
             if _canonical_muon_option(configured[key]) != _canonical_muon_option(
@@ -385,7 +399,7 @@ class HyperOptimizerAdapter:
         self, state_dict: dict, configured: dict, prefix: str
     ) -> None:
         """Use explicit legacy confirmation only for absent checkpoint settings."""
-        for key in _MUON_NS_KEYS:
+        for key in _muon_checkpoint_keys(configured):
             if prefix + key in state_dict and not _is_missing_checkpoint_option(
                 state_dict[prefix + key]
             ):
@@ -727,6 +741,15 @@ def _muon_layout_options(
             group["head_blocks"] = blocks
 
     def reshape_heads(name: str, matrix: torch.Tensor) -> list:
+        """Prepare independent matrix views for head or singleton-expert updates.
+
+        Args:
+            name: Parameter name used to resolve its configured head layout.
+            matrix: Optimizer input with the parameter's logical shape.
+
+        Returns:
+            Shared-storage matrices for independent orthogonalization.
+        """
         if name in singleton_experts:
             # A list of 2D views avoids Hyper's native [E, 1, H] convolution
             # interpretation and preserves VeOmni's E independent matrices.
@@ -773,10 +796,80 @@ def _build_muon_adamw_leaves(model, parameters, options, native_module):
     return leaves
 
 
+def _collect_hyper_muon_options(options: dict, native_module: Any) -> dict:
+    """Reuse VeOmni's existing configuration schema and explicit overrides."""
+    config = options.get("optimizer_config")
+    collected = {}
+    if config is not None:
+        # VeOmni owns its schema; no public equivalent of this collector exists.
+        collected.update(native_module._collect_muon_kwargs(config))  # pylint: disable=protected-access
+    return {**collected, **(options.get("muon_kwargs") or {})}
+
+
+def _validate_hyper_muon_ns(options: dict, implementation: str) -> None:
+    """Keep a single VeOmni selector without exposing Hyper-only overrides."""
+    if not isinstance(implementation, str) or implementation not in _MUON_NS_IMPLEMENTATIONS:
+        raise ValueError(f"Unsupported Muon NS implementation: {implementation!r}.")
+    unsupported = options.keys() & set((*_MUON_CORE_KEYS, "ns_variant"))
+    if unsupported:
+        raise ValueError(
+            f"VeOmni Hyper Muon does not expose {sorted(unsupported)}; "
+            "momentum is vanilla and ns_implementation selects Gram and GEMM behavior."
+        )
+
+
+def _hyper_muon_ns_options(options: dict, native_muon: Any) -> tuple:
+    """Bridge VeOmni's existing NS selector to Hyper's built-in implementations."""
+    implementation = options.get("ns_implementation", "gram_quack")
+    _validate_hyper_muon_ns(options, implementation)
+    use_gram, backend = _MUON_NS_IMPLEMENTATIONS[implementation]
+    steps = options.get("ns_steps", 5)
+    coefficients = options.get("ns_coefficients", _MUON_DEFAULT_COEFFICIENTS)
+    # VeOmni owns expansion of a triple or a per-step schedule, including effective step count.
+    schedule = native_muon._as_coeff_schedule(coefficients, steps)  # pylint: disable=protected-access
+    resets = tuple(int(index) for index in options.get("gram_ns_reset_iterations", (2,)))
+    resolved = {"momentum_mode": "vanilla", "use_gram": use_gram, "ns_backend": backend}
+    kwargs = {
+        "ns_variant": "custom",
+        "ns_steps": len(schedule),
+        "ns_coefficients": list(schedule),
+        "ns_epsilon": options.get("eps", 1e-7),
+        "zeropower_fn": None,
+        "gram_reset_iterations": resets,
+        **resolved,
+    }
+    metadata = {
+        "ns_implementation": implementation,
+        "gram_ns_reset_iterations": resets,
+        "gram_reset_iterations": resets,
+        **resolved,
+    }
+    return kwargs, metadata
+
+
+def _validate_hyper_muon_capabilities(muon_class: Any, options: dict) -> None:
+    """Explain missing optional core features before constructing an optimizer."""
+    requested = set(options) & set(_MUON_CORE_KEYS)
+    if not requested:
+        return
+    parameters = signature(muon_class).parameters
+    advanced = getattr(muon_class, "ADDITIONAL_CONFIG_KEYS", None)
+    if not isinstance(advanced, (set, frozenset)):
+        if any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()):
+            return
+        advanced = set()
+    unsupported = requested - (set(parameters) | advanced)
+    if unsupported:
+        raise ValueError(
+            f"Installed Hyper Muon does not support {sorted(unsupported)}; "
+            "install a core version providing the requested momentum/Gram/GEMM options."
+        )
+
+
 def _build_hyper_muon_adapter(
     model: torch.nn.Module, optimizer_options: dict, native_optimizer_module: Any
 ) -> HyperOptimizerAdapter:
-    """Construct Hyper Muon using VeOmni's grouping and selected NS callback."""
+    """Construct Hyper Muon using VeOmni's grouping and bridged NS selection."""
     # Muon is optional and is loaded only after the real parameter layout is
     # known, following Hyper's existing optimizer configuration boundary.
     optimizer_utils = import_module("hyper_parallel.core.optimizer.utils")
@@ -788,15 +881,7 @@ def _build_hyper_muon_adapter(
     muon_class = import_module("hyper_parallel.core.optimizer.muon").Muon
     for name, parameter in model.named_parameters():
         parameter.model_name = name
-    muon_options = dict(optimizer_options.get("muon_kwargs") or {})
-    if optimizer_options.get("optimizer_config") is not None:
-        muon_options = {
-            # Reuse native config translation; no public equivalent exists.
-            **native_optimizer_module._collect_muon_kwargs(  # pylint: disable=protected-access
-                optimizer_options["optimizer_config"]
-            ),
-            **muon_options,
-        }
+    muon_options = _collect_hyper_muon_options(optimizer_options, native_optimizer_module)
     native_muon_module = import_module("veomni.optim.muon")
     muon_params, adamw_params, _, _ = native_muon_module.split_muon_adamw_params(
         model,
@@ -809,34 +894,10 @@ def _build_hyper_muon_adapter(
         model, muon_params, muon_options, native_muon_module
     )
     detect_dtensor_backend([], [{"params": muon_params}])
-    coefficients = muon_options.get("ns_coefficients", (3.4445, -4.775, 2.0315))
-    steps = muon_options.get("ns_steps", 5)
-    callback = None
-    implementation = muon_options.get("ns_implementation", "gram_quack")
-    if implementation not in ("std", "gram", "gram_quack"):
-        raise ValueError(f"Unsupported Muon NS implementation: {implementation!r}.")
+    ns_options, metadata = _hyper_muon_ns_options(muon_options, native_muon_module)
+    _validate_hyper_muon_capabilities(muon_class, ns_options)
     for group in muon_groups:
-        group["ns_implementation"] = implementation
-        group["gram_ns_reset_iterations"] = tuple(
-            muon_options.get("gram_ns_reset_iterations", (2,))
-        )
-    if implementation != "std":
-        run_newton_schulz = native_muon_module.run_newton_schulz
-
-        def run_zeropower(matrix: torch.Tensor, steps: int) -> torch.Tensor:
-            """Invoke the selected existing NS kernel with Hyper's callback signature."""
-            return run_newton_schulz(
-                matrix,
-                ns_steps=steps,
-                ns_coefficients=coefficients,
-                eps=muon_options.get("eps", 1e-7),
-                ns_implementation=implementation,
-                gram_ns_reset_iterations=muon_options.get(
-                    "gram_ns_reset_iterations", (2,)
-                ),
-            )
-
-        callback = run_zeropower
+        group.update(metadata)
 
     muon_lr = (
         optimizer_options["lr"]
@@ -851,12 +912,8 @@ def _build_hyper_muon_adapter(
             momentum=muon_options.get("momentum", 0.95),
             nesterov=muon_options.get("nesterov", True),
             weight_decay=muon_options.get("weight_decay", 0.0),
-            ns_variant="custom",
-            ns_steps=steps,
-            ns_coefficients=[coefficients] * steps,
-            ns_epsilon=muon_options.get("eps", 1e-7),
-            zeropower_fn=callback,
             reshape_fn=reshape_fn,
+            **ns_options,
         )
     }
     if adamw_params:

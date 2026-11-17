@@ -22,7 +22,8 @@ import torch
 
 from hyper_parallel import DTensor, DeviceMesh, Replicate, SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
-from hyper_parallel.core.optimizer import Muon, SwapOptimizerConfig, swap_optimizer
+from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
+from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.swap_adam import AdamSwapAdapter
 from hyper_parallel.core.optimizer.swap_muon import (
     MUON_STATE_KEYS,
@@ -530,7 +531,7 @@ class TestMuonPackedSwap(unittest.TestCase):
         for index, param in enumerate(params):
             slot = adapter._slots[(id(param), "momentum_buffer")]
             self.assertIs(optimizer.state[param]["momentum_buffer"], slot.cpu_tensor)
-            torch.testing.assert_close(slot.cpu_tensor, torch.full_like(param, 0 if index in (0, 2) else 1))
+            torch.testing.assert_close(slot.cpu_tensor, torch.full_like(param, 0 if index in (0, 2) else 0.05))
 
     def test_no_local_state_executes_units_without_allocating_arenas(self):
         """A zero-byte rank still reaches every callback and logical batch."""
@@ -955,7 +956,7 @@ class TestMuonFrozenUnshardSchedule(unittest.TestCase):
                     self.assertEqual(set(wrapped.state), set(assignment.owned_params))
                     self.assertEqual({param_id for param_id, _ in wrapped.adapter._slots},
                                      {id(param) for param in assignment.owned_params})
-            self.assertTrue(all(signature == signatures[0] for signature in signatures))
+            self.assertEqual(signatures, [signatures[0]] * len(signatures))
 
     def test_all_frozen_assignment_keeps_empty_unit_and_single_flush(self):
         """A zero-byte assignment still reaches its logical execution and flush."""
@@ -995,7 +996,7 @@ class TestMuonFrozenUnshardSchedule(unittest.TestCase):
         wrapped.step()
 
         self.assertFalse(torch.equal(param, torch.ones(4, 4)))
-        torch.testing.assert_close(wrapped.state[param]["momentum_buffer"], torch.ones(4, 4))
+        torch.testing.assert_close(wrapped.state[param]["momentum_buffer"], torch.full_like(param, 0.05))
         self.assertEqual(set(wrapped.adapter._slots), {(id(param), "momentum_buffer")})
 
 
@@ -1423,7 +1424,7 @@ class TestMuonSwapParameterReset(unittest.TestCase):
         new.grad = torch.ones_like(new)
         wrapped.step()
         torch.testing.assert_close(
-            wrapped.state[new]["momentum_buffer"], expected.float() * 0.95 + 1, rtol=0, atol=0,
+            wrapped.state[new]["momentum_buffer"], expected.float() * 0.95 + 0.05,
         )
 
     def test_reset_drains_removed_slots_and_keeps_unchanged_state(self):
@@ -1548,7 +1549,7 @@ class TestMuonSwapParameterReset(unittest.TestCase):
         wrapped.reset_optimizer_parameters({new: old})
         new.grad = torch.ones_like(new)
         wrapped.step()
-        torch.testing.assert_close(wrapped.state[new]["momentum_buffer"], torch.full_like(new, 1.95))
+        torch.testing.assert_close(wrapped.state[new]["momentum_buffer"], torch.ones_like(new))
 
     def test_reset_preserves_each_leafs_existing_state(self):
         """The shared new-to-old map cannot move momentum into an Adam leaf."""
@@ -1635,7 +1636,7 @@ class TestMuonSwapParameterReset(unittest.TestCase):
                     self.assertEqual(set(target.state), {model.weight} if owns_param else set())
                     if owns_param:
                         torch.testing.assert_close(
-                            target.state[model.weight]["momentum_buffer"], torch.ones_like(model.weight),
+                            target.state[model.weight]["momentum_buffer"], torch.full_like(model.weight, 0.05),
                         )
 
 

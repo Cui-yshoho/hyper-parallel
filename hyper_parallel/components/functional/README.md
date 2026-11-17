@@ -248,3 +248,39 @@ These protocols share the same local KDA stages and can be combined with Ulysses
 Forward exchanges use S/M, while backward produces fresh G/N instead of caching M.
 See [KDA context parallelism](../../../docs/guide/kda_context_parallel.md)
 for configurations, supported shapes and the state-buffer lifetime contract.
+
+## Symmetric matrix multiplication
+
+```python
+from hyper_parallel.components.functional import symmetric_matmul
+
+# x: [N, K] or [B, N, K]. Use under torch.no_grad().
+gram = symmetric_matmul(x, x.mT)
+polynomial = symmetric_matmul(gram, gram, gram, alpha=0.5, beta=-0.25)
+```
+
+The caller guarantees that `a @ b` and the active additive `c` are mathematically
+symmetric. Inputs must be contiguous matrices or last-two-axis transposes with
+matching batches; broadcasting and backward are unsupported. `out=` accepts a
+contiguous, non-aliasing output buffer. Zero alpha/beta suppress operand reads.
+
+The default `backend="auto"` uses a static rule: on NPU, FP16/BF16 products with
+`N > 256` and `2 * B * N * N * K >= 20_000_000_000` use the packaged Ascend C
+kernel when present. All other products use native `torch.matmul(out=...)`
+(CANN on NPU, Torch's native backend elsewhere). No runtime tuning or timing is
+performed. `backend="ascendc"` and `backend="cann"` force a path for validation.
+An absent optional library allows automatic fallback; a broken installed library
+or a kernel error raises rather than silently falling back.
+
+Ascend C uses CANN-derived MDL tiling, triangular tasks, pipelined Cube/Vector
+execution and mirrored output. Pure products write directly in FP16/BF16;
+scaled/additive products retain FP32 intermediates until conversion. The CANN
+path computes the full output and rounds separate operations in the input dtype.
+Only Ascend C guarantees bitwise-identical triangles. Backend outputs need not
+match bit for bit, even for pure products.
+
+The library is built during source installation and shipped inside the wheel;
+no compiler runs on import and no manual library-path environment variable is
+needed. See [installation](../../../docs/installation.md). Native metadata plans
+retain no tensors or device pointers; streams and addresses are resolved per call.
+The validated target is 910B3 / CANN 8.5.0 / torch-npu 2.9. A3/910C remains unqualified.

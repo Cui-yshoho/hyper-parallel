@@ -18,6 +18,7 @@ import math
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -56,22 +57,26 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         parameter.device_mesh = SimpleNamespace(mesh_dim_names=("ep_fsdp",))
 
         def native(
-            model,
-            optimizer_type="adamw",
-            param_groups=None,
-            lr=0.01,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-            weight_decay=0.1,
-            fused=False,
-            no_decay_modules=None,
-            no_decay_params=None,
-        ):
+            model: torch.nn.Module,
+            optimizer_type: str = "adamw",
+            param_groups: Any = None,
+            lr: float = 0.01,
+            betas: tuple = (0.9, 0.95),
+            eps: float = 1e-8,
+            weight_decay: float = 0.1,
+            fused: bool = False,
+            no_decay_modules: Any = None,
+            no_decay_params: Any = None,
+        ) -> None:
+            """Reject calls that bypass the Hyper parameter grouping boundary."""
             raise AssertionError(
                 "EP type inspection must not call the Torch-only factory"
             )
 
-        def native_groups(model_arg, parameters, weight_decay, modules, names):
+        def native_groups(
+            model_arg: torch.nn.Module, parameters: list, weight_decay: float, _modules: Any, _names: Any
+        ) -> list:
+            """Retain the native decay grouping for live Hyper parameters."""
             self.assertIs(model_arg, model)
             self.assertIs(parameters[0], parameter)
             self.assertEqual(weight_decay, 0.1)
@@ -126,7 +131,11 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         }
         container = SimpleNamespace(_is_multi_optimizer=True, optimizers_dict=leaves)
 
-        def native(model, optimizer_type="adamw", param_groups=None):
+        def native(model: torch.nn.Module, optimizer_type: str = "adamw", param_groups: Any = None) -> Any:
+            """Return the native optimizer container for the Torch-owned model."""
+            self.assertIsInstance(model, torch.nn.Linear)
+            self.assertEqual(optimizer_type, "adamw")
+            self.assertIsNone(param_groups)
             return container
 
         _, factory = build_optimizer_binding(
@@ -172,7 +181,8 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
             def __init__(self, optimizer, load):
                 self.optimizer, self._load = optimizer, load
 
-            def state_dict(self):
+            def state_dict(self) -> dict:
+                """Expose the test checkpoint as the native state container would."""
                 return state
 
         _, bound = build_optimizer_state_binding(NativeState)
@@ -414,8 +424,9 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
     def test_optimizer_binding_rejects_missing_or_incompatible_parameters(self):
         """Fail at activation, not with a dictionary KeyError during construction."""
 
-        def positional_only(model, optimizer_type, param_groups, /):
-            return model
+        def positional_only(model: Any, optimizer_type: str, param_groups: Any, /) -> tuple:
+            """Represent an incompatible positional-only optimizer factory."""
+            return model, optimizer_type, param_groups
 
         for factory in (
             None,
@@ -437,8 +448,11 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         """Check only the dependency contract, not the entire native signature."""
 
         def native(
-            *, model, optimizer_type="adamw", param_groups=None, extra_option=None
-        ):
+            *, model: Any, optimizer_type: str = "adamw", param_groups: Any = None, extra_option: Any = None
+        ) -> tuple:
+            """Preserve additional native factory keyword arguments."""
+            self.assertEqual(optimizer_type, "adamw")
+            self.assertIsNone(param_groups)
             return model, extra_option
 
         original, wrapper = build_optimizer_binding(
@@ -465,8 +479,9 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
     def test_hyper_muon_matches_native_vlm_grouping_contract(self):
         """VLM groups are re-split by Muon, just as in the native factory."""
 
-        def native(model, optimizer_type="muon", param_groups=None):
-            return model
+        def native(model: Any, optimizer_type: str = "muon", param_groups: Any = None) -> tuple:
+            """Describe the native Muon parameter-group contract."""
+            return model, optimizer_type, param_groups
 
         logger = MagicMock()
         native_module = SimpleNamespace(build_optimizer=native, logger=logger)
@@ -485,9 +500,11 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
         """Evaluation exposes plain parameters but must retain the Hyper boundary."""
 
         class Wrapped(torch.nn.Linear, HSDPModule):
-            pass
+            def __init__(self):
+                """Initialize a plain local module with the Hyper ownership marker."""
+                torch.nn.Linear.__init__(self, 2, 2)
 
-        self.assertTrue(uses_hyper(Wrapped(2, 2)))
+        self.assertTrue(uses_hyper(Wrapped()))
         self.assertFalse(uses_hyper(torch.nn.Linear(2, 2)))
 
     def test_restore_releases_replica_transport_state(self):
@@ -622,11 +639,10 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
             actual = adapter.state_dict()
         self.assertEqual(actual["param_groups.weight.step"], 0)
 
-    def test_ns_callback_accepts_hyper_steps_keyword(self):
-        """Forward Hyper's callback keyword without invoking optional CUDA kernels."""
+    def test_ns_implementations_use_hyper_without_veomni_callback(self):
+        """Bridge all VeOmni NS modes without invoking its optional CUDA kernels."""
         model = torch.nn.Linear(2, 2, bias=False)
-        matrix = torch.ones(2, 2)
-        factory, run_ns = MagicMock(), MagicMock(return_value=matrix)
+        factory, run_ns = MagicMock(), MagicMock()
         modules = {
             "hyper_parallel.core.optimizer.utils": SimpleNamespace(
                 _install_logger_methods=MagicMock()
@@ -640,6 +656,7 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
                     return_value=([model.weight], [], [], [])
                 ),
                 run_newton_schulz=run_ns,
+                _as_coeff_schedule=MagicMock(return_value=((3.4445, -4.775, 2.0315),) * 5),
             ),
         }
         for requested in ("std", "gram", "gram_quack", None):
@@ -658,18 +675,10 @@ class TestHyperOptimizerAdapter(unittest.TestCase):
                     side_effect=modules.__getitem__,
                 ):
                     _build_hyper_muon_adapter(model, values, SimpleNamespace())
-                callback = factory.call_args.kwargs["zeropower_fn"]
-                if implementation == "std":
-                    self.assertIsNone(callback)
-                    run_ns.assert_not_called()
-                else:
-                    self.assertIs(callback(matrix, steps=3), matrix)
-                    run_ns.assert_called_once_with(
-                        matrix,
-                        ns_steps=3,
-                        ns_coefficients=(3.4445, -4.775, 2.0315),
-                        eps=1e-7,
-                        ns_implementation=implementation,
-                        gram_ns_reset_iterations=(2,),
-                    )
-                run_ns.reset_mock()
+                options = factory.call_args.kwargs
+                self.assertIsNone(options["zeropower_fn"])
+                self.assertEqual(options["momentum_mode"], "vanilla")
+                expected_backend = {"std": None, "gram": "cann", "gram_quack": "auto"}[implementation]
+                self.assertEqual(options["ns_backend"], expected_backend)
+                self.assertEqual(options["use_gram"], implementation != "std")
+                run_ns.assert_not_called()

@@ -193,3 +193,53 @@ and [VLM example](../../examples/training_demo/deepseek_v41/train_deepseek_v41_v
 for nested callback configuration and Engram parameter groups. The examples
 configure optimizer hyperparameters; they do not reproduce the report's full
 training schedule. Resume with the same optimizer partition and head layout.
+
+## Optional Muon Gram Newton-Schulz
+
+```python
+from hyper_parallel.core.optimizer.muon import Muon
+
+optimizer = Muon(parameters, use_gram=True, ns_backend="auto")
+```
+
+Mixed optimizer `muon_kwargs` or YAML `muon_config` also accept `muon_use_gram: true`.
+Gram is disabled by default, preserving the original NS behavior. The option is
+stored in parameter groups and optimizer checkpoints. An explicit `zeropower_fn`
+continues to take precedence.
+
+Configure the algorithm and symmetric GEMM backend independently:
+
+| Configuration | `use_gram` | `ns_backend` |
+| --- | --- | --- |
+| Standard NS + native matmul (default) | `False` | `"cann"` or `None` |
+| Static Gram selection + native matmul | `True` | `"cann"` or `None` |
+| Standard NS + static Ascend C selection | `False` | `"auto"` |
+| Static Gram selection + static Ascend C selection | `True` | `"auto"` |
+
+`ns_backend="ascendc"` forces the Ascend C symmetric operator for validation.
+Both options are stored in parameter groups. Enabling Gram alone keeps native
+matmul. On non-NPU devices, `"cann"` refers to the framework's native matmul.
+
+The configured coefficient schedule reaches Gram independently of coefficient
+family, iteration count and floating-point input dtype. The algorithm is selected
+from the actual NS input after reshaping and batching. With batch B, short side n and long side L, Gram
+requires `n > 256` and `6 * B * n**2 * (2*L - 3*n) >= 50_000_000_000`, and
+restarts at `gram_reset_iterations` (default `(2,)`). Other shapes use standard NS.
+The static cost rule was calibrated for five steps with the default restart;
+it remains a performance heuristic when configuring other schedules.
+With `ns_backend="auto"`, `symmetric_matmul` selects Ascend C or native matmul
+independently for each symmetric product. When the static rule rejects Gram,
+standard NS retains its coefficient rounding order and buffer layout.
+Rectangular products continue to use ordinary matmul.
+
+Selection uses an offline heuristic without runtime timing or tuning; it does
+not guarantee optimal performance for every shape. The optimizer retains its
+existing BF16 NS preparation; direct NS calls retain the input dtype. Gram reassociation and fused epilogues change
+rounding, so exact-arithmetic equivalence does not imply bitwise equality or
+validated training convergence. Gram selection preserves the existing momentum,
+parameter update and communication paths.
+
+Muon also accepts `momentum_mode="vanilla"` for EMA momentum or `"legacy"`
+for the existing formula, independently of Gram and the GEMM backend. The default
+is `"vanilla"`. See the [VeOmni adapter](../../hyper_parallel/integration/veomni/README.md)
+for EMA + Gram + Ascend C configuration through VeOmni.
