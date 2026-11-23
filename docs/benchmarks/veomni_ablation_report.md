@@ -191,7 +191,7 @@ Qwen3.5-35B-A3B，8K，64die，每组50步，关闭profiling。
 
 ## 4. 附录
 
-<sub>以下profiling分析统一取ProfilerStep#20；点击图片可查看原图。</sub>
+<sub>以下profiling结果统一取ProfilerStep#20；点击图片可查看原图。</sub>
 
 ### 4.1 实验数据与日志
 
@@ -224,7 +224,7 @@ Qwen3.5-35B-A3B，8K，64die，每组50步，关闭profiling。
 
 ### 4.3 16die Profiling图表
 
-Profiling分析结果：
+Profiling结果：
 
 | 方案 | 计算(ms) | 通信(ms) | 未掩盖通信(ms) | 通信掩盖率 | Optimizer.step(ms) |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -233,10 +233,6 @@ Profiling分析结果：
 | Torch FSDP2＋VeOmni Muon std | 4278.925 | 4887.050 | 1549.761 | 68.29% | 459.17 |
 | Torch FSDP2＋Hyper Muon std | 4127.344 | 4872.502 | 1522.286 | 68.76% | 310.30 |
 | Hyper FSDP＋Hyper Muon std | 3337.312 | 2835.200 | 802.822 | 71.68% | 285.53 |
-
-固定Torch FSDP2，Hyper Muon的优化器阶段耗时下降约32.42%；切换Hyper FSDP后，计算和未掩盖通信区间也进一步缩短。
-
-下方profiling截图显示，Hyper Muon确实缩短了优化器阶段耗时；但整步训练耗时存在波动，因此端到端收益不明显。
 
 | Torch FSDP2＋VeOmni Muon | Torch FSDP2＋Hyper Muon |
 | --- | --- |
@@ -252,17 +248,13 @@ Profiling分析结果：
 
 #### 4.4.1 Muon整体对比
 
-Profiling分析结果：
+Profiling结果：
 
 | 方案 | 计算(ms) | 通信(ms) | 未掩盖通信(ms) | 通信掩盖率 | Muon阶段(ms) |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Torch FSDP2＋VeOmni Muon std | 3637.911 | 6329.394 | 3143.246 | 50.34% | 317.7 |
 | Torch FSDP2＋Hyper Muon std | 3591.940 | 6390.992 | 3210.700 | 49.76% | 213.7 |
 | Hyper FSDP＋Hyper Muon std | 2998.626 | 4046.542 | 1453.984 | 64.07% | 208.4 |
-
-固定Torch FSDP2时，Hyper Muon使优化器阶段耗时下降32.74%，但受整步耗时波动影响，端到端收益不明显。
-
-搭配Hyper FSDP后，计算耗时进一步下降，未掩盖通信减少54.71%，带来更明显的整步收益。
 
 #### 4.4.2 AdamW通信对比
 
@@ -272,8 +264,6 @@ Profiling结果：
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 64 | Torch | 61.57% | 2392.875 | 2952.263 | 3269.108 | 307.939 | 580.623 |
 | 64 | Hyper | 78.04% | 867.666 | 1769.385 | 2171.511 | — | — |
-
-Hyper的FSDP组通信掩盖率提高16.48个百分点，未掩盖通信减少约63.74%。
 
 #### 4.4.3 Muon整步时间线
 
