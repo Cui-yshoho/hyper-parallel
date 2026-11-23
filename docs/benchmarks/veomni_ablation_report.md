@@ -7,7 +7,7 @@
 - **Qwen3.5性能**：Hyper FSDP＋AdamW相对Torch FSDP2＋AdamW，在16die和64die下分别提升30.65%和48.09%；Hyper FSDP＋Hyper Muon相对Torch FSDP2＋VeOmni Muon分别提升44.17%和55.73%。
 - **Muon优化**：固定Torch FSDP2，Hyper Muon将优化器阶段缩短约三分之一。
 - **Qwen3.5精度**：开启确定性后，64die实验记录的50步Loss、grad_norm逐位一致。
-- **Flash-Next性能**：即使在4K序列下，FSDP通信也能达到较高的掩盖率，收益主要来自Hyper FSDP节省的Copy-in/Copy-out流程。性能提升比例取决于拷贝操作占总计算时间的比例。
+- **Flash-Next性能**：4K序列下，FSDP通信具有较高的掩盖率，收益主要来自Hyper FSDP节省的Copy-in/Copy-out流程。性能提升比例取决于拷贝操作占总计算时间的比例。
 
 ## 2. Qwen3.5-35B-A3B消融实验
 
@@ -154,7 +154,7 @@ Qwen3.5-35B-A3B，8K，64die，每组50步，关闭profiling。
 
 ### 3.2 Profiling分析
 
-即使在4K序列下，FSDP通信也能达到较高的掩盖率，本次收益主要来自Hyper FSDP节省的Copy-in/Copy-out流程。性能提升比例取决于拷贝操作占总计算时间的比例：序列变长、计算耗时增加后，本组实验中的相对收益逐渐减小。
+4K序列下，FSDP通信具有较高的掩盖率，本次收益主要来自Hyper FSDP节省的Copy-in/Copy-out流程。性能提升比例取决于拷贝操作占总计算时间的比例：序列变长、计算耗时增加后，本组实验中的相对收益逐渐减小。
 
 #### 3.2.1 未掩盖通信拆解
 
