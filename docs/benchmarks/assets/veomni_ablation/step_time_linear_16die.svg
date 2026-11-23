@@ -432,7 +432,7 @@ L 763.844225 248.372155
 L 779.469483 248.399284
 L 795.094742 248.399284
 L 810.72 248.399284
-" clip-path="url(#p46289653fd)" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #16877b; stroke-width: 1.8"/>
+" clip-path="url(#p46289653fd)" style="fill: none; stroke: #16877b; stroke-width: 1.8"/>
    </g>
    <g id="line2d_32">
     <path d="M 45.082344 223.385903
@@ -485,7 +485,7 @@ L 763.844225 248.806226
 L 779.469483 248.806226
 L 795.094742 248.806226
 L 810.72 248.833356
-" clip-path="url(#p46289653fd)" style="fill: none; stroke-dasharray: 1.8,2.97; stroke-dashoffset: 0; stroke: #9162b8; stroke-width: 1.8"/>
+" clip-path="url(#p46289653fd)" style="fill: none; stroke: #9162b8; stroke-width: 1.8"/>
    </g>
    <g id="line2d_33">
     <path d="M 45.082344 230.412438
@@ -538,7 +538,7 @@ L 763.844225 253.33685
 L 779.469483 253.363979
 L 795.094742 253.363979
 L 810.72 253.363979
-" clip-path="url(#p46289653fd)" style="fill: none; stroke-dasharray: 11.52,2.88,1.8,2.88; stroke-dashoffset: 0; stroke: #d34452; stroke-width: 1.8"/>
+" clip-path="url(#p46289653fd)" style="fill: none; stroke: #d34452; stroke-width: 1.8"/>
    </g>
    <g id="patch_4">
     <path d="M 45.082344 265.029656
@@ -580,7 +580,7 @@ L 253.853437 357.999188
     <path d="M 235.853437 371.499891
 L 244.853437 371.499891
 L 253.853437 371.499891
-" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #16877b; stroke-width: 1.8"/>
+" style="fill: none; stroke: #16877b; stroke-width: 1.8"/>
    </g>
    <g id="text_21">
     <text style="font-size: 9px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="261.053437" y="374.649891" transform="rotate(-0 261.053437 374.649891)">Torch FSDP2 + VeOmni Muon std</text>
@@ -589,7 +589,7 @@ L 253.853437 371.499891
     <path d="M 427.002187 344.498484
 L 436.002187 344.498484
 L 445.002187 344.498484
-" style="fill: none; stroke-dasharray: 1.8,2.97; stroke-dashoffset: 0; stroke: #9162b8; stroke-width: 1.8"/>
+" style="fill: none; stroke: #9162b8; stroke-width: 1.8"/>
    </g>
    <g id="text_22">
     <text style="font-size: 9px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="452.202187" y="347.648484" transform="rotate(-0 452.202187 347.648484)">Torch FSDP2 + Hyper Muon std</text>
@@ -598,7 +598,7 @@ L 445.002187 344.498484
     <path d="M 427.002187 357.999188
 L 436.002187 357.999188
 L 445.002187 357.999188
-" style="fill: none; stroke-dasharray: 11.52,2.88,1.8,2.88; stroke-dashoffset: 0; stroke: #d34452; stroke-width: 1.8"/>
+" style="fill: none; stroke: #d34452; stroke-width: 1.8"/>
    </g>
    <g id="text_23">
     <text style="font-size: 9px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="452.202187" y="361.149188" transform="rotate(-0 452.202187 361.149188)">Hyper FSDP + Hyper Muon std</text>

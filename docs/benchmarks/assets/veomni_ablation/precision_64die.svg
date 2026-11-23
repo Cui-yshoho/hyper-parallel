@@ -335,7 +335,7 @@ L 357.483651 206.339205
 L 363.560045 211.305068
 L 369.636439 210.520482
 L 375.712834 217.09647
-" clip-path="url(#p0015b64fb7)" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #ed8936; stroke-width: 1.8"/>
+" clip-path="url(#p0015b64fb7)" style="fill: none; stroke: #ed8936; stroke-width: 1.8"/>
    </g>
    <g id="patch_3">
     <path d="M 63.082344 225.091406
@@ -377,7 +377,7 @@ L 343.548437 62.30125
      <path d="M 323.548437 77.302031
 L 333.548437 77.302031
 L 343.548437 77.302031
-" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #ed8936; stroke-width: 1.8"/>
+" style="fill: none; stroke: #ed8936; stroke-width: 1.8"/>
     </g>
     <g id="text_11">
      <text style="font-size: 10px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="351.548437" y="80.802031" transform="rotate(-0 351.548437 80.802031)">Hyper</text>
@@ -651,7 +651,7 @@ L 748.083651 216.386889
 L 754.160045 216.379426
 L 760.236439 216.246139
 L 766.312834 216.88691
-" clip-path="url(#p24a5f7eb75)" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #ed8936; stroke-width: 1.8"/>
+" clip-path="url(#p24a5f7eb75)" style="fill: none; stroke: #ed8936; stroke-width: 1.8"/>
    </g>
    <g id="patch_7">
     <path d="M 453.682344 225.091406
@@ -693,7 +693,7 @@ L 734.148438 62.30125
      <path d="M 714.148438 77.302031
 L 724.148438 77.302031
 L 734.148438 77.302031
-" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #ed8936; stroke-width: 1.8"/>
+" style="fill: none; stroke: #ed8936; stroke-width: 1.8"/>
     </g>
     <g id="text_20">
      <text style="font-size: 10px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="742.148438" y="80.802031" transform="rotate(-0 742.148438 80.802031)">Hyper</text>
