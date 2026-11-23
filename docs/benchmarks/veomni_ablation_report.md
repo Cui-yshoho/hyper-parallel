@@ -53,6 +53,8 @@ MFU按VeOmni公式离线估算，五组统一使用日志中的平滑s/it；prof
 | Torch FSDP2＋Hyper Muon std | Torch FSDP2＋VeOmni Muon std | 7.2143 | +0.99% | 18.98 / — | +0.00% / — |
 | Hyper FSDP＋Hyper Muon std | Torch FSDP2＋VeOmni Muon std | 4.6786 | +55.73% | 19.01 / — | -0.16% / — |
 
+<sub>64die实验由多人分别运行，日志打印项不一致，Muon各组未记录reserved显存。</sub>
+
 | MFU | Step time |
 | --- | --- |
 | [<img src="assets/veomni_ablation/mfu_estimated_smoothed_64die.svg" alt="64die各方案估算MFU曲线" width="420">](assets/veomni_ablation/mfu_estimated_smoothed_64die.svg) | [<img src="assets/veomni_ablation/step_time_linear_64die.svg" alt="64die各方案step time曲线" width="420">](assets/veomni_ablation/step_time_linear_64die.svg) |
