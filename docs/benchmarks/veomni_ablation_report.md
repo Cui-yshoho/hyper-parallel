@@ -5,7 +5,7 @@
 ## 1. 核心结论
 
 - **Qwen3.5性能**：Hyper FSDP＋AdamW相对Torch FSDP2＋AdamW，在16die和64die下分别提升30.65%和48.09%；Hyper FSDP＋Hyper Muon相对Torch FSDP2＋VeOmni Muon分别提升44.17%和55.73%。
-- **Muon优化**：固定Torch FSDP2，Hyper Muon将优化器阶段缩短约三分之一，但整步仍主要耗在前反向和通信，端到端收益较小。
+- **Muon优化**：固定Torch FSDP2，Hyper Muon将优化器阶段缩短约三分之一。
 - **Qwen3.5精度**：开启确定性后，64die实验记录的50步Loss、grad_norm逐位一致。
 - **Flash-Next性能**：4K下通信已能较好掩盖，收益主要来自减少FSDP搬运；4K、8K、16K步时分别下降5.39%、3.16%、1.41%。
 
