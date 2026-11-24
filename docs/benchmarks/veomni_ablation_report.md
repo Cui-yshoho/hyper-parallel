@@ -2,6 +2,8 @@
 
 <!-- markdownlint-configure-file {"MD033": {"allowed_elements": ["img", "sub"]}} -->
 
+设备：Atlas 900 A3 SuperPoD，每个 node 16 张卡。16die实验使用1个node（16卡），64die实验使用4个node（64卡）。
+
 ## 1. 核心结论
 
 - **Qwen3.5性能**：Hyper FSDP＋AdamW相对Torch FSDP2＋AdamW，在16die和64die下分别提升30.65%和48.09%；Hyper FSDP＋Hyper Muon相对Torch FSDP2＋VeOmni Muon分别提升44.17%和55.73%。
@@ -21,7 +23,7 @@ MFU按VeOmni公式离线估算，五组统一使用日志中的平滑s/it；prof
 
 #### 2.1.1 16die
 
-**Qwen3.5-35B-A3B，8K，16die，SP=1、EP=1，GBS=16，每组50步。**
+**Qwen3.5-35B-A3B，8K，单node 16卡（16die），SP=1、EP=1，GBS=16，每组50步。**
 
 配置：[Torch FSDP2＋AdamW](assets/config/torch_fsdp2_adamw_16die_8k.yaml)；[Hyper FSDP＋AdamW](assets/config/hyper_fsdp2_adamw_16die_8k.yaml)；[Torch FSDP2＋VeOmni Muon std](assets/config/torch_fsdp2_veomni_muon_16die_8k.yaml)；[Torch FSDP2＋Hyper Muon std](assets/config/torch_fsdp2_hyper_muon_16die_8k.yaml)；[Hyper FSDP＋Hyper Muon std](assets/config/hyper_fsdp2_hyper_muon_16die_8k.yaml)。
 
@@ -41,7 +43,7 @@ MFU按VeOmni公式离线估算，五组统一使用日志中的平滑s/it；prof
 
 #### 2.1.2 64die
 
-**Qwen3.5-35B-A3B，8K，64die，SP=1、EP=1，GBS=64，每组50步。**
+**Qwen3.5-35B-A3B，8K，4 nodes 64卡（64die），SP=1、EP=1，GBS=64，每组50步。**
 
 配置：[Torch FSDP2＋AdamW](assets/config/torch_fsdp2_adamw_64die_8k.yaml)；[Hyper FSDP＋AdamW](assets/config/hyper_fsdp2_adamw_64die_8k.yaml)；[Torch FSDP2＋VeOmni Muon std](assets/config/torch_fsdp2_veomni_muon_64die_8k.yaml)；[Torch FSDP2＋Hyper Muon std](assets/config/torch_fsdp2_hyper_muon_64die_8k.yaml)；[Hyper FSDP＋Hyper Muon std](assets/config/hyper_fsdp2_hyper_muon_64die_8k.yaml)。
 
@@ -127,7 +129,7 @@ Hyper Muon在16die和64die下都将优化器阶段缩短了约三分之一，但
 
 ### 2.3 精度对比
 
-Qwen3.5-35B-A3B，8K，64die，每组50步，关闭profiling。
+Qwen3.5-35B-A3B，8K，4 nodes 64卡（64die），每组50步，关闭profiling。
 
 配置：[Torch FSDP2＋AdamW](assets/config/torch_fsdp2_adamw_64die_8k_deterministic.yaml)、[Hyper FSDP＋AdamW](assets/config/hyper_fsdp2_adamw_64die_8k_deterministic.yaml)。
 
