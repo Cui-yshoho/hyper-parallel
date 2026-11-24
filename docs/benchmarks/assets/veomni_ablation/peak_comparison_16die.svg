@@ -514,7 +514,7 @@ L 925.2 302.913984
    </g>
   </g>
   <g id="text_38">
-   <text style="font-size: 12px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle" x="468" y="15.938625" transform="rotate(-0 468 15.938625)">Qwen3.5-35B-A3B | 16die | 8K | Peak memory</text>
+   <text style="font-size: 12px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle" x="468" y="15.938625" transform="rotate(-0 468 15.938625)">Qwen3.5-35B-A3B | 16 cards | 8K | Peak memory</text>
   </g>
  </g>
  <defs>

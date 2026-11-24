@@ -521,7 +521,7 @@ L 810.72 265.029656
 " style="fill: none; stroke: #000000; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="text_15">
-    <text style="font-size: 12px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle" x="431.141172" y="20.16" transform="rotate(-0 431.141172 20.16)">Qwen3.5-35B-A3B | 64die | 8K | Logged smoothed step time</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle" x="431.141172" y="20.16" transform="rotate(-0 431.141172 20.16)">Qwen3.5-35B-A3B | 64 cards | 8K | Logged smoothed step time</text>
    </g>
   </g>
   <g id="text_16">

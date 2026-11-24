@@ -4,9 +4,9 @@
 
 ## 1. 核心结论
 
-- **Qwen3.5性能**：Hyper FSDP＋AdamW相对Torch FSDP2＋AdamW，在16die和64die下分别提升30.65%和48.09%；Hyper FSDP＋Hyper Muon相对Torch FSDP2＋VeOmni Muon分别提升44.17%和55.73%。
+- **Qwen3.5性能**：Hyper FSDP＋AdamW相对Torch FSDP2＋AdamW，在16卡和64卡下分别提升30.65%和48.09%；Hyper FSDP＋Hyper Muon相对Torch FSDP2＋VeOmni Muon分别提升44.17%和55.73%。
 - **Muon优化**：固定Torch FSDP2，Hyper Muon将优化器阶段缩短约三分之一。
-- **Qwen3.5精度**：开启确定性后，64die实验记录的50步Loss、grad_norm逐位一致。
+- **Qwen3.5精度**：开启确定性后，64卡实验记录的50步Loss、grad_norm逐位一致。
 - **Flash-Next性能**：4K序列下，FSDP通信具有较高的掩盖率，收益主要来自Hyper FSDP节省的Copy-in/Copy-out流程。性能提升比例取决于拷贝操作占总计算时间的比例。
 
 ## 2. Qwen3.5-35B-A3B消融实验
@@ -19,9 +19,9 @@ Profiling：仅采集rank 0的CPU/NPU时间线，使用Level0；第17–19步预
 
 MFU按VeOmni公式离线估算，五组统一使用日志中的平滑s/it；profiling导出会影响后续平滑值。
 
-#### 2.1.1 16die
+#### 2.1.1 16卡
 
-**Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，单node 16卡（16die），SP=1、EP=1，GBS=16，每组50步。**
+**Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，单node 16卡，SP=1、EP=1，GBS=16，每组50步。**
 
 配置：[Torch FSDP2＋AdamW](assets/config/torch_fsdp2_adamw_16die_8k.yaml)；[Hyper FSDP＋AdamW](assets/config/hyper_fsdp2_adamw_16die_8k.yaml)；[Torch FSDP2＋VeOmni Muon std](assets/config/torch_fsdp2_veomni_muon_16die_8k.yaml)；[Torch FSDP2＋Hyper Muon std](assets/config/torch_fsdp2_hyper_muon_16die_8k.yaml)；[Hyper FSDP＋Hyper Muon std](assets/config/hyper_fsdp2_hyper_muon_16die_8k.yaml)。
 
@@ -35,13 +35,13 @@ MFU按VeOmni公式离线估算，五组统一使用日志中的平滑s/it；prof
 
 | MFU | Step time |
 | --- | --- |
-| [<img src="assets/veomni_ablation/mfu_estimated_smoothed_16die.svg" alt="16die各方案估算MFU曲线" width="420">](assets/veomni_ablation/mfu_estimated_smoothed_16die.svg) | [<img src="assets/veomni_ablation/step_time_linear_16die.svg" alt="16die各方案step time曲线" width="420">](assets/veomni_ablation/step_time_linear_16die.svg) |
+| [<img src="assets/veomni_ablation/mfu_estimated_smoothed_16die.svg" alt="16卡各方案估算MFU曲线" width="420">](assets/veomni_ablation/mfu_estimated_smoothed_16die.svg) | [<img src="assets/veomni_ablation/step_time_linear_16die.svg" alt="16卡各方案step time曲线" width="420">](assets/veomni_ablation/step_time_linear_16die.svg) |
 
-[<img src="assets/veomni_ablation/peak_comparison_16die.svg" alt="16die各方案显存峰值柱状图" width="720">](assets/veomni_ablation/peak_comparison_16die.svg)
+[<img src="assets/veomni_ablation/peak_comparison_16die.svg" alt="16卡各方案显存峰值柱状图" width="720">](assets/veomni_ablation/peak_comparison_16die.svg)
 
-#### 2.1.2 64die
+#### 2.1.2 64卡
 
-**Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡（64die），SP=1、EP=1，GBS=64，每组50步。**
+**Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡，SP=1、EP=1，GBS=64，每组50步。**
 
 配置：[Torch FSDP2＋AdamW](assets/config/torch_fsdp2_adamw_64die_8k.yaml)；[Hyper FSDP＋AdamW](assets/config/hyper_fsdp2_adamw_64die_8k.yaml)；[Torch FSDP2＋VeOmni Muon std](assets/config/torch_fsdp2_veomni_muon_64die_8k.yaml)；[Torch FSDP2＋Hyper Muon std](assets/config/torch_fsdp2_hyper_muon_64die_8k.yaml)；[Hyper FSDP＋Hyper Muon std](assets/config/hyper_fsdp2_hyper_muon_64die_8k.yaml)。
 
@@ -53,21 +53,21 @@ MFU按VeOmni公式离线估算，五组统一使用日志中的平滑s/it；prof
 | Torch FSDP2＋Hyper Muon std | Torch FSDP2＋VeOmni Muon std | 7.2143 | +0.99% | 18.98 / — | +0.00% / — |
 | Hyper FSDP＋Hyper Muon std | Torch FSDP2＋VeOmni Muon std | 4.6786 | +55.73% | 19.01 / — | -0.16% / — |
 
-<sub>64die实验由多人分别运行，日志打印项不一致，Muon各组未记录reserved显存。</sub>
+<sub>64卡实验由多人分别运行，日志打印项不一致，Muon各组未记录reserved显存。</sub>
 
 | MFU | Step time |
 | --- | --- |
-| [<img src="assets/veomni_ablation/mfu_estimated_smoothed_64die.svg" alt="64die各方案估算MFU曲线" width="420">](assets/veomni_ablation/mfu_estimated_smoothed_64die.svg) | [<img src="assets/veomni_ablation/step_time_linear_64die.svg" alt="64die各方案step time曲线" width="420">](assets/veomni_ablation/step_time_linear_64die.svg) |
+| [<img src="assets/veomni_ablation/mfu_estimated_smoothed_64die.svg" alt="64卡各方案估算MFU曲线" width="420">](assets/veomni_ablation/mfu_estimated_smoothed_64die.svg) | [<img src="assets/veomni_ablation/step_time_linear_64die.svg" alt="64卡各方案step time曲线" width="420">](assets/veomni_ablation/step_time_linear_64die.svg) |
 
-[<img src="assets/veomni_ablation/peak_comparison_64die.svg" alt="64die各方案显存峰值柱状图" width="720">](assets/veomni_ablation/peak_comparison_64die.svg)
+[<img src="assets/veomni_ablation/peak_comparison_64die.svg" alt="64卡各方案显存峰值柱状图" width="720">](assets/veomni_ablation/peak_comparison_64die.svg)
 
 ### 2.2 性能分析
 
 #### 2.2.1 扩卡后Hyper收益增大的原因
 
-AdamW的16die与64die性能对比：
+AdamW的16卡与64卡性能对比：
 
-| 方案 | 16die单步耗时(s) | 64die单步耗时(s) | 扩卡后步时增长 |
+| 方案 | 16卡单步耗时(s) | 64卡单步耗时(s) | 扩卡后步时增长 |
 | --- | ---: | ---: | ---: |
 | Torch FSDP2＋AdamW | 5.7857 | 6.9286 | +19.75% |
 | Hyper FSDP＋AdamW | 4.4286 | 4.6786 | +5.65% |
@@ -76,10 +76,10 @@ AdamW的16die与64die性能对比：
 
 | 规模 | 方案 | Computing(ms) | 通信(ms) | 未掩盖通信(ms) | 通信掩盖率 | AG copy-out(ms) | RS copy-in / chunk-cat(ms) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16die | Torch | 4320.434 | 4853.422 | 1138.577 | 76.54% | 359.252 | 470.240 |
-| 16die | Hyper | 3603.371 | 3226.979 | 581.729 | 81.97% | — | — |
-| 64die | Torch | 4182.321 | 6226.073 | 2392.875 | 61.57% | 307.939 | 580.623 |
-| 64die | Hyper | 3510.638 | 3951.516 | 867.666 | 78.04% | — | — |
+| 16卡 | Torch | 4320.434 | 4853.422 | 1138.577 | 76.54% | 359.252 | 470.240 |
+| 16卡 | Hyper | 3603.371 | 3226.979 | 581.729 | 81.97% | — | — |
+| 64卡 | Torch | 4182.321 | 6226.073 | 2392.875 | 61.57% | 307.939 | 580.623 |
+| 64卡 | Hyper | 3510.638 | 3951.516 | 867.666 | 78.04% | — | — |
 
 <sub>Computing包含模型计算及FSDP数据搬运。</sub>
 
@@ -87,12 +87,12 @@ AdamW的16die与64die性能对比：
 
 | 规模 | 方案 | AllGather次数 | 输入非512B对齐次数 | 其中输入≥1MiB的次数 | AllGather耗时(ms) | 未对齐AllGather累计耗时(ms) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 16die | Torch | 189 | 189 | 189 | 2334.357 | 2334.357 |
-| 16die | Hyper | 2706 | 1476 | 0 | 1384.719 | 289.803 |
-| 64die | Torch | 189 | 189 | 81 | 2952.263 | 2952.263 |
-| 64die | Hyper | 2706 | 1368 | 0 | 1769.385 | 307.499 |
+| 16卡 | Torch | 189 | 189 | 189 | 2334.357 | 2334.357 |
+| 16卡 | Hyper | 2706 | 1476 | 0 | 1384.719 | 289.803 |
+| 64卡 | Torch | 189 | 189 | 81 | 2952.263 | 2952.263 |
+| 64卡 | Hyper | 2706 | 1368 | 0 | 1769.385 | 307.499 |
 
-选取每卡输入大于1MiB的主要AllGather，对比16die→64die：
+选取每卡输入大于1MiB的主要AllGather，对比16卡→64卡：
 
 | 方案 | 聚合输出(MiB) | 每步次数 | 每卡输入(MiB) | 单次耗时(ms) | 通信掩盖率 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -102,32 +102,32 @@ AdamW的16die与64die性能对比：
 | Hyper | 1024→1024 | 80→80 | 64→16 | 7.958→9.910 | 88.46%→89.40% |
 | Hyper | 512→512 | 80→80 | 32→8 | 3.686→5.169 | 85.52%→63.83% |
 
-从16die扩展至64die，Torch和Hyper的通信耗时分别增长28.28%和22.45%，但未掩盖通信分别增长110.16%和49.15%。Torch扩卡后暴露了更多通信耗时，整步耗时增长19.75%，Hyper仅增长5.65%，使Hyper相对Torch的性能提升由30.65%增至48.09%。
+从16卡扩展至64卡，Torch和Hyper的通信耗时分别增长28.28%和22.45%，但未掩盖通信分别增长110.16%和49.15%。Torch扩卡后暴露了更多通信耗时，整步耗时增长19.75%，Hyper仅增长5.65%，使Hyper相对Torch的性能提升由30.65%增至48.09%。
 
 [HCCL官方案例](https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/practicalcases/GeneralPerformanceIssue/toolsample6_046.html)中，AllGather源、目标地址未按512B对齐导致通信带宽显著下降，增加对齐padding后，耗时从350ms降至50ms。
 
-Torch将多个权重融合后进行AllGather，大块通信的输入长度均未按512B对齐，可能影响通信效率。从单机16die扩展到四机64die后，这些通信的总耗时从2334.357ms增至2952.263ms。2006.961MiB的AllGather耗时也从30.515ms增至35.297ms。表中约1595MiB的AllGather原本几乎完全被计算掩盖，扩卡后掩盖率降至55.84%。Hyper也有未对齐的通信，但输入都小于1MiB，总耗时只从289.803ms增至307.499ms；1024MiB大权重的AllGather仍能保持约89%的掩盖率。
+Torch将多个权重融合后进行AllGather，大块通信的输入长度均未按512B对齐，可能影响通信效率。从单机16卡扩展到四机64卡后，这些通信的总耗时从2334.357ms增至2952.263ms。2006.961MiB的AllGather耗时也从30.515ms增至35.297ms。表中约1595MiB的AllGather原本几乎完全被计算掩盖，扩卡后掩盖率降至55.84%。Hyper也有未对齐的通信，但输入都小于1MiB，总耗时只从289.803ms增至307.499ms；1024MiB大权重的AllGather仍能保持约89%的掩盖率。
 
-[查看16die AdamW时间线](#431-adamw时间线) · [查看64die AdamW时间线](#446-adamw时间线)
+[查看16卡 AdamW时间线](#431-adamw时间线) · [查看64卡 AdamW时间线](#446-adamw时间线)
 
 #### 2.2.2 Muon优化与端到端收益
 
-结合附录中[16die](#43-16die-profiling图表)、[64die](#44-64die-profiling图表)的profiling结果及优化器时间线，汇总如下：
+结合附录中[16卡](#43-16卡-profiling图表)、[64卡](#44-64卡-profiling图表)的profiling结果及优化器时间线，汇总如下：
 
 | 规模 | 方案 | 第20步优化器阶段耗时(ms) | 优化器阶段耗时下降 | 平均单步耗时(s) | 端到端性能提升 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 16die | Torch FSDP2＋VeOmni Muon std | 459.17 | — | 6.1786 | — |
-| 16die | Torch FSDP2＋Hyper Muon std | 310.30 | 32.42% | 5.9643 | 3.59% |
-| 16die | Hyper FSDP＋Hyper Muon std | 285.53 | 37.82% | 4.2857 | 44.17% |
-| 64die | Torch FSDP2＋VeOmni Muon std | 317.70 | — | 7.2857 | — |
-| 64die | Torch FSDP2＋Hyper Muon std | 213.70 | 32.74% | 7.2143 | 0.99% |
-| 64die | Hyper FSDP＋Hyper Muon std | 208.40 | 34.40% | 4.6786 | 55.73% |
+| 16卡 | Torch FSDP2＋VeOmni Muon std | 459.17 | — | 6.1786 | — |
+| 16卡 | Torch FSDP2＋Hyper Muon std | 310.30 | 32.42% | 5.9643 | 3.59% |
+| 16卡 | Hyper FSDP＋Hyper Muon std | 285.53 | 37.82% | 4.2857 | 44.17% |
+| 64卡 | Torch FSDP2＋VeOmni Muon std | 317.70 | — | 7.2857 | — |
+| 64卡 | Torch FSDP2＋Hyper Muon std | 213.70 | 32.74% | 7.2143 | 0.99% |
+| 64卡 | Hyper FSDP＋Hyper Muon std | 208.40 | 34.40% | 4.6786 | 55.73% |
 
-Hyper Muon在16die和64die下都将优化器阶段缩短了约三分之一，但前反向和通信仍占整步的大部分时间，加上整步耗时存在波动，仅替换Muon的端到端收益较小。进一步切换Hyper FSDP后，Hyper Muon的阶段耗时变化不大，整步耗时却明显下降，说明额外收益主要来自FSDP相关的搬运和通信优化。
+Hyper Muon在16卡和64卡下都将优化器阶段缩短了约三分之一，但前反向和通信仍占整步的大部分时间，加上整步耗时存在波动，仅替换Muon的端到端收益较小。进一步切换Hyper FSDP后，Hyper Muon的阶段耗时变化不大，整步耗时却明显下降，说明额外收益主要来自FSDP相关的搬运和通信优化。
 
 ### 2.3 精度对比
 
-Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡（64die），每组50步，关闭profiling。
+Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡，每组50步，关闭profiling。
 
 配置：[Torch FSDP2＋AdamW](assets/config/torch_fsdp2_adamw_64die_8k_deterministic.yaml)、[Hyper FSDP＋AdamW](assets/config/hyper_fsdp2_adamw_64die_8k_deterministic.yaml)。
 
@@ -137,13 +137,13 @@ Qwen3.5-35B-A3B，8K，Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64�
 | --- | --- | ---: | ---: | --- |
 | Torch FSDP2＋AdamW / Hyper FSDP＋AdamW | 确定性 | 0 | 0 | 日志记录的50步Loss、grad_norm逐位一致 |
 
-[<img src="assets/veomni_ablation/precision_64die.svg" alt="64die确定性Loss、grad_norm与差值" width="720">](assets/veomni_ablation/precision_64die.svg)
+[<img src="assets/veomni_ablation/precision_64die.svg" alt="64卡确定性Loss、grad_norm与差值" width="720">](assets/veomni_ablation/precision_64die.svg)
 
 ## 3. Qwen3.8-Flash-Next实验
 
 ### 3.1 性能对比
 
-Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡（64die），FSDP shard=64、replicate=1，SP=1、EP=16、PerLayerEngram=8，使用AdamW；对比4K、8K、16K序列。视觉塔启用`comm_fusion_vit`，专家参数沿dim-0切分。
+Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡，FSDP shard=64、replicate=1，SP=1、EP=16、PerLayerEngram=8，使用AdamW；对比4K、8K、16K序列。视觉塔启用`comm_fusion_vit`，专家参数沿dim-0切分。
 
 | 序列长度 | 方案 | 单步耗时(s) | 步时下降 | allocated / reserved峰值(GiB) | 显存节省 allocated / reserved |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -199,18 +199,18 @@ Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡（64die），FSDP sha
 
 | CSV | 日志 | 内容 |
 | --- | --- | --- |
-| [torch_fsdp2_adamw_16die_8k.csv](assets/csv/torch_fsdp2_adamw_16die_8k.csv) | [日志](assets/log/torch_fsdp2_adamw_16die_8k.log) | 16die，Torch FSDP2＋AdamW，50步 |
-| [hyper_fsdp2_adamw_16die_8k.csv](assets/csv/hyper_fsdp2_adamw_16die_8k.csv) | [日志](assets/log/hyper_fsdp2_adamw_16die_8k.log) | 16die，Hyper FSDP＋AdamW，50步 |
-| [torch_fsdp2_veomni_muon_16die_8k.csv](assets/csv/torch_fsdp2_veomni_muon_16die_8k.csv) | [日志](assets/log/torch_fsdp2_veomni_muon_16die_8k.log) | 16die，Torch FSDP2＋VeOmni Muon std，50步 |
-| [torch_fsdp2_hyper_muon_16die_8k.csv](assets/csv/torch_fsdp2_hyper_muon_16die_8k.csv) | [日志](assets/log/torch_fsdp2_hyper_muon_16die_8k.log) | 16die，Torch FSDP2＋Hyper Muon std，50步 |
-| [hyper_fsdp2_hyper_muon_16die_8k.csv](assets/csv/hyper_fsdp2_hyper_muon_16die_8k.csv) | [日志](assets/log/hyper_fsdp2_hyper_muon_16die_8k.log) | 16die，Hyper FSDP＋Hyper Muon std，50步 |
-| [torch_fsdp2_adamw_64die_8k.csv](assets/csv/torch_fsdp2_adamw_64die_8k.csv) | [日志](assets/log/torch_fsdp2_adamw_64die_8k.log) | 64die，Torch FSDP2＋AdamW，50步 |
-| [hyper_fsdp2_adamw_64die_8k.csv](assets/csv/hyper_fsdp2_adamw_64die_8k.csv) | [日志](assets/log/hyper_fsdp2_adamw_64die_8k.log) | 64die，Hyper FSDP＋AdamW，50步 |
-| [torch_fsdp2_veomni_muon_64die_8k.csv](assets/csv/torch_fsdp2_veomni_muon_64die_8k.csv) | [日志](assets/log/torch_fsdp2_veomni_muon_64die_8k.log) | 64die，Torch FSDP2＋VeOmni Muon std，50步 |
-| [torch_fsdp2_hyper_muon_64die_8k.csv](assets/csv/torch_fsdp2_hyper_muon_64die_8k.csv) | [日志](assets/log/torch_fsdp2_hyper_muon_64die_8k.log) | 64die，Torch FSDP2＋Hyper Muon std，50步 |
-| [hyper_fsdp2_hyper_muon_64die_8k.csv](assets/csv/hyper_fsdp2_hyper_muon_64die_8k.csv) | [日志](assets/log/hyper_fsdp2_hyper_muon_64die_8k.log) | 64die，Hyper FSDP＋Hyper Muon std，50步 |
-| [torch_fsdp2_adamw_64die_8k_deterministic.csv](assets/csv/torch_fsdp2_adamw_64die_8k_deterministic.csv) | [日志](assets/log/torch_fsdp2_adamw_64die_8k_deterministic.log) | 64die，Torch FSDP2＋AdamW，确定性，50步 |
-| [hyper_fsdp2_adamw_64die_8k_deterministic.csv](assets/csv/hyper_fsdp2_adamw_64die_8k_deterministic.csv) | [日志](assets/log/hyper_fsdp2_adamw_64die_8k_deterministic.log) | 64die，Hyper FSDP＋AdamW，确定性，50步 |
+| [torch_fsdp2_adamw_16die_8k.csv](assets/csv/torch_fsdp2_adamw_16die_8k.csv) | [日志](assets/log/torch_fsdp2_adamw_16die_8k.log) | 16卡，Torch FSDP2＋AdamW，50步 |
+| [hyper_fsdp2_adamw_16die_8k.csv](assets/csv/hyper_fsdp2_adamw_16die_8k.csv) | [日志](assets/log/hyper_fsdp2_adamw_16die_8k.log) | 16卡，Hyper FSDP＋AdamW，50步 |
+| [torch_fsdp2_veomni_muon_16die_8k.csv](assets/csv/torch_fsdp2_veomni_muon_16die_8k.csv) | [日志](assets/log/torch_fsdp2_veomni_muon_16die_8k.log) | 16卡，Torch FSDP2＋VeOmni Muon std，50步 |
+| [torch_fsdp2_hyper_muon_16die_8k.csv](assets/csv/torch_fsdp2_hyper_muon_16die_8k.csv) | [日志](assets/log/torch_fsdp2_hyper_muon_16die_8k.log) | 16卡，Torch FSDP2＋Hyper Muon std，50步 |
+| [hyper_fsdp2_hyper_muon_16die_8k.csv](assets/csv/hyper_fsdp2_hyper_muon_16die_8k.csv) | [日志](assets/log/hyper_fsdp2_hyper_muon_16die_8k.log) | 16卡，Hyper FSDP＋Hyper Muon std，50步 |
+| [torch_fsdp2_adamw_64die_8k.csv](assets/csv/torch_fsdp2_adamw_64die_8k.csv) | [日志](assets/log/torch_fsdp2_adamw_64die_8k.log) | 64卡，Torch FSDP2＋AdamW，50步 |
+| [hyper_fsdp2_adamw_64die_8k.csv](assets/csv/hyper_fsdp2_adamw_64die_8k.csv) | [日志](assets/log/hyper_fsdp2_adamw_64die_8k.log) | 64卡，Hyper FSDP＋AdamW，50步 |
+| [torch_fsdp2_veomni_muon_64die_8k.csv](assets/csv/torch_fsdp2_veomni_muon_64die_8k.csv) | [日志](assets/log/torch_fsdp2_veomni_muon_64die_8k.log) | 64卡，Torch FSDP2＋VeOmni Muon std，50步 |
+| [torch_fsdp2_hyper_muon_64die_8k.csv](assets/csv/torch_fsdp2_hyper_muon_64die_8k.csv) | [日志](assets/log/torch_fsdp2_hyper_muon_64die_8k.log) | 64卡，Torch FSDP2＋Hyper Muon std，50步 |
+| [hyper_fsdp2_hyper_muon_64die_8k.csv](assets/csv/hyper_fsdp2_hyper_muon_64die_8k.csv) | [日志](assets/log/hyper_fsdp2_hyper_muon_64die_8k.log) | 64卡，Hyper FSDP＋Hyper Muon std，50步 |
+| [torch_fsdp2_adamw_64die_8k_deterministic.csv](assets/csv/torch_fsdp2_adamw_64die_8k_deterministic.csv) | [日志](assets/log/torch_fsdp2_adamw_64die_8k_deterministic.log) | 64卡，Torch FSDP2＋AdamW，确定性，50步 |
+| [hyper_fsdp2_adamw_64die_8k_deterministic.csv](assets/csv/hyper_fsdp2_adamw_64die_8k_deterministic.csv) | [日志](assets/log/hyper_fsdp2_adamw_64die_8k_deterministic.log) | 64卡，Hyper FSDP＋AdamW，确定性，50步 |
 | [memory_summary.csv](assets/csv/memory_summary.csv) | — | 上述12组实验的最终显存峰值汇总 |
 | [memory_by_rank.csv](assets/csv/memory_by_rank.csv) | — | 上述7组性能实验的逐rank最终显存峰值 |
 
@@ -224,7 +224,7 @@ Atlas 900 A3 SuperPoD，4 nodes、每node 16卡，共64卡（64die），FSDP sha
 
 各DP rank通过VeOmni原生分布式采样器获取不同样本索引，每个rank每步使用一个样本。由于样本内容、序列长度和媒体形状相同，输入侧的文本与视觉计算量保持一致；这种合成数据构造不保证专家路由、设备执行或通信到达时间完全一致，也不代表真实混合数据的负载分布。
 
-### 4.3 16die Profiling图表
+### 4.3 16卡 Profiling图表
 
 Profiling结果：
 
@@ -238,15 +238,15 @@ Profiling结果：
 
 | Torch FSDP2＋VeOmni Muon | Torch FSDP2＋Hyper Muon |
 | --- | --- |
-| [<img src="assets/veomni_ablation/profile_16die_torch_fsdp2_veomni_muon_optimizer.png" alt="16die Torch FSDP2＋VeOmni Muon优化器profiling" width="420">](assets/veomni_ablation/profile_16die_torch_fsdp2_veomni_muon_optimizer.png) | [<img src="assets/veomni_ablation/profile_16die_torch_fsdp2_hyper_muon_optimizer.png" alt="16die Torch FSDP2＋Hyper Muon优化器profiling" width="420">](assets/veomni_ablation/profile_16die_torch_fsdp2_hyper_muon_optimizer.png) |
+| [<img src="assets/veomni_ablation/profile_16die_torch_fsdp2_veomni_muon_optimizer.png" alt="16卡 Torch FSDP2＋VeOmni Muon优化器profiling" width="420">](assets/veomni_ablation/profile_16die_torch_fsdp2_veomni_muon_optimizer.png) | [<img src="assets/veomni_ablation/profile_16die_torch_fsdp2_hyper_muon_optimizer.png" alt="16卡 Torch FSDP2＋Hyper Muon优化器profiling" width="420">](assets/veomni_ablation/profile_16die_torch_fsdp2_hyper_muon_optimizer.png) |
 
 #### 4.3.1 AdamW时间线
 
 | Torch FSDP2＋AdamW | Hyper FSDP＋AdamW |
 | --- | --- |
-| [<img src="assets/veomni_ablation/profile_adamw_16die_torch_scaling.png" alt="16die Torch FSDP2＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_16die_torch_scaling.png) | [<img src="assets/veomni_ablation/profile_adamw_16die_hyper_scaling.png" alt="16die Hyper FSDP＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_16die_hyper_scaling.png) |
+| [<img src="assets/veomni_ablation/profile_adamw_16die_torch_scaling.png" alt="16卡 Torch FSDP2＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_16die_torch_scaling.png) | [<img src="assets/veomni_ablation/profile_adamw_16die_hyper_scaling.png" alt="16卡 Hyper FSDP＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_16die_hyper_scaling.png) |
 
-### 4.4 64die Profiling图表
+### 4.4 64卡 Profiling图表
 
 #### 4.4.1 Muon整体对比
 
@@ -271,22 +271,22 @@ Profiling结果：
 
 | Torch FSDP2＋VeOmni Muon | Torch FSDP2＋Hyper Muon |
 | --- | --- |
-| [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_step.png" alt="64die Torch FSDP2＋VeOmni Muon整步profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_step.png) | [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_step.png" alt="64die Torch FSDP2＋Hyper Muon整步profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_step.png) |
+| [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_step.png" alt="64卡 Torch FSDP2＋VeOmni Muon整步profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_step.png) | [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_step.png" alt="64卡 Torch FSDP2＋Hyper Muon整步profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_step.png) |
 
 #### 4.4.4 Muon优化器时间线
 
 | Torch FSDP2＋VeOmni Muon | Torch FSDP2＋Hyper Muon |
 | --- | --- |
-| [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_optimizer.png" alt="64die Torch FSDP2＋VeOmni Muon优化器profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_optimizer.png) | [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_optimizer.png" alt="64die Torch FSDP2＋Hyper Muon优化器profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_optimizer.png) |
+| [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_optimizer.png" alt="64卡 Torch FSDP2＋VeOmni Muon优化器profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_veomni_muon_optimizer.png) | [<img src="assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_optimizer.png" alt="64卡 Torch FSDP2＋Hyper Muon优化器profiling" width="420">](assets/veomni_ablation/profile_64die_torch_fsdp2_hyper_muon_optimizer.png) |
 
 #### 4.4.5 Hyper FSDP＋Hyper Muon时间线
 
 | 整步 | 优化器 |
 | --- | --- |
-| [<img src="assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_step.png" alt="64die Hyper FSDP＋Hyper Muon整步profiling" width="420">](assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_step.png) | [<img src="assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_optimizer.png" alt="64die Hyper FSDP＋Hyper Muon优化器profiling" width="420">](assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_optimizer.png) |
+| [<img src="assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_step.png" alt="64卡 Hyper FSDP＋Hyper Muon整步profiling" width="420">](assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_step.png) | [<img src="assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_optimizer.png" alt="64卡 Hyper FSDP＋Hyper Muon优化器profiling" width="420">](assets/veomni_ablation/profile_64die_hyper_fsdp2_hyper_muon_optimizer.png) |
 
 #### 4.4.6 AdamW时间线
 
 | Torch FSDP2＋AdamW | Hyper FSDP＋AdamW |
 | --- | --- |
-| [<img src="assets/veomni_ablation/profile_adamw_64die_torch_scaling.png" alt="64die Torch FSDP2＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_64die_torch_scaling.png) | [<img src="assets/veomni_ablation/profile_adamw_64die_hyper_scaling.png" alt="64die Hyper FSDP＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_64die_hyper_scaling.png) |
+| [<img src="assets/veomni_ablation/profile_adamw_64die_torch_scaling.png" alt="64卡 Torch FSDP2＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_64die_torch_scaling.png) | [<img src="assets/veomni_ablation/profile_adamw_64die_hyper_scaling.png" alt="64卡 Hyper FSDP＋AdamW profiling" width="420">](assets/veomni_ablation/profile_adamw_64die_hyper_scaling.png) |

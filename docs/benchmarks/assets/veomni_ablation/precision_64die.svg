@@ -1323,7 +1323,7 @@ L 781.2 425.877656
    </g>
   </g>
   <g id="text_57">
-   <text style="font-size: 12px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle" x="396" y="18.530625" transform="rotate(-0 396 18.530625)">Qwen3.5-35B-A3B | 64die | 8K | Deterministic AdamW | 50 steps</text>
+   <text style="font-size: 12px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle" x="396" y="18.530625" transform="rotate(-0 396 18.530625)">Qwen3.5-35B-A3B | 64 cards | 8K | Deterministic AdamW | 50 steps</text>
   </g>
  </g>
  <defs>
