@@ -37,11 +37,11 @@ VLA、WAM 描述模型能力，PT、SFT 描述训练阶段。**同一类模型�
 | [NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel) | 模型分布式训练框架，已提供具体 WAM 接入 | [Praxis-1](https://github.com/NVIDIA-NeMo/Automodel/pull/4730)：通过 `TrainWAMFinetuneRecipe` 实现视频／动作联合目标、FSDP2 + EP、全量／LoRA 微调、导出与 LIBERO 评测；尚未覆盖 TP／CP／PP，断点恢复仍有显存限制 |
 | [FSDPTurbo](https://gitcode.com/Ascend/FSDPTurbo)／[FSDPTraining](https://gitcode.com/Ascend/FSDPTraining) | 并行加速库与配套训练框架，提供图像／音视频生成配方 | [FLUX.3](https://gitcode.com/Ascend/FSDPTraining/blob/main/examples/flux3_image_klein/README.md) 与 [MiniMax-H3](https://gitcode.com/Ascend/FSDPTraining/blob/main/examples/minimax_h3/README.md)：参考模型结构与目标、数据适配、训练编排及并行能力的分工；现有这些配方不包含机器人动作训练与闭环评测 |
 
-本方案结合这些框架的接入经验，**保留官方模型、数据处理与 processor 的语义，使用 Hyper 承载分布式训练和运行管理**。训练入口的组织方式参考 Hyper 现有 `VLMTrainer`；模型特有目标与数据适配留在接入层，训练编排和并行执行复用公共能力，具体接口通过 Recipe 逐步确定。
+本方案结合这些框架的接入经验，**保留官方模型、数据处理与 processor 的语义，使用 Hyper 承载分布式训练和运行管理**。优先复用 Hyper 现有 Trainer，通过模型与数据适配、必要的扩展接口完成 Recipe，保持上游训练目标和损失语义。具体选择由模型的实际调用链决定；随着实现与验证逐步迭代，再判断哪些能力应提取为公共组件、是否需要新增具身 Trainer。
 
 ## 二、开发路线
 
-**先做 Recipe，再逐步沉淀为 Kit，通过实际模型接入确认公共边界。**
+**优先复用已有 Trainer 完成 Recipe，通过实现和验证逐步收敛公共能力与 Kit 边界，再决定是否需要新 Trainer。**
 
 以四个代表模型驱动开发，按需求差异逐步推进：
 
@@ -52,9 +52,9 @@ VLA、WAM 描述模型能力，PT、SFT 描述训练阶段。**同一类模型�
 | 第二轮 | π0.5 | 用不同 VLA 结构和处理流程检验首轮公共接口 |
 | 第二轮 | FastWAM | 检验另一种 WAM 的视频／动作联合目标，以及训练和推理路径的差异 |
 
-1. **完成首轮 Recipe**：先完成 GR00T N1.7，再接入 OpenWAM-α 的下游 SFT。各自走通数据、训练、策略导出与评测，复用 Hyper 的公共训练能力，保留上游模型与数据处理方式。OpenWAM-α 首轮使用公开预训练权重，以 LIBERO 为评测入口；大规模预训练留作后续扩展。
+1. **完成首轮 Recipe**：先完成 GR00T N1.7，再接入 OpenWAM-α 的下游 SFT。各自优先基于已有 Trainer 走通数据、训练、策略导出与评测，保留上游模型与数据处理方式；对已有训练流程的扩展保持最小必要范围。OpenWAM-α 首轮使用公开预训练权重，以 LIBERO 为评测入口；大规模预训练留作后续扩展。
 2. **检验与扩展边界**：比较首轮 Recipe 的共性与差异，再通过 π0.5 和 FastWAM 检验可复用接口。明确哪些逻辑属于模型、哪些属于具身任务、哪些由 Hyper 公共能力承载，再按实际需求扩展 PT 等训练阶段。
-3. **逐步沉淀 Embodied Kit**：随着模型接入，将已验证的共性提取为可复用组件，逐步稳定数据、训练和评测接口，并据此确定 `EmbodiedTrainer` 的职责。各模型的 Recipe 继续保留，用于组织具体配置和模型特有逻辑。
+3. **收敛公共能力与 Kit**：根据多个 Recipe 的实现与验证结果，将稳定共性逐步提取为公共能力，并按需组织为 Embodied Kit。若已有 Trainer 加上这些能力即可承载需求，则继续复用；只有出现稳定、独立的具身训练流程，且复用现有 Trainer 会持续增加耦合或重复时，再考虑新增 Trainer。各模型的 Recipe 继续保留，用于组织具体配置和模型特有逻辑。
 
 首版以 GR00T N1.7 和 OpenWAM-α 的下游 SFT 完整链路为目标，接口随接入经验收敛，不预先要求所有 VLA／WAM 遵循同一套协议。LeRobot 与模型官方实现均可作为组件来源，由 Hyper 组织训练与并行执行。当前先完成静态接入分析，明确所需组件、改动位置和验证要求；后续再进入代码实现与实验验证。
 
