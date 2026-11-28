@@ -1,0 +1,65 @@
+model:
+  _target_: hyper_parallel.models.pi05.modeling.build_pi05_model
+  checkpoint: &checkpoint /path/to/pi05_libero_base
+  train_expert_only: true
+
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.components.losses.MaskedModelOutputLoss
+  mask_field: action_mask
+  loss_family: action
+
+dataset:
+  _target_: hyper_parallel.data.embodied.dataset.build_lerobot_dataset
+  dataset_root: /path/to/LIBERO_LeRobot_v3/libero_spatial
+  dataset_repo: nvidia/LIBERO_LeRobot_v3
+  frame_offsets:
+    _target_: hyper_parallel.models.pi05.modeling.build_pi05_frame_offsets
+    checkpoint: *checkpoint
+  model_assets:
+    _target_: hyper_parallel.models.pi05.modeling.build_pi05_processor
+    tokenizer_dir: /path/to/paligemma-tokenizer
+    stats_file: /path/to/libero-spatial-pi05-stats.json
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.SampleListCollator
+  get_batch:
+    _target_: hyper_parallel.models.pi05.modeling.Pi05Batch
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  seed: 42
+  backend: hccl
+
+fsdp_config:
+  dp_shard_size: 1
+  mix_precision:
+    # The native joint attention mixes the sharded expert with the FP32 frozen backbone.
+    param_dtype: float32
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  adamw_config:
+    lr: 0.000025
+    betas: [0.9, 0.95]
+    adamw_weight_decay: 0.01
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.000025
+    lr_warmup_steps: 0
+
+checkpoint:
+  save_ckpt: false
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/pi05

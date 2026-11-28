@@ -167,6 +167,9 @@ class EnvironMeterCallback(Callback):
     @staticmethod
     def _batch_samples(batch: Mapping[str, Any]) -> int:
         """Count logical samples in one micro-batch."""
+        sample_count = batch.get("sample_count")
+        if isinstance(sample_count, int):
+            return sample_count
         value = batch.get("input_ids")
         if value is None:
             value = batch.get("labels")

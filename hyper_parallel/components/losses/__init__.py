@@ -21,7 +21,7 @@ from hyper_parallel.components.losses.chunked_cross_entropy import (
     chunked_cross_entropy,
 )
 from hyper_parallel.components.losses.masked_ce import MaskedCrossEntropy
-from hyper_parallel.components.losses.model_output import ModelOutputLoss
+from hyper_parallel.components.losses.model_output import MaskedModelOutputLoss, ModelOutputLoss
 from hyper_parallel.components.losses.mtp import calculate_mtp_loss, compute_mtp_loss
 
 # FusedLinearCrossEntropy — optional, requires cut_cross_entropy
@@ -34,6 +34,7 @@ __all__ = [
     "ChunkedCausalLMLoss",
     "ChunkedCausalLMOutput",
     "MaskedCrossEntropy",
+    "MaskedModelOutputLoss",
     "ModelOutputLoss",
     "FusedLinearCrossEntropy",
     "calculate_loss",

@@ -1,0 +1,70 @@
+# OpenWAM-Official/OpenWAM at 74457862cd39f4f0147e99eced627931a5617ed1
+model:
+  _target_: hyper_parallel.models.openwam_alpha.modeling.build_openwam_model
+  checkpoint: /path/to/OpenWAM-Alpha-Pretrain-Foundation-Model
+  model_provider: hyper_parallel.models.openwam_alpha.modeling.OpenWAMDiTProvider
+  offload_frozen_encoders: true
+
+model_init_dtype: bfloat16
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+
+dataset:
+  _target_: hyper_parallel.data.embodied.dataset.build_lerobot_dataset
+  dataset_root: /path/to/OpenWAM-LIBERO
+  dataset_repo: local/openwam-libero
+  split: train
+  data_transform:
+    _target_: hyper_parallel.data.embodied.trajectory.TrajectoryWindow
+    action_steps: 32
+    video_stride: 4
+    camera_layout: [observation.images.image, observation.images.image2, null]
+    height: 384
+    width: 320
+    output_dim: 80
+    action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    stats_file: meta/libero_normalization_stats.npy
+    action_stats_key: eef
+    state_stats_key: eef_state
+    unchanged_dimensions: [3, 4, 5, 6, 7, 8]
+    representation: native_delta_eef10
+    gripper_convention: minus1_closed_plus1_open
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.SampleListCollator
+  get_batch:
+    _target_: hyper_parallel.data.dit.DiTBatch
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  seed: 42
+  max_grad_norm: 1.0
+  backend: hccl
+
+fsdp_config:
+  dp_shard_size: 1
+  forward_prefetch_depth: 0
+  backward_prefetch_depth: 0
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
+optimizer:
+  _target_: hyper_parallel.components.optim.ModelOptimizer
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+
+checkpoint:
+  save_ckpt: false
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/openwam-alpha

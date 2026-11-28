@@ -25,6 +25,8 @@ from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeter
 from hyper_parallel.trainer.runtime.flops import estimate_step_flops
 from hyper_parallel.trainer.state import TrainerState
 
+from tests.common.mark_utils import arg_mark
+
 
 class _NoItemScalar:
     """Represent a device scalar whose host conversion is forbidden."""
@@ -53,6 +55,24 @@ class TestEnvironMeterCallback(unittest.TestCase):
             lr_scheduler=None,
             optimizer=SimpleNamespace(param_groups=[{"lr": 0.001}]),
         )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_counts_samples_for_batches_without_text_tokens(self, mock_world: Mock, mock_device: Mock) -> None:
+        """Feature: Non-text batch metrics.
+
+        Description: Supply two micro-batches with explicit sample counts and no text tokens.
+        Expectation: The meter aggregates three samples and zero tokens.
+        """
+        del mock_world, mock_device
+        trainer = self._build_trainer()
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1)
+        callback.on_step_begin(state, micro_batches=[{"sample_count": 2}, {"sample_count": 1}])
+        callback.on_step_end(state, loss=1.0, loss_dict={}, grad_norm=1.0)
+        self.assertEqual(trainer.step_env_metrics["data/consumed_samples"], 3.0)
+        self.assertEqual(trainer.step_env_metrics["data/consumed_tokens"], 0.0)
 
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)

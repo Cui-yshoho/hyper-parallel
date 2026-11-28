@@ -22,6 +22,7 @@ import contextlib
 import inspect
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -47,6 +48,8 @@ _STAGE_NAMES = (
     "_build_training_context", "_init_callbacks",
 )
 
+from tests.common.mark_utils import arg_mark
+
 
 def _make_config(**training_overrides):
     """Build a trainer config tree with DiT-sized training options."""
@@ -59,6 +62,7 @@ def _make_config(**training_overrides):
     }
     training.update(training_overrides)
     return SimpleNamespace(
+        loss_fn=None,
         model=SimpleNamespace(
             model_provider=None,
             model_type="wan",
@@ -110,7 +114,7 @@ class _KwArgModel(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
 
-    def forward(self, **kwargs):  # pylint: disable=arguments-differ
+    def forward(self, **kwargs: torch.Tensor) -> SimpleNamespace:  # pylint: disable=arguments-differ
         """Project the hidden states into the prediction tensor."""
         return SimpleNamespace(sample=self.linear(kwargs["hidden_states"].float()))
 
@@ -161,9 +165,15 @@ class TestModuleHelpers(unittest.TestCase):
         with self.assertRaises(ValueError):
             _unwrap_single_sample([1, 2], "f")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_select_forward_inputs_filters_by_signature(self):  # pylint: disable=no-value-for-parameter
-        """Batch keys outside the model signature are dropped."""
-        def forward(self, hidden_states, timestep, encoder_hidden_states=None):  # pylint: disable=unused-argument
+        """Feature: DiT forward input selection.
+
+        Description: Select inputs from a batch using a fixed model signature.
+        Expectation: Only parameters named in the signature are forwarded.
+        """
+        def forward(self: torch.nn.Module, hidden_states: torch.Tensor, timestep: int,
+                    encoder_hidden_states: torch.Tensor | None = None) -> torch.Tensor:  # pylint: disable=unused-argument
             """Reference signature for the filter."""
             del timestep, encoder_hidden_states
             return hidden_states
@@ -191,13 +201,18 @@ class TestModuleHelpers(unittest.TestCase):
         selected = _select_forward_inputs(model, batch)
         self.assertEqual(sorted(selected), ["extra", "hidden_states"])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_has_condition_inputs_checks_required_names(self):
-        """The condition hook runs only when the batch carries its inputs."""
+        """Feature: DiT conditioning input selection.
+
+        Description: Inspect batches against a condition model signature.
+        Expectation: Batches with all required fields can invoke the condition model.
+        """
 
         class _Condition(torch.nn.Module):
             """Reference condition model with two required inputs."""
 
-            def get_condition(self, inputs, videos, images=None):  # pylint: disable=unused-argument
+            def get_condition(self, inputs: Any, videos: Any, images: Any = None) -> dict:  # pylint: disable=unused-argument
                 """Reference signature with two required parameters."""
                 return {}
 
@@ -217,10 +232,16 @@ class TestDiTTrainerInit(unittest.TestCase):
 
     def test_init_runs_all_stages_with_condition_model(self):
         """The assembly calls every stage in order and builds the condition model."""
+        bound_models = []
+
+        def build_condition_model(*, model: torch.nn.Module, **_: Any) -> torch.nn.Module:
+            bound_models.append(model)
+            return torch.nn.Linear(2, 2)
+
         with patch("hyper_parallel.trainer.dit_trainer.resolve_dit_provider",
-                   return_value=SimpleNamespace(
-                       build_condition_model=Mock(return_value=torch.nn.Linear(2, 2)))):
+                   return_value=SimpleNamespace(build_condition_model=build_condition_model)):
             trainer = DiTTrainer(_make_config())
+        self.assertEqual(bound_models, [trainer.base.model])
         self.assertEqual(
             self.calls,
             ["_setup", "_build_model", "_build_dataset", "_build_dataloader",
@@ -316,6 +337,30 @@ class TestDiTTrainerSteps(unittest.TestCase):
         )
         self.assertEqual(_as_float(loss), 0.0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_configured_loss_preserves_samples_and_logs_detached_metrics(self):
+        """Feature: DiT objective selection.
+
+        Description: Forward a list of samples through a model with a configurable loss.
+        Expectation: The model receives both samples and only the joint objective backpropagates.
+        """
+        weight = torch.nn.Parameter(torch.tensor(3.0))
+
+        def forward(samples: list[int]) -> SimpleNamespace:
+            """Record the intact sample batch and return native losses."""
+            self.assertEqual(samples, [2, 4])
+            return SimpleNamespace(loss=weight * sum(samples), extra_metrics={"action_loss": weight * 10})
+
+        model = torch.nn.Module()
+        model.forward = forward
+        self.trainer.base.model = model
+        self.trainer.base.loss_fn = Mock(side_effect=lambda model_output, labels: model_output.loss)
+        loss, metrics = self.trainer.forward_backward_step({"samples": [2, 4], "labels": None})
+        self.assertEqual(loss.item(), 9.0)
+        self.assertEqual(metrics["action_loss"].item(), 15.0)
+        self.assertFalse(metrics["action_loss"].requires_grad)
+        self.assertEqual(weight.grad.item(), 3.0)
+
     def test_forward_backward_step_runs_condition_and_backward(self):
         """The condition model rewrites the batch before the real forward."""
         condition_model = MagicMock()
@@ -356,6 +401,42 @@ class TestDiTTrainerSteps(unittest.TestCase):
         self.trainer.base.on_step_end.assert_called_once()
         self.assertEqual(self.trainer.base.state.global_step, 1)
         self.assertIsInstance(result["grad_norm"], float)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_condition_model_encodes_raw_samples_before_objective_forward(self) -> None:
+        """Feature: DiT conditioning for a model-owned objective.
+
+        Description: Run a raw micro-batch through the configured condition stage.
+        Expectation: Conditioning runs without autograd before the model receives encoded inputs.
+        """
+        model = self.trainer.base.model
+        samples = [{"action": torch.tensor([1.0])}]
+        hidden_states = torch.ones(1, 4)
+
+        class Condition:
+            """Record conditioning inputs and the active autograd state."""
+
+            def get_condition(self, samples: list[dict[str, Any]], **_: Any) -> dict[str, Any]:
+                """Capture the raw samples and provide a synthetic encoding."""
+                calls.append((samples, torch.is_grad_enabled()))
+                return {"hidden_states": hidden_states}
+
+            @staticmethod
+            def process_condition(**condition: Any) -> dict[str, Any]:
+                """Pass the encoded fields to model forward."""
+                return condition
+
+        calls = []
+        self.trainer.base.condition_model = Condition()
+        self.trainer.base.loss_fn = Mock(side_effect=lambda model_output, labels: model_output.sample.square().mean())
+
+        def _observe_forward(_module: Any, _args: Any, kwargs: dict[str, Any]) -> None:
+            self.assertEqual(calls, [(samples, False)])
+            self.assertEqual(set(kwargs), {"hidden_states"})
+
+        with model.register_forward_pre_hook(_observe_forward, with_kwargs=True):
+            loss, _ = self.trainer.forward_backward_step({"samples": samples, "sample_count": 1})
+        torch.testing.assert_close(loss, model.linear(hidden_states).square().mean() / 2)
 
     def test_train_step_handles_optimizer_list_and_scheduler(self):
         """Optimizer lists and schedulers both step inside one update."""

@@ -1,0 +1,67 @@
+model:
+  _target_: hyper_parallel.models.groot_n17.modeling.build_groot_model
+  checkpoint: &checkpoint /path/to/GR00T-N1.7-3B
+  dataset_root: &dataset_root /path/to/LIBERO_LeRobot_v3/libero_spatial
+  dataset_repo: &dataset_repo nvidia/LIBERO_LeRobot_v3
+  embodiment_tag: &embodiment libero_sim
+
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.components.losses.MaskedModelOutputLoss
+  mask_field: action_mask
+  loss_family: action
+
+dataset:
+  _target_: hyper_parallel.data.embodied.dataset.build_lerobot_dataset
+  dataset_root: *dataset_root
+  dataset_repo: *dataset_repo
+  use_imagenet_stats: true
+  frame_offsets:
+    _target_: hyper_parallel.models.groot_n17.modeling.build_groot_frame_offsets
+    checkpoint: *checkpoint
+    embodiment_tag: *embodiment
+  model_assets:
+    _target_: hyper_parallel.models.groot_n17.modeling.build_groot_processor
+    processor_dir: /path/to/Cosmos-Reason2-2B-processor
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.SampleListCollator
+  get_batch:
+    _target_: hyper_parallel.models.groot_n17.modeling.GrootBatch
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  seed: 42
+  backend: hccl
+
+fsdp_config:
+  dp_shard_size: 1
+  wrapper_class: [Qwen3VLVisionBlock, Qwen3VLTextDecoderLayer, BasicTransformerBlock]
+  forward_prefetch_depth: 0
+  backward_prefetch_depth: 0
+  mix_precision:
+    # GR00T owns BF16 autocast and derives its action input dtype from the native parameters.
+    param_dtype: float32
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
+optimizer:
+  _target_: hyper_parallel.components.optim.ModelOptimizer
+  fp32_main_params: true
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+
+checkpoint:
+  save_ckpt: false
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/groot_n17

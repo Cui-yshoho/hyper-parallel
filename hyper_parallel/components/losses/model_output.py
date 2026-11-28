@@ -14,7 +14,7 @@
 # ============================================================================
 """Loss module that reads the loss produced by a model."""
 
-__all__ = ["ModelOutputLoss"]
+__all__ = ["MaskedModelOutputLoss", "ModelOutputLoss"]
 
 from typing import Any, Dict, Optional, Union
 
@@ -62,3 +62,36 @@ class ModelOutputLoss(torch.nn.Module):
         local_loss = torch.where(has_valid_labels, local_loss, torch.zeros_like(local_loss))
 
         return local_loss
+
+
+class MaskedModelOutputLoss(torch.nn.Module):
+    """Weight a native mean loss by its mask across micro-batches and ranks."""
+
+    preserve_single_microbatch_loss = True
+
+    def __init__(self, mask_field: str, loss_family: str) -> None:
+        """Select the supervision mask field and the loss family to aggregate."""
+        super().__init__()
+        self.mask_field = mask_field
+        self.loss_name = f"{loss_family}_loss"
+        self.count_name = f"{loss_family}_tokens"
+
+    def count_loss_units(self, loss_inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Count supervised elements using the configured loss mask.
+
+        Args:
+            loss_inputs: Fields used by the configured loss.
+        """
+        return {self.count_name: loss_inputs[self.mask_field].count_nonzero()}
+
+    def forward(
+        self, model_output: Any, labels: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Read the native mean computed over the same supervision mask.
+
+        Args:
+            model_output: Output exposing the model-computed mean loss.
+            labels: Optional Trainer labels.
+        """
+        del labels
+        return {self.loss_name: model_output.loss}

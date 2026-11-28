@@ -4,9 +4,78 @@
 
 ## 当前进展
 
-已确定 GR00T N1.7 与 OpenWAM-α 为首轮模型，并完成 GR00T 的初步源码分析。当前分支保存总体方案与首个 Recipe 的接入设计，尚未增加训练实现或运行训练实验。
+GR00T N1.7 已接入现有 VLM Trainer。用单卡重放同一份 LIBERO batch 和 LeRobot 基线的 RNG，两个 AdamW 参数组、loss、梯度范数、采样的裁剪后梯度及参数更新量均已对齐。
 
-接下来需要确定昇腾验证环境的软件版本及本地权重、processor 和数据路径，再实现模型与数据薄适配。训练正确性、FSDP、自恢复和 LIBERO 任务效果均按下文顺序验证。
+双卡 FSDP 完成了有效动作数不等和梯度累积的单步对照。从第 1 步 checkpoint 重启后，第 2 步与连续训练的数据位置、RNG、loss、梯度范数和采样的参数更新、AdamW 状态一致。第 2 步策略已导出并由 LeRobot 离线严格重载。在 Ascend 单卡和 OSMesa 软件渲染环境中完成了 LIBERO Spatial 任务 0 的一条 280 步闭环，成功数为 0/1。
+
+## 单卡训练基线
+
+在 Python 3.12 或更新版本的昇腾环境安装本仓库和固定版本的 LeRobot。准备原始 NVIDIA GR00T N1.7 分片权重及其处理器配置、统计文件，本地 LeRobot v3.0 格式的 LIBERO Spatial 数据，以及 Hugging Face 缓存中的 `nvidia/Cosmos-Reason2-2B` tokenizer 和 processor 文件。
+
+```bash
+python -m pip install -e .
+python -m pip install 'lerobot[groot] @ git+https://github.com/huggingface/lerobot.git@b07adcc5e3ce42c26a248236dbb3571f84c28c43'
+
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python scripts/smoke_groot_n17.py \
+  --checkpoint /path/to/GR00T-N1.7-3B \
+  --processor-dir /path/to/Cosmos-Reason2-2B-processor \
+  --dataset-root /path/to/LIBERO_LeRobot_v3/libero_spatial \
+  --dataset-repo nvidia/LIBERO_LeRobot_v3 \
+  --device npu:0 --seed 42 --baseline-output /path/to/lerobot-step.pt
+```
+
+基线固定使用真实数据的首个样本、原始 NVIDIA 权重和 seed 42。权重和优化器使用 FP32，BF16 计算由 GR00T Policy 自己控制。脚本使用 LeRobot 的参数分组和 AdamW preset，并调用 LeRobot 官方的 `update_policy` 来完成反向、梯度裁剪和更新。单步对比使用固定学习率和一个 micro-batch。调度器的行为在循环接入后单独验证。
+
+`--baseline-output` 保存处理后的同一 batch、更新前 CPU/NPU RNG 状态、loss、全局梯度范数、有效动作数、可训练参数名、优化器组配置，以及固定参数采样位置的裁剪后梯度和更新前后值。切换到 Hyper Trainer 时从原始权重重新加载，只在首步重放这个 batch 和 RNG。先比较有效动作数与冻结集合，再比较损失、梯度范数、裁剪后梯度和参数更新量，并检查冻结参数采样值保持一致。
+
+单卡对齐后，用同一有效 batch 对比双卡 FSDP，在两卡有效动作数不等和启用梯度累积时，按整个优化器步上的有效动作元素总数归一化。分别验证 checkpoint 保存与恢复、策略重载和 LIBERO 闭环表现。
+
+## Hyper Trainer 单卡入口
+
+使用 `scripts/train_vl.py` 和 [LIBERO Spatial 配置](../../../hyper_parallel/models/groot_n17/recipes/libero_spatial.yaml)。将下面的资产根目录替换为本地路径，或者直接编辑 YAML 中的资产路径。
+
+```bash
+assets=/path/to/assets
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 torchrun --standalone --nproc-per-node=1 \
+  scripts/train_vl.py hyper_parallel/models/groot_n17/recipes/libero_spatial.yaml \
+  --model.checkpoint="$assets/hf_weights/GR00T-N1.7-3B" \
+  --dataset.frame_offsets.checkpoint="$assets/hf_weights/GR00T-N1.7-3B" \
+  --model.dataset_root="$assets/data/LIBERO_LeRobot_v3/libero_spatial" \
+  --dataset.dataset_root="$assets/data/LIBERO_LeRobot_v3/libero_spatial" \
+  --dataset.model_assets.processor_dir="$assets/hf_weights/Cosmos-Reason2-2B-processor"
+```
+
+GR00T 使用固定样本数的 DataLoader，组批时保留样本列表。VLM Trainer 的 `get_batch` 阶段堆叠样本字段并运行 LeRobot processor。随后损失组件从动作 mask 统计有效坐标数。单卡且每步只有一个 micro-batch 时，在反向前保留上游已归一化的 loss，以对齐 BF16 反向的舍入行为。AdamW 使用 LeRobot preset 和相同的衰减分组，由 Hyper Trainer 执行梯度裁剪和更新。
+
+## 双卡 FSDP
+
+在上述启动命令中使用 `--nproc-per-node=2`，并追加 `--fsdp_config.dp_shard_size=2 --training.global_batch_size=2`。每卡累积两个 micro-batch 时使用 `--training.global_batch_size=4 --fsdp_config.requires_grad_sync=false`。
+
+视觉块、语言 decoder 层和动作 Transformer 块各自作为子分片单元，外层训练模块负责剩余参数和共享权重。FSDP 保持 FP32 参数和梯度归约，BF16 autocast 由上游 GR00T 管理。验证时对比同一批真实 LIBERO 样本和逐样本 RNG，包含动作窗尾部的 padding。
+
+保存恢复对照使用两个优化器步，每卡累积两个 micro-batch。设置 `--checkpoint.save_ckpt=true --checkpoint.save_steps=1`，在连续运行结束后用同一训练配置和 `--checkpoint.restore_from=/path/to/checkpoints/global_step_1` 重启。逐 rank 核对第 2 步的样本索引、处理后输入、RNG 及采样的梯度和优化器状态。
+
+## 策略导出与闭环评测
+
+导出脚本在 CPU 上读取 DCP 的模型分片，使用 LeRobot 保存策略配置、完整权重、preprocessor、postprocessor 和归一化状态。导出配置引用本地原始 GR00T 权重目录及 Cosmos processor 目录，重载时保留这两项资产的路径。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python scripts/export_groot_n17.py \
+  --training-checkpoint /path/to/checkpoints/global_step_2 \
+  --checkpoint /path/to/GR00T-N1.7-3B \
+  --processor-dir /path/to/Cosmos-Reason2-2B-processor \
+  --dataset-root /path/to/LIBERO_LeRobot_v3/libero_spatial \
+  --output-dir /path/to/exported-policy
+```
+
+在 LeRobot 环境安装 `hf-libero` 并准备 LIBERO 模拟器资产和 MuJoCo 渲染环境。评测入口用官方 LeRobot API 在 CPU 上严格重载权重，然后将策略移动到 Ascend。GR00T 与 OpenWAM 共用 Hyper 的 LIBERO rollout 和指标统计。使用无 GPU 的 Linux 节点时可配置 OSMesa 软件渲染。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python scripts/eval_libero.py --model groot_n17 \
+  --policy-dir /path/to/exported-policy \
+  --task-ids 0 --episodes 1 --seed 42 \
+  --output /path/to/libero-result.json
+```
 
 ## 首版范围
 
@@ -52,7 +121,7 @@ LIBERO 闭环评测
 4. **接入 FSDP**：在相同有效 batch 与可重放输入下比较单卡和多卡的损失、梯度和更新，并验证 checkpoint 保存与恢复。
 5. **导出与评测**：用上游策略接口重载导出资产，接入 LIBERO，分别报告训练正确性与任务成功率。
 
-先基于已有 Trainer 完成 GR00T Recipe 所需的最小适配；结合 OpenWAM-α 等模型的实现与验证结果，逐步提取公共能力、收敛 Kit 边界，并判断是否需要新 Trainer。
+GR00T 通过现有 VLM Trainer 和 YAML 配置启动。与 OpenWAM-α 共享的训练能力纳入 Hyper 的公共组件，GR00T 模型接入层保留上游 policy 和 processor 所需的适配。
 
 ## 代码参考
 

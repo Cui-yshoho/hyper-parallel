@@ -1,0 +1,61 @@
+# Use FastWAM source at 7faa71108368fbb3b6885649f112af607427a2d4.
+model:
+  _target_: hyper_parallel.models.fastwam.modeling.build_fastwam_model
+  checkpoint: /path/to/fastwam/libero_uncond_2cam224.pt
+  wan_dir: /path/to/Wan2.2-TI2V-5B
+  model_config: /path/to/FastWAM/configs/model/fastwam.yaml
+  data_config: &data_config /path/to/FastWAM/configs/data/libero_2cam_lerobot_v30.yaml
+
+model_init_dtype: bfloat16
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+
+dataset:
+  _target_: hyper_parallel.data.embodied.dataset.build_lerobot_dataset
+  dataset_root: /path/to/lerobot_v30/libero_spatial_no_noops_lerobot
+  dataset_repo: yuanty/LIBERO-fastwam
+  data_transform:
+    _target_: hyper_parallel.models.fastwam.data.FastWAMTrajectory
+    data_config: *data_config
+    stats_file: /path/to/fastwam/libero_uncond_2cam224_dataset_stats.json
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.SampleListCollator
+  get_batch:
+    _target_: hyper_parallel.models.fastwam.data.FastWAMBatch
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  seed: 42
+  max_grad_norm: 1.0
+  backend: hccl
+
+fsdp_config:
+  dp_shard_size: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  adamw_config:
+    lr: 0.0001
+    adamw_weight_decay: 0.01
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+
+checkpoint:
+  save_ckpt: false
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/fastwam

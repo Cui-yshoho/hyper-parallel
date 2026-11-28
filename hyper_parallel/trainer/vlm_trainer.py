@@ -99,13 +99,12 @@ class VLMTrainer:
         # registered architecture such as the Kimi-K2.6 family (``kimi_k26``)
         # stays on the local implementation unless the config opts into remote
         # code.
-        processor = config.dataset.model_assets.build(
-            trust_remote_code=bool(
-                getattr(config.model, "trust_remote_code", True)
-            ),
-        )
+        asset_kwargs = {"trust_remote_code": bool(getattr(config.model, "trust_remote_code", True))}
+        if config.dataset.data_transform is None:
+            asset_kwargs["model"] = self.base.model
+        processor = config.dataset.model_assets.build(**asset_kwargs)
         tokenizer = getattr(processor, "tokenizer", None)
-        if tokenizer is None:
+        if tokenizer is None and config.dataset.data_transform is not None:
             raise ValueError("dataset.model_assets must build a processor with a tokenizer")
 
         self.base.processor = processor
@@ -120,7 +119,8 @@ class VLMTrainer:
             raise ValueError("dataset must define a build target")
 
         if dataset_config.data_transform is None:
-            raise ValueError("dataset.data_transform must define an Omni transform build target")
+            self.base.data_transform = None
+            return
 
         if dataset_config.training_mode is None:
             raise ValueError("dataset.training_mode must be explicitly set to 'sft' or 'pretrain' for VLM training")
@@ -167,13 +167,17 @@ class VLMTrainer:
                 "validate_placement": bool(getattr(config.model, "validate_placement", False)),
             },
         )
+        processor_kwargs = {"processor": self.base.processor} if config.dataset.data_transform is None else {}
         get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
             dataloader_context=self.base.dataloader_context,
             device=self.base.device,
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
+            **processor_kwargs,
         )
+        if processor_kwargs and isinstance(get_batch, OmniParallelBatch):
+            raise ValueError("OmniParallelBatch requires dataset.data_transform")
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
@@ -263,7 +267,8 @@ class VLMTrainer:
             Loss tensor and named loss tensors for this FB step.
         """
         model_inputs, loss_inputs = self.base.get_batch(data_iterator)
-        self.base.current_token_counts = count_loss_token(loss_inputs)
+        count_loss_units = getattr(getattr(self.base, "loss_fn", None), "count_loss_units", count_loss_token)
+        self.base.current_token_counts = count_loss_units(loss_inputs)
         self.on_micro_step_begin(model_inputs)
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
         self.on_micro_step_end(loss_dict)

@@ -818,11 +818,10 @@ class BaseTrainer(Stateful, ABC):
         for foundation_loss in foundation_losses:
             if foundation_loss is not None:
                 bind_aux_loss_scale(foundation_loss)
-        loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            local_loss,
-            current_token_counts,
-            device_mesh=self.mesh,
-        )
+        if self._uses_native_loss_normalization():
+            loss_dict = local_loss if isinstance(local_loss, dict) else {"foundation_loss": local_loss}
+        else:
+            loss_dict = mean_global_loss(local_loss, current_token_counts, device_mesh=self.mesh)
         loss = torch.stack(list(loss_dict.values())).sum()
         # Model-declared extra metrics join the logged mapping only after
         # the backward loss is fixed: log-only, never part of the loss.
@@ -996,6 +995,14 @@ class BaseTrainer(Stateful, ABC):
         """Reset scalar counters before reading the next optimizer step."""
         self.step_token_counts = {}
 
+    def _uses_native_loss_normalization(self) -> bool:
+        """Preserve an opted-in task's backward scale for a standalone micro-batch."""
+        return (
+            getattr(getattr(self, "loss_fn", None), "preserve_single_microbatch_loss", False) is True
+            and self.num_micro_batches == 1
+            and self.mesh.dp_size == self.mesh.cp_size == self.mesh.tp_size == 1
+        )
+
     def _loss_denominator(self) -> float:
         """Return the optimizer-step valid-token count across DP/CP."""
         family = self.loss_names[0].split("_loss", maxsplit=1)[0]
@@ -1045,6 +1052,8 @@ class BaseTrainer(Stateful, ABC):
             loss: Summed step objective before token normalization.
             loss_dict: Step loss metrics, normalized in place.
         """
+        if self._uses_native_loss_normalization():
+            return loss, self.clip_grad_norm()
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)

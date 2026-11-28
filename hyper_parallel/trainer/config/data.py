@@ -63,7 +63,11 @@ class DatasetConfig:
 
 @dataclass
 class DataLoaderConfig:
-    """DataLoader target and its text-batch assembly components.
+    """DataLoader target and its batch assembly components.
+
+    ``collate_fn`` groups dataset samples. Text and VLM batch runtimes return
+    ``(model_inputs, loss_inputs)``. DiT batch runtimes provide a mapping to
+    the condition model and training objective.
 
     ``load_balance=None`` retains the native loader. A mapping, including an
     empty one, enables distributed balancing with those configuration options.

@@ -19,7 +19,7 @@ Parameter-name and parameter-group logic lives in
 algorithm implementations stay in ``hyper_parallel.core.optimizer``.
 """
 
-__all__ = ["AdamW", "Muon", "Sinkhorn"]
+__all__ = ["AdamW", "ModelOptimizer", "Muon", "Sinkhorn"]
 
 import logging
 import re
@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from torch import nn
 
 from hyper_parallel.core.optimizer import get_hyper_optimizer
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.components.optim.parameter_groups import (
     _DEFAULT_ADAMW_NAME_KEYWORDS,
     get_adamw_param_groups,
@@ -35,6 +36,22 @@ from hyper_parallel.components.optim.parameter_groups import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ModelOptimizer:
+    """Expose a model's native optimizer through Hyper's optimizer lifecycle."""
+
+    def __init__(self, model: nn.Module, **options: Any) -> None:
+        """Build the optimizer using the model's parameter grouping."""
+        build_optimizer = getattr(model, "build_optimizer", None)
+        if not callable(build_optimizer):
+            raise TypeError("ModelOptimizer requires a model with a build_optimizer method")
+        optimizer = build_optimizer(**options)
+        self.optimizer = ChainedOptimizer(model, {type(optimizer).__name__.lower(): optimizer})
+
+    def get_optimizer(self) -> ChainedOptimizer:
+        """Return the optimizer consumed by the Trainer."""
+        return self.optimizer
 
 
 class AdamW:

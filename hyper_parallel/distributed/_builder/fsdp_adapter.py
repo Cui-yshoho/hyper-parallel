@@ -803,6 +803,8 @@ class FSDP2Manager:
         model: ModuleClass,
         source_shard_info: SourceShardInfoByFQN | None = None,
         ignored_params: set[ParameterClass] | None = None,
+        *,
+        root_only: bool = False,
     ) -> ModuleClass:
         """Apply configured child FSDP units, root FSDP, and prefetch links.
 
@@ -811,6 +813,8 @@ class FSDP2Manager:
             source_shard_info: FQN-keyed source-layout metadata returned by
                 ``apply_sharding_plan``. The manager resolves parameter
                 identities before applying nested FSDP units.
+            ignored_params: Parameters managed outside FSDP.
+            root_only: Manage all sharded parameters at the model's forward boundary.
 
         Returns:
             The model enhanced with the HyperParallel HSDPModule interface.
@@ -831,7 +835,7 @@ class FSDP2Manager:
             custom_params = self._resolve_custom_params(dict(model.named_parameters(remove_duplicate=False)))
         self._build_mixed_precision_policy(custom_params)
 
-        wrap_modules = self._find_wrap_modules(model, metadata_by_parameter)
+        wrap_modules = [] if root_only else self._find_wrap_modules(model, metadata_by_parameter)
         owner_by_parameter = self._resolve_parameter_owners(model, wrap_modules)
         dense_fsdp_kwargs, dense_root_kwargs = self._build_fully_shard_kwargs(
             self._build_fsdp_actual_mesh()

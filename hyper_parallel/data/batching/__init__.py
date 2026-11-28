@@ -15,6 +15,7 @@
 """Batch collation, dynamic packing, and DataLoader construction."""
 
 from hyper_parallel.data.batching.build_collate_fn import (
+    SampleListCollator,
     build_default_collate_fn,
     build_sft_collate_fn,
     build_indexed_collate_fn,
@@ -50,6 +51,7 @@ __all__ = [
     "TextParallelBatch",
     "RuntimeInputAdapter",
     "RuntimeInputContext",
+    "SampleListCollator",
     "SamplePacker",
     "TokenBatchLoader",
     "build_default_collate_fn",

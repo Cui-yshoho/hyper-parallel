@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build final batch collators for Indexed and Online sources."""
+"""Build collators for DataLoader micro-batches."""
 
 from __future__ import annotations
 
@@ -121,6 +121,20 @@ def _pad_batch_tokens(
         padded_batch["cu_seq_lens"] = torch.cat((boundaries, boundaries[-1:] + pad_length))
 
     return padded_batch
+
+
+class SampleListCollator:
+    """Preserve raw sample lists for model-owned preprocessing."""
+
+    def __init__(self, input_name: str = "samples") -> None:
+        """Select the model's named input for the list of samples."""
+        if not input_name or input_name == "sample_count":
+            raise ValueError("input_name must be a model input distinct from sample_count")
+        self.input_name = input_name
+
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        """Keep the list intact and expose its size to the Trainer meter."""
+        return {self.input_name: samples, "sample_count": len(samples)}
 
 
 @dataclass

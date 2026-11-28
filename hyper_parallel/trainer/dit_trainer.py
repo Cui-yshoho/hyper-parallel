@@ -94,6 +94,8 @@ def _unwrap_single_sample(value: Any, field_name: str) -> Any:
 def _select_forward_inputs(
     model: torch.nn.Module,
     micro_batch: dict[str, Any],
+    *,
+    unwrap_samples: bool = True,
 ) -> dict[str, Any]:
     """Project a conditioned batch onto the upstream model's forward inputs."""
     signature = getattr(model, "_hp_forward_signature", None)
@@ -111,7 +113,7 @@ def _select_forward_inputs(
     if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
         accepted_names = micro_batch.keys()
     return {
-        name: _unwrap_single_sample(value, name)
+        name: _unwrap_single_sample(value, name) if unwrap_samples else value
         for name, value in micro_batch.items()
         if name in accepted_names
     }
@@ -142,6 +144,8 @@ class DiTTrainer:
 
         self.base._setup()
         self.base._build_model()
+        if config.loss_fn is not None:
+            self.base._build_loss()
 
         self._build_model_assets()
         self._build_data_transform()
@@ -159,13 +163,17 @@ class DiTTrainer:
     def _build_model_assets(self) -> None:
         """Resolve the DiT provider and build its condition model when one is provided."""
         config = self.base.config
-        provider = resolve_dit_provider(
-            getattr(config.model, "model_provider", None),
-            getattr(config.model, "model_type", None),
-        )
+        configured_provider = getattr(config.model, "model_provider", None)
+        model_type = getattr(config.model, "model_type", None)
+        provider = None
+        if configured_provider is not None or model_type is not None or config.loss_fn is None:
+            provider = resolve_dit_provider(configured_provider, model_type)
         build_condition = getattr(provider, "build_condition_model", None)
         if callable(build_condition):
+            # A provider can reuse encoders that are already part of the restored model.
+            model_kwargs = {"model": self.base.model} if "model" in inspect.signature(build_condition).parameters else {}
             self.base.condition_model = build_condition(
+                **model_kwargs,
                 model_target=config.model,
                 device=self.base.device,
                 dp_rank=self.base.mesh.dp_rank,
@@ -223,6 +231,11 @@ class DiTTrainer:
         )
 
     def preforward(self, micro_batch: dict[str, Any]) -> dict[str, Any]:
+        """Move nested batch tensors to the Trainer device.
+
+        Args:
+            micro_batch: Inputs supplied by the data pipeline.
+        """
         return {key: _move_nested_to_device(value, self.base.device) for key, value in micro_batch.items()}
 
     def postforward(
@@ -230,7 +243,23 @@ class DiTTrainer:
         outputs: Any,
         micro_batch: dict[str, Any],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the flow-matching objective outside the upstream model."""
+        """Apply the configured objective or the default DiT flow-matching MSE.
+
+        Args:
+            outputs: Model forward output.
+            micro_batch: Batch used for the forward pass.
+        """
+        if self.base.loss_fn is not None:
+            losses = self.base.loss_fn(model_output=outputs, labels=micro_batch.get("labels"))
+            if isinstance(losses, torch.Tensor):
+                losses = {"loss": losses}
+            scaled = {name: value / self.base.num_micro_batches for name, value in losses.items()}
+            loss = torch.stack(list(scaled.values())).sum()
+            metrics = getattr(outputs, "extra_metrics", None)
+            if metrics:
+                scaled.update({name: value.detach() / self.base.num_micro_batches for name, value in metrics.items()})
+            return loss, scaled
+
         if "training_target" not in micro_batch:
             raise ValueError("Conditioned DiT batch missing required loss field: training_target")
         prediction = getattr(outputs, "sample", None)
@@ -267,7 +296,9 @@ class DiTTrainer:
             else self.base.model_fwd_context
         )
         with model_fwd_context:
-            model_inputs = _select_forward_inputs(self.base.model, micro_batch)
+            model_inputs = _select_forward_inputs(
+                self.base.model, micro_batch, unwrap_samples=self.base.loss_fn is None,
+            )
             outputs = self.base.model(**model_inputs)
         loss, loss_dict = self.postforward(outputs, micro_batch)
         del outputs
@@ -282,10 +313,7 @@ class DiTTrainer:
         """Consume micro-batches, accumulate gradients, and apply one optimizer update."""
         config = self.base.config
         num_micro_steps = self.base.num_micro_batches
-        micro_batches = [self.base.get_batch(data_iterator)]
-        for _ in range(1, num_micro_steps):
-            micro_batches.append(self.base.get_batch(data_iterator))
-
+        micro_batches = [self.base.get_batch(data_iterator) for _ in range(num_micro_steps)]
         self.base.on_step_begin(micro_batches=micro_batches)
         synchronize()
 
